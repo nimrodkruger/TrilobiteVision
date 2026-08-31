@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TrilobiteVision</title>
+<style>
+  :root {
+    --bg: #12131a; --panel: #1b1d27; --line: #2c2f3d;
+    --ink: #e6e8f0; --muted: #8b90a6; --accent: #6ea8fe; --warn: #ffb454; --ok: #5fd18c;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font-size: 14px; }
+  header {
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+    padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  header h1 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: .02em; }
+  header .meta { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+  header button { margin-left: auto; }
+  button {
+    background: var(--accent); color: #08101f; border: 0; border-radius: 6px;
+    padding: 6px 12px; font-size: 13px; font-weight: 600; cursor: pointer;
+  }
+  button.ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+  button:hover { filter: brightness(1.1); }
+  main { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; padding: 16px; }
+  .cam { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .cam h2 { margin: 0; padding: 10px 14px; font-size: 14px; border-bottom: 1px solid var(--line);
+            display: flex; align-items: center; gap: 10px; }
+  .cam h2 .stat { margin-left: auto; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .view { background: #000; display: block; width: 100%; aspect-ratio: 4/3; object-fit: contain; }
+  .controls { padding: 12px 14px; display: flex; flex-direction: column; gap: 14px; }
+  .stage { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .stage .hdr { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .stage .hdr strong { font-size: 13px; }
+  .stage .hdr .type { color: var(--muted); font-size: 11px; font-family: ui-monospace, monospace; }
+  .stage .hdr .ms { margin-left: auto; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .row { display: grid; grid-template-columns: 110px 1fr 62px; align-items: center; gap: 8px; margin: 5px 0; }
+  .row label { color: var(--muted); font-size: 12px; }
+  .row input[type=range] { width: 100%; accent-color: var(--accent); }
+  .row output { font-variant-numeric: tabular-nums; font-size: 12px; text-align: right; }
+  .row input[type=checkbox] { accent-color: var(--accent); justify-self: start; }
+  .actions { display: flex; gap: 8px; padding: 0 14px 14px; }
+  #log { padding: 8px 18px; border-top: 1px solid var(--line); color: var(--muted);
+         font-family: ui-monospace, monospace; font-size: 12px; min-height: 22px; }
+  #log.err { color: var(--warn); }
+  #log.ok { color: var(--ok); }
+</style>
+</head>
+<body>
+<header>
+  <h1>TrilobiteVision</h1>
+  <span class="meta" id="session">&mdash;</span>
+  <button class="ghost" id="capture-all">Capture all (raw)</button>
+</header>
+
+<main id="cams"></main>
+<div id="log"></div>
+
+<script>
+const $ = (s, r = document) => r.querySelector(s);
+const log = (msg, cls = "") => { const el = $("#log"); el.textContent = msg; el.className = cls; };
+
+async function jget(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+  return r.json();
+}
+async function jpost(url, body) {
+  const r = await fetch(url, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body ?? {})
+  });
+  if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+  return r.json();
+}
+
+// Build a control row straight from the JSON schema a stage published.
+// Nothing here knows what a stage does -- add a stage in Python and its
+// controls appear with no change to this file.
+function controlRow(camId, stageName, key, spec, value) {
+  const row = document.createElement("div");
+  row.className = "row";
+
+  const label = document.createElement("label");
+  label.textContent = spec.title || key;
+  if (spec.description) label.title = spec.description;
+  row.appendChild(label);
+
+  const send = debounce(async (v) => {
+    try {
+      await jpost(`/api/pipeline/${camId}/${stageName}`, { values: { [key]: v } });
+      log(`${camId}/${stageName}.${key} = ${v}`, "ok");
+    } catch (e) { log(String(e), "err"); }
+  }, 120);
+
+  if (spec.type === "boolean") {
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.checked = !!value;
+    cb.onchange = () => send(cb.checked);
+    row.appendChild(cb);
+    row.appendChild(document.createElement("span"));
+    return row;
+  }
+
+  const isInt = spec.type === "integer";
+  const min = spec.minimum ?? spec.exclusiveMinimum ?? 0;
+  const max = spec.maximum ?? spec.exclusiveMaximum ?? 1;
+  const slider = document.createElement("input");
+  slider.type = "range";
+  slider.min = min; slider.max = max;
+  slider.step = isInt ? 1 : (max - min) / 200;
+  slider.value = value;
+
+  const out = document.createElement("output");
+  out.textContent = isInt ? value : Number(value).toFixed(3);
+
+  slider.oninput = () => {
+    const v = isInt ? parseInt(slider.value, 10) : parseFloat(slider.value);
+    out.textContent = isInt ? v : v.toFixed(3);
+    send(v);
+  };
+  row.appendChild(slider);
+  row.appendChild(out);
+  return row;
+}
+
+function debounce(fn, ms) {
+  let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
+}
+
+async function renderPipeline(camId, host) {
+  const stages = await jget(`/api/pipeline/${camId}`);
+  host.innerHTML = "";
+  for (const st of stages) {
+    const box = document.createElement("div");
+    box.className = "stage";
+    const hdr = document.createElement("div");
+    hdr.className = "hdr";
+    hdr.innerHTML = `<strong>${st.name}</strong><span class="type">${st.type}</span>` +
+                    `<span class="ms" data-stage="${st.name}">${st.last_ms} ms</span>`;
+    box.appendChild(hdr);
+    const props = (st.schema && st.schema.properties) || {};
+    for (const [key, spec] of Object.entries(props)) {
+      box.appendChild(controlRow(camId, st.name, key, spec, st.values[key]));
+    }
+    host.appendChild(box);
+  }
+}
+
+async function build() {
+  const cams = await jget("/api/cameras");
+  const root = $("#cams");
+  root.innerHTML = "";
+  for (const cam of cams) {
+    const card = document.createElement("section");
+    card.className = "cam";
+    card.innerHTML = `
+      <h2>${cam.cam_id}
+        <span class="type" style="color:var(--muted);font-size:11px">${cam.backend}</span>
+        <span class="stat" data-fps="${cam.cam_id}">&mdash;</span>
+      </h2>
+      <img class="view" src="/stream/${cam.cam_id}.mjpg" alt="${cam.cam_id} preview">
+      <div class="controls" data-pipeline="${cam.cam_id}"></div>
+      <div class="actions">
+        <button data-cap="${cam.cam_id}">Capture raw</button>
+        <button class="ghost" data-cap-proc="${cam.cam_id}">Capture processed</button>
+      </div>`;
+    root.appendChild(card);
+    await renderPipeline(cam.cam_id, card.querySelector("[data-pipeline]"));
+  }
+
+  root.onclick = async (ev) => {
+    const raw = ev.target.dataset?.cap, proc = ev.target.dataset?.capProc;
+    const id = raw || proc;
+    if (!id) return;
+    try {
+      const r = await jpost(`/api/capture/${id}?raw=${raw ? "true" : "false"}`);
+      log(`saved ${r.file}  ${r.shape.join("x")} ${r.dtype}`, "ok");
+    } catch (e) { log(String(e), "err"); }
+  };
+}
+
+$("#capture-all").onclick = async () => {
+  try {
+    const r = await jpost("/api/capture-all?raw=true");
+    log(Object.entries(r).map(([k, v]) => `${k}: ${v.file || v.error}`).join("   |   "), "ok");
+  } catch (e) { log(String(e), "err"); }
+};
+
+async function poll() {
+  try {
+    const s = await jget("/api/status");
+    $("#session").textContent = `${s.session_dir}   up ${s.uptime_s}s`;
+    for (const c of s.cameras) {
+      const el = document.querySelector(`[data-fps="${c.cam_id}"]`);
+      if (el) el.textContent =
+        `${c.fps} fps  ${c.frames} frames` + (c.errors ? `  ${c.errors} errors` : "");
+    }
+  } catch (e) { /* transient; the stream itself will show a stall */ }
+  setTimeout(poll, 1000);
+}
+
+build().then(poll).catch(e => log(String(e), "err"));
+</script>
+</body>
+</html>

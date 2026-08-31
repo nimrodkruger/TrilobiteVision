@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Prepare a freshly flashed Raspberry Pi 5 for the flyeye stack.
+# Prepare a freshly flashed Raspberry Pi 5 for the TrilobiteVision stack.
 #
 # Run on the Pi:   bash scripts/install_pi.sh
 # Safe to re-run.
@@ -7,27 +7,33 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENV="${HOME}/.venvs/flyeye"
+VENV="${HOME}/.venvs/trilobite"
 BOOT_CFG=/boot/firmware/config.txt
 
 echo "==> System packages"
 sudo apt update
 sudo apt full-upgrade -y
 
+# Everything comes from apt-packages.txt so there is one list to edit, and it
+# is the same list you would install by hand. Installed one at a time: a wrong
+# package name then reports itself instead of aborting the whole batch.
+#
 # picamera2 and the libcamera Python bindings MUST come from apt. They are C++
 # extensions built against the system libcamera; the pip versions drift out of
-# step with the shipped libcamera and produce import errors or, worse, silent
-# format mismatches. numpy and opencv also come from apt so they are ABI-
-# compatible with picamera2's buffers and so you avoid a 40-minute source build
-# of opencv on the Pi.
-sudo apt install -y \
-  python3-picamera2 \
-  python3-numpy \
-  python3-opencv \
-  python3-simplejpeg \
-  rpicam-apps \
-  python3-venv python3-pip \
-  git
+# step and produce import errors or, worse, silent format mismatches.
+SKIPPED=()
+while read -r pkg; do
+  if ! sudo apt install -y "$pkg"; then
+    echo "!! could not install: $pkg"
+    SKIPPED+=("$pkg")
+  fi
+done < <(grep -vE '^\s*(#|$)' "${REPO_DIR}/apt-packages.txt" | awk '{print $1}')
+
+if (( ${#SKIPPED[@]} )); then
+  echo
+  echo "The following packages were not installed: ${SKIPPED[*]}"
+  echo "Continuing -- the camera stack may still work if none of them were required."
+fi
 
 echo
 echo "==> Camera overlays in ${BOOT_CFG}"
@@ -71,7 +77,7 @@ python -c "import picamera2, numpy, cv2; print('picamera2, numpy, cv2 import OK'
   echo "picamera2 import failed -- was the venv created with --system-site-packages?" >&2
   exit 1
 }
-python -c "import flyeye; print('flyeye', flyeye.__version__)"
+python -c "import trilobite; print('TrilobiteVision', trilobite.__version__)"
 
 echo
 if [[ "$CONFIG_CHANGED" == "1" ]]; then

@@ -1,0 +1,26 @@
+# Force LF endings in the repo for everything text.
+#
+# This is not cosmetic. You are committing from Windows and running on Linux.
+# A shell script that arrives with CRLF endings fails on the Pi with
+#   bash: ./install_pi.sh: /bin/bash^M: bad interpreter: No such file or directory
+# which is an obscure enough error to lose an hour to. Same for the shebang in
+# probe_cameras.py and for YAML config files.
+
+* text=auto eol=lf
+
+*.sh      text eol=lf
+*.py      text eol=lf
+*.yaml    text eol=lf
+*.yml     text eol=lf
+*.service text eol=lf
+*.md      text eol=lf
+*.html    text eol=lf
+*.txt     text eol=lf
+
+# Never let git touch these.
+*.npy  binary
+*.png  binary
+*.jpg  binary
+*.tif  binary
+*.tiff binary
+*.h5   binary

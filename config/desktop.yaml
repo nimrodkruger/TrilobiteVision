@@ -13,7 +13,7 @@ server:
   jpeg_quality: 80
 
 storage:
-  root: ./flyeye-data
+  root: ./trilobite-data
   still_format: npy
 
 cameras:

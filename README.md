@@ -1,8 +1,26 @@
-# flyeye
+# TrilobiteVision
 
 Dual-camera capture, configurable processing and browser preview for a
 Raspberry Pi 5 with two IMX296 global shutter cameras. Built as a skeleton for
 plenoptic camera calibration work.
+
+### Names used here
+
+| thing | name | why |
+|---|---|---|
+| repo / project folder | `TrilobiteVision` | the project |
+| distribution (pyproject `name`) | `trilobitevision` | matches the repo |
+| Python import package | `trilobite` | what you type: `python -m trilobite` |
+| venv | `~/.venvs/trilobite` | created by `install_pi.sh`; does not exist until then |
+| systemd unit | `trilobite.service` | `systemctl status trilobite` |
+| data directory | `~/trilobite-data` | change via `storage.root` in the config |
+| the Pi itself | `flyeye` | hostname and login user, unrelated to the code |
+| the cameras | `cam0`, `cam1` | `cam_id` in the config; rename them freely |
+
+The import package is shortened to `trilobite` so commands stay typeable. To
+use the full name instead, rename `src/trilobite/` and replace `trilobite`
+with `trilobitevision` in `pyproject.toml` and in the imports.
+
 
 ---
 
@@ -77,7 +95,7 @@ touches this module and the static page, nothing else.
 ### Files
 
 ```
-src/flyeye/
+src/trilobite/
   types.py                 Frame, CameraInfo. Metadata travels with pixels.
   config.py                pydantic schema for the rig YAML
   bus.py                   LatestFrame (newest wins), FrameQueue (counts drops)
@@ -100,7 +118,7 @@ src/flyeye/
   web/static/index.html    UI generated from the stage schemas
 scripts/probe_cameras.py   run this first, on the Pi
 scripts/install_pi.sh      apt + config.txt + venv, idempotent
-systemd/flyeye.service     run as a service
+systemd/trilobite.service     run as a service
 tests/test_pipeline.py     runs anywhere, no camera needed
 ```
 
@@ -110,19 +128,22 @@ tests/test_pipeline.py     runs anywhere, no camera needed
 
 ### On the Pi
 
+Nothing below exists on a freshly flashed Pi -- no venv, no Python packages,
+no camera overlays. `install_pi.sh` creates all of it and is safe to re-run.
+
 ```bash
-git clone <your-repo> ~/flyeye
-cd ~/flyeye
-bash scripts/install_pi.sh
+git clone <your-repo> ~/TrilobiteVision
+cd ~/TrilobiteVision
+bash scripts/install_pi.sh      # apt packages, config.txt, venv, editable install
 sudo reboot                     # required: config.txt changed
 ```
 
 Then:
 
 ```bash
-source ~/.venvs/flyeye/bin/activate
+source ~/.venvs/trilobite/bin/activate
 python scripts/probe_cameras.py --grab
-python -m flyeye --config config/pi.yaml
+python -m trilobite --config config/pi.yaml
 ```
 
 Open `http://<pi-address>:8000/`.
@@ -160,11 +181,11 @@ Verify with `rpicam-hello --list-cameras` before blaming the Python.
 
 ```powershell
 git clone <your-repo>
-cd flyeye
+cd TrilobiteVision
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e ".[desktop,dev]"
-python -m flyeye --config config/desktop.yaml
+python -m trilobite --config config/desktop.yaml
 pytest
 ```
 
@@ -184,7 +205,7 @@ git add -A; git commit -m "..."; git push
 
 ```bash
 # Pi
-ssh flyeye@<address> 'cd ~/flyeye && git pull && sudo systemctl restart flyeye'
+ssh flyeye@<address> 'cd ~/TrilobiteVision && git pull && sudo systemctl restart trilobite'
 ```
 
 During active development, leave the systemd service **disabled** and run the
@@ -223,7 +244,7 @@ change was optical or computational.
 The whole procedure:
 
 ```python
-# src/flyeye/processing/stages/my_stage.py
+# src/trilobite/processing/stages/my_stage.py
 from pydantic import Field
 from ...types import Frame
 from ..base import Stage, StageParams

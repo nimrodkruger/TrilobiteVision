@@ -1,0 +1,29 @@
+# Run TrilobiteVision as a service so it survives reboots and SSH disconnects.
+#
+#   sudo cp systemd/trilobite.service /etc/systemd/system/
+#   sudo sed -i "s/%USER%/$USER/g" /etc/systemd/system/trilobite.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now trilobite
+#   journalctl -u trilobite -f
+#
+# During active development you probably want this DISABLED and the app run by
+# hand in a terminal -- a service holding the cameras will block your manual
+# runs with a confusing "device busy".
+
+[Unit]
+Description=TrilobiteVision camera rig
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%USER%
+WorkingDirectory=/home/%USER%/TrilobiteVision
+ExecStart=/home/%USER%/.venvs/trilobite/bin/python -m trilobite --config config/pi.yaml
+Restart=on-failure
+RestartSec=3
+# libcamera needs to release the sensor cleanly or the next start fails.
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

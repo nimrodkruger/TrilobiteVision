@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "flyeye"
+name = "trilobitevision"
 version = "0.1.0"
 description = "Dual-camera capture, processing and browser preview for a Raspberry Pi 5 optics rig"
 requires-python = ">=3.11"
@@ -26,13 +26,13 @@ desktop = ["numpy>=1.24", "pillow>=10.0"]
 dev = ["pytest>=8.0", "ruff>=0.4"]
 
 [project.scripts]
-flyeye = "flyeye.__main__:main"
+trilobite = "trilobite.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-"flyeye.web" = ["static/*"]
+"trilobite.web" = ["static/*"]
 
 [tool.ruff]
 line-length = 100

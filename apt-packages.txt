@@ -1,4 +1,4 @@
-# apt packages for the flyeye Pi 5 rig.
+# apt packages for the TrilobiteVision Pi 5 rig.
 #
 # Install everything uncommented here with:
 #
@@ -30,7 +30,7 @@ rpicam-apps               # rpicam-hello / rpicam-still / rpicam-vid.
 
 
 # ---------------------------------------------------------------------------
-# REQUIRED -- Python tooling and the numeric libraries flyeye imports
+# REQUIRED -- Python tooling and the numeric libraries TrilobiteVision imports
 # ---------------------------------------------------------------------------
 
 python3-venv              # for  python3 -m venv --system-site-packages

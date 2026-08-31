@@ -18,7 +18,7 @@ server:
 storage:
   # Point this at a USB SSD or an NVMe HAT. Sustained image capture to the SD
   # card is slow and wears it out.
-  root: ~/flyeye-data
+  root: ~/trilobite-data
   still_format: npy
 
 cameras:

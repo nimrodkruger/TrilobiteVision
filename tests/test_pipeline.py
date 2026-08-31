@@ -8,11 +8,11 @@ import numpy as np
 import pytest
 from pydantic import ValidationError
 
-from flyeye.cameras.registry import build_camera
-from flyeye.config import CameraConfig, StageConfig
-from flyeye.processing import Pipeline, catalogue
-from flyeye.processing.registry import build_stage
-from flyeye.types import Frame
+from trilobite.cameras.registry import build_camera
+from trilobite.config import CameraConfig, StageConfig
+from trilobite.processing import Pipeline, catalogue
+from trilobite.processing.registry import build_stage
+from trilobite.types import Frame
 
 
 def make_frame(w=64, h=48):
