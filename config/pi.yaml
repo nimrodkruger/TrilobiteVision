@@ -31,8 +31,12 @@ cameras:
     controls:
       # Fixed exposure and gain. Auto-exposure makes frames incomparable,
       # which defeats the purpose of a calibration rig.
+      #
+      # No AwbEnable: these are the MONO IMX296, which has no colour
+      # processing, so libcamera advertises no white-balance control at all.
+      # Unsupported names are now dropped with a warning instead of aborting
+      # startup, but leaving one in the config is still noise.
       AeEnable: false
-      AwbEnable: false
       ExposureTime: 8000              # microseconds
       AnalogueGain: 1.0
     pipeline:
@@ -48,7 +52,6 @@ cameras:
     fps: 30
     controls:
       AeEnable: false
-      AwbEnable: false
       ExposureTime: 8000
       AnalogueGain: 1.0
     pipeline:

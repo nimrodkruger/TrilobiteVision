@@ -103,3 +103,37 @@ def test_synthetic_camera_roundtrip():
         full = cam.capture_full(raw=True)
         assert full.space == "raw"
         assert cam.describe().backend == "synthetic"
+
+
+class _FakeCam:
+    """Stands in for a Picamera2 object exposing only a mono sensor's controls."""
+
+    camera_controls = {
+        "ExposureTime": (1, 1000000, 8000),
+        "AnalogueGain": (1.0, 16.0, 1.0),
+        "AeEnable": (False, True, True),
+        "FrameDurationLimits": (100, 1000000, 33333),
+    }
+
+
+def test_unsupported_controls_are_dropped_not_raised():
+    """Regression: a mono IMX296 advertises no AwbEnable, and picamera2 raises
+    on an unknown control name rather than ignoring it. Startup must survive."""
+    from trilobite.cameras.picam import Picamera2Source
+
+    supported, dropped = Picamera2Source._split_controls(
+        _FakeCam(),
+        {"ExposureTime": 5000, "AnalogueGain": 2.0, "AwbEnable": False, "Saturation": 0.0},
+    )
+    assert supported == {"ExposureTime": 5000, "AnalogueGain": 2.0}
+    assert dropped == ["AwbEnable", "Saturation"]
+
+
+def test_all_supported_controls_pass_through():
+    from trilobite.cameras.picam import Picamera2Source
+
+    supported, dropped = Picamera2Source._split_controls(
+        _FakeCam(), {"ExposureTime": 100, "AeEnable": False}
+    )
+    assert supported == {"ExposureTime": 100, "AeEnable": False}
+    assert dropped == []

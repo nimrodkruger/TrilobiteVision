@@ -39,6 +39,15 @@ class Picamera2Source(CameraSource):
         self._lock = threading.Lock()
         self._mono = False
         self._full_res: tuple[int, int] = (0, 0)
+        self._dropped_controls: list[str] = []
+
+    @staticmethod
+    def _split_controls(picam: Any, controls: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+        """Partition requested controls into (supported, unsupported names)."""
+        advertised = set(picam.camera_controls)
+        supported = {k: v for k, v in controls.items() if k in advertised}
+        dropped = sorted(set(controls) - advertised)
+        return supported, dropped
 
     def open(self) -> None:
         if self._open:
@@ -71,7 +80,7 @@ class Picamera2Source(CameraSource):
         # advertises a Bayer pattern. Detect rather than assume, because the
         # two variants share a model string.
         raw_fmt = str(picam.sensor_format or "")
-        self._mono = raw_fmt.startswith("R") and not any(
+        self._mono = raw_fmt.startswith(("R", "Y", "MONO")) and not any(
             p in raw_fmt for p in ("RGGB", "BGGR", "GRBG", "GBRG")
         )
 
@@ -83,14 +92,39 @@ class Picamera2Source(CameraSource):
         )
         picam.configure(config)
 
+        # A configured mono sensor reports a MONO_* raw format. That is a
+        # firmer signal than the pre-configure sensor_format string, so let it
+        # override.
+        try:
+            if "MONO" in str(picam.camera_configuration()["raw"]["format"]).upper():
+                self._mono = True
+        except (KeyError, TypeError):
+            pass
+
         controls: dict[str, Any] = {}
         if self.cfg.fps:
             # libcamera takes a frame duration range in microseconds.
             dur = int(1_000_000 / self.cfg.fps)
             controls["FrameDurationLimits"] = (dur, dur)
         controls.update(self.cfg.controls)
-        if controls:
-            picam.set_controls(controls)
+
+        # Not every sensor advertises every control, and picamera2 raises on an
+        # unknown name rather than ignoring it. A mono IMX296 has no colour
+        # processing at all, so AwbEnable, ColourGains and Saturation simply do
+        # not exist on it -- setting one aborts startup. Rather than encode
+        # per-sensor knowledge here, ask the camera what it supports and drop
+        # the rest with a warning. That is what lets one config file serve both
+        # a mono and a colour rig.
+        supported, dropped = self._split_controls(picam, controls)
+        if dropped:
+            log.warning(
+                "%s: sensor does not advertise these controls, ignoring: %s",
+                self.cam_id,
+                ", ".join(dropped),
+            )
+        self._dropped_controls = dropped
+        if supported:
+            picam.set_controls(supported)
 
         picam.start()
         self._picam = picam
@@ -168,14 +202,28 @@ class Picamera2Source(CameraSource):
             full_resolution=self._full_res,
             preview_resolution=tuple(self.cfg.preview_resolution),
             mono=self._mono,
-            detail={k: str(v) for k, v in self._info.items()},
+            detail={
+                **{k: str(v) for k, v in self._info.items()},
+                "dropped_controls": ", ".join(self._dropped_controls) or "none",
+            },
         )
 
     def set_controls(self, controls: dict[str, Any]) -> None:
         if not self._open:
             raise RuntimeError(f"{self.cam_id}: camera not open")
         with self._lock:
-            self._picam.set_controls(controls)
+            # Unlike startup, a runtime request naming an unsupported control
+            # is a mistake worth reporting: the caller asked for something
+            # specific and silently ignoring it would be misleading. The web
+            # layer turns this into a 422 naming what is actually available.
+            supported, dropped = self._split_controls(self._picam, controls)
+            if dropped:
+                raise ValueError(
+                    f"{self.cam_id}: control(s) not supported by this sensor: "
+                    f"{', '.join(dropped)}. Available: "
+                    f"{', '.join(sorted(self._picam.camera_controls))}"
+                )
+            self._picam.set_controls(supported)
 
     def get_controls(self) -> dict[str, Any]:
         if not self._open:
