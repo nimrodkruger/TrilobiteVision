@@ -1,0 +1,57 @@
+# Rig configuration for the Pi 5 with two IMX296 global shutter cameras.
+#
+# `index` comes from scripts/probe_cameras.py. On a Pi 5, connector CAM0 is
+# usually index 0, but confirm rather than assume -- libcamera orders by bus
+# address, and swapping the ribbon cables swaps the indices.
+
+log_level: INFO
+
+server:
+  host: 0.0.0.0
+  port: 8000
+  # Preview frames pushed to the browser per second. Deliberately far below
+  # the sensor rate: the Pi 5 encodes JPEG in software, and two streams at
+  # sensor rate would starve the capture threads.
+  preview_fps: 12
+  jpeg_quality: 80
+
+storage:
+  # Point this at a USB SSD or an NVMe HAT. Sustained image capture to the SD
+  # card is slow and wears it out.
+  root: ~/flyeye-data
+  still_format: npy
+
+cameras:
+  - cam_id: cam0
+    backend: picamera2
+    index: 0
+    full_resolution: [1456, 1088]     # IMX296 native
+    preview_resolution: [728, 544]
+    fps: 30
+    controls:
+      # Fixed exposure and gain. Auto-exposure makes frames incomparable,
+      # which defeats the purpose of a calibration rig.
+      AeEnable: false
+      AwbEnable: false
+      ExposureTime: 8000              # microseconds
+      AnalogueGain: 1.0
+    pipeline:
+      - {type: stats,      name: stats}
+      - {type: levels,     name: display, params: {gain: 1.0, gamma: 1.0}}
+      - {type: mla_grid_overlay, name: mla, params: {enabled: false, pitch_px: 20}}
+
+  - cam_id: cam1
+    backend: picamera2
+    index: 1
+    full_resolution: [1456, 1088]
+    preview_resolution: [728, 544]
+    fps: 30
+    controls:
+      AeEnable: false
+      AwbEnable: false
+      ExposureTime: 8000
+      AnalogueGain: 1.0
+    pipeline:
+      - {type: stats,      name: stats}
+      - {type: levels,     name: display, params: {gain: 1.0, gamma: 1.0}}
+      - {type: mla_grid_overlay, name: mla, params: {enabled: false, pitch_px: 20}}

@@ -1,0 +1,38 @@
+# Desktop configuration: two synthetic cameras, no hardware required.
+#
+# This is the config to develop against on Windows. The entire stack runs --
+# web UI, parameter plumbing, storage layout, pipeline -- so you can build and
+# test almost everything without the Pi, then change one file to deploy.
+
+log_level: INFO
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  preview_fps: 15
+  jpeg_quality: 80
+
+storage:
+  root: ./flyeye-data
+  still_format: npy
+
+cameras:
+  - cam_id: cam0
+    backend: synthetic
+    full_resolution: [1456, 1088]
+    preview_resolution: [728, 544]
+    fps: 20
+    pipeline:
+      - {type: stats,  name: stats}
+      - {type: levels, name: display, params: {gain: 1.0, gamma: 1.0}}
+      - {type: mla_grid_overlay, name: mla, params: {enabled: false, pitch_px: 24}}
+
+  - cam_id: cam1
+    backend: synthetic
+    full_resolution: [1456, 1088]
+    preview_resolution: [728, 544]
+    fps: 20
+    pipeline:
+      - {type: stats,      name: stats}
+      - {type: downsample, name: decimate, params: {factor: 1}}
+      - {type: levels,     name: display, params: {gain: 1.2, gamma: 1.0}}

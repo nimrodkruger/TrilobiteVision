@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flyeye"
+version = "0.1.0"
+description = "Dual-camera capture, processing and browser preview for a Raspberry Pi 5 optics rig"
+requires-python = ">=3.11"
+
+# Deliberately excludes picamera2, numpy and opencv. On the Pi those come from
+# apt (see scripts/install_pi.sh) because the libcamera Python bindings are not
+# pip-installable and version skew between pip and apt builds is the single
+# most common way to break a working camera stack.
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.27",
+  "pydantic>=2.6",
+  "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Desktop-only: everything needed to run the synthetic/replay backends on
+# Windows with no Pi attached.
+desktop = ["numpy>=1.24", "pillow>=10.0"]
+dev = ["pytest>=8.0", "ruff>=0.4"]
+
+[project.scripts]
+flyeye = "flyeye.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"flyeye.web" = ["static/*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]

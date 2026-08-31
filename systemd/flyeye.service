@@ -1,0 +1,29 @@
+# Run flyeye as a service so it survives reboots and SSH disconnects.
+#
+#   sudo cp systemd/flyeye.service /etc/systemd/system/
+#   sudo sed -i "s/%USER%/$USER/g" /etc/systemd/system/flyeye.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now flyeye
+#   journalctl -u flyeye -f
+#
+# During active development you probably want this DISABLED and the app run by
+# hand in a terminal -- a service holding the cameras will block your manual
+# runs with a confusing "device busy".
+
+[Unit]
+Description=flyeye camera rig
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%USER%
+WorkingDirectory=/home/%USER%/flyeye
+ExecStart=/home/%USER%/.venvs/flyeye/bin/python -m flyeye --config config/pi.yaml
+Restart=on-failure
+RestartSec=3
+# libcamera needs to release the sensor cleanly or the next start fails.
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
