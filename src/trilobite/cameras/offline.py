@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -41,6 +42,12 @@ class SyntheticSource(CameraSource):
         self._rng = np.random.default_rng(abs(hash(cfg.cam_id)) % (2**32))
         self._period = 1.0 / max(cfg.fps, 1e-3)
         self._last = 0.0
+        self._controls: dict[str, Any] = {
+            "ExposureTime": 5000,
+            "AnalogueGain": 1.0,
+            "AeEnable": False,
+        }
+        self._brightness = 1.0
 
     def open(self) -> None:
         self._open = True
@@ -58,7 +65,9 @@ class SyntheticSource(CameraSource):
         img += 0.20 * (((xx.astype(int) % 128) < 3) | ((yy.astype(int) % 128) < 3))
         img += 0.5
         img += self._rng.normal(0.0, 0.01, size=img.shape).astype(np.float32)
-        return np.clip(img * 255.0, 0, 255).astype(np.uint8)
+        # Exposure and gain scale the scene, so the sensor controls have a
+        # visible effect here too and the UI is testable without the rig.
+        return np.clip(img * 255.0 * self._brightness, 0, 255).astype(np.uint8)
 
     def read_preview(self) -> Frame | None:
         if not self._open:
@@ -78,9 +87,8 @@ class SyntheticSource(CameraSource):
             self.cam_id,
             self._next_seq(),
             space="mono8",
-            ExposureTime=5000,
-            AnalogueGain=1.0,
             Synthetic=True,
+            **self._controls,
         )
 
     def capture_full(self, raw: bool = True) -> Frame:
@@ -90,9 +98,8 @@ class SyntheticSource(CameraSource):
             self.cam_id,
             self._next_seq(),
             space="raw" if raw else "mono8",
-            ExposureTime=5000,
-            AnalogueGain=1.0,
             Synthetic=True,
+            **self._controls,
         )
 
     def describe(self) -> CameraInfo:
@@ -104,6 +111,32 @@ class SyntheticSource(CameraSource):
             preview_resolution=self._prev,
             mono=True,
         )
+
+    # Advertising a plausible control set is not decoration: it means the
+    # sensor panel in the UI can be exercised on the desktop, so a change to
+    # that panel is testable without the rig attached.
+    def control_spec(self) -> dict[str, dict[str, Any]]:
+        return {
+            "ExposureTime": {"type": "integer", "minimum": 30, "maximum": 100000, "default": 5000},
+            "AnalogueGain": {"type": "number", "minimum": 1.0, "maximum": 16.0, "default": 1.0},
+            "AeEnable": {"type": "boolean", "default": False},
+        }
+
+    def set_controls(self, controls: dict[str, Any]) -> None:
+        spec = self.control_spec()
+        unknown = sorted(set(controls) - set(spec))
+        if unknown:
+            raise ValueError(
+                f"{self.cam_id}: control(s) not supported by this sensor: "
+                f"{', '.join(unknown)}. Available: {', '.join(sorted(spec))}"
+            )
+        self._controls.update(controls)
+        exp = float(self._controls.get("ExposureTime", 5000))
+        gain = float(self._controls.get("AnalogueGain", 1.0))
+        self._brightness = min(4.0, (exp / 5000.0) * gain)
+
+    def get_controls(self) -> dict[str, Any]:
+        return dict(self._controls)
 
 
 class ReplaySource(CameraSource):

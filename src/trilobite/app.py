@@ -48,6 +48,7 @@ class CameraRuntime:
     def __init__(self, cfg: CameraConfig, writer: SessionWriter) -> None:
         self.cfg = cfg
         self.cam_id = cfg.cam_id
+        self.label = cfg.label or cfg.cam_id.replace("_", " ").title()
         self.source: CameraSource = build_camera(cfg)
         self.pipeline = Pipeline.from_config(cfg.pipeline)
         self.preview = LatestFrame()
@@ -113,12 +114,46 @@ class CameraRuntime:
             pipeline_settings=self.pipeline.settings_snapshot(),
             camera_info=self.source.describe().as_dict(),
             tag=tag,
+            label=self.label,
         )
+
+    def capture_preview(self, tag: str = "view") -> dict[str, Any]:
+        """Save the preview frame exactly as displayed -- post-pipeline.
+
+        Distinct from capture_still on purpose. This is low-resolution, gamma
+        shaped, possibly with a grid drawn on it: a record of *what you were
+        looking at*, useful for lab notes and for documenting an alignment
+        state. It is not measurement data, and the sidecar says so via
+        `space` and the pipeline block. Never fit anything to these.
+        """
+        frame = self.latest()
+        if frame is None:
+            raise RuntimeError(f"{self.cam_id}: no preview frame yet")
+        return self.writer.save_still(
+            frame,
+            pipeline_settings=self.pipeline.settings_snapshot(),
+            camera_info=self.source.describe().as_dict(),
+            tag=tag,
+            label=self.label,
+        )
+
+    def mla_stage(self):
+        """The MLA overlay stage, if this camera has one. None otherwise.
+
+        The web layer needs it to derive sub-aperture crops from the same
+        parameters the overlay draws with -- one source of truth, so the boxes
+        you see and the crops you get cannot drift apart.
+        """
+        for st in self.pipeline.describe():
+            if st["type"] == "mla_grid_overlay":
+                return self.pipeline.stage(st["name"])
+        return None
 
     def status(self) -> dict[str, Any]:
         version, frame = self.preview.get()
         return {
             "cam_id": self.cam_id,
+            "label": self.label,
             "backend": self.cfg.backend,
             "open": self.source.is_open,
             "fps": round(self.rate.fps, 2),

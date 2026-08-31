@@ -17,7 +17,8 @@ storage:
   still_format: npy
 
 cameras:
-  - cam_id: cam0
+  - cam_id: left
+    label: Left camera
     backend: synthetic
     full_resolution: [1456, 1088]
     preview_resolution: [728, 544]
@@ -27,7 +28,8 @@ cameras:
       - {type: levels, name: display, params: {gain: 1.0, gamma: 1.0}}
       - {type: mla_grid_overlay, name: mla, params: {enabled: false, pitch_px: 24}}
 
-  - cam_id: cam1
+  - cam_id: right
+    label: Right camera
     backend: synthetic
     full_resolution: [1456, 1088]
     preview_resolution: [728, 544]
@@ -36,3 +38,4 @@ cameras:
       - {type: stats,      name: stats}
       - {type: downsample, name: decimate, params: {factor: 1}}
       - {type: levels,     name: display, params: {gain: 1.2, gamma: 1.0}}
+      - {type: mla_grid_overlay, name: mla, params: {enabled: false, pitch_px: 24}}

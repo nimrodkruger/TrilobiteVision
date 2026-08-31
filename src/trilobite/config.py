@@ -25,7 +25,16 @@ class StageConfig(BaseModel):
 
 
 class CameraConfig(BaseModel):
+    # Physical identity: used in filenames, sidecars, API paths and the UI.
+    # Use words that mean something at the bench -- "left", "right" -- not
+    # indices. The libcamera index is a wiring detail and lives in `index`
+    # alone, so if you swap the ribbon cables you change one number and every
+    # file written before and after still names the physical camera correctly.
     cam_id: str
+
+    # Display label. Defaults to a title-cased cam_id.
+    label: str | None = None
+
     backend: Literal["picamera2", "replay", "synthetic"] = "picamera2"
 
     # picamera2: index into the list from Picamera2.global_camera_info().
@@ -44,6 +53,15 @@ class CameraConfig(BaseModel):
 
     # Frames per second requested from the sensor.
     fps: float = 30.0
+
+    # Force a specific raw stream format, e.g. "R10" or "R12".
+    #
+    # Leave null and libcamera picks for you -- on a Pi 5 that is
+    # MONO_PISP_COMP1, a *companded* encoding. It is visually lossless but it
+    # is not linear sensor data, so it is wrong for radiometric work and for
+    # anything that fits a model to pixel values. Set an uncompressed format
+    # here once probe_cameras.py has told you which ones this sensor offers.
+    raw_format: str | None = None
 
     # Camera controls passed straight to libcamera, e.g.
     #   {ExposureTime: 5000, AnalogueGain: 1.0, AeEnable: false}
@@ -85,6 +103,11 @@ class AppConfig(BaseModel):
     @property
     def storage_root(self) -> Path:
         return Path(os.path.expanduser(self.storage.root))
+
+    @property
+    def camera_order(self) -> list[str]:
+        """cam_ids in config order -- which is the order the UI lays them out."""
+        return [c.cam_id for c in self.cameras]
 
     def camera(self, cam_id: str) -> CameraConfig:
         for c in self.cameras:

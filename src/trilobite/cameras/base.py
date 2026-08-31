@@ -86,7 +86,18 @@ class CameraSource(ABC):
         """Apply driver-level controls (exposure, gain, ...). Optional."""
         log.debug("%s: set_controls ignored by %s", self.cam_id, type(self).__name__)
 
+    def control_spec(self) -> dict[str, dict[str, Any]]:
+        """Advertised driver controls as {name: {min, max, default, type}}.
+
+        Structured, not stringified, so the UI can build a slider with the
+        sensor's own limits rather than a hardcoded guess -- exposure range
+        differs per sensor and per mode, and a wrong range makes the control
+        useless at one end.
+        """
+        return {}
+
     def get_controls(self) -> dict[str, Any]:
+        """Current values of the driver controls, where the backend knows them."""
         return {}
 
     # -- helpers for subclasses -----------------------------------------

@@ -6,81 +6,157 @@
 <title>TrilobiteVision</title>
 <style>
   :root {
-    --bg: #12131a; --panel: #1b1d27; --line: #2c2f3d;
-    --ink: #e6e8f0; --muted: #8b90a6; --accent: #6ea8fe; --warn: #ffb454; --ok: #5fd18c;
+    --bg:#0f1117; --panel:#171a23; --panel2:#1d212c; --line:#2a2f3d;
+    --ink:#e7e9f0; --muted:#8990a6; --accent:#6ea8fe; --ok:#5fd18c; --warn:#ffb454; --err:#ff6b6b;
     font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   }
   * { box-sizing: border-box; }
-  body { margin: 0; background: var(--bg); color: var(--ink); font-size: 14px; }
-  header {
-    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
-    padding: 12px 18px; border-bottom: 1px solid var(--line); background: var(--panel);
-  }
-  header h1 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: .02em; }
-  header .meta { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
-  header button { margin-left: auto; }
-  button {
-    background: var(--accent); color: #08101f; border: 0; border-radius: 6px;
-    padding: 6px 12px; font-size: 13px; font-weight: 600; cursor: pointer;
-  }
-  button.ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); }
-  button:hover { filter: brightness(1.1); }
-  main { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; padding: 16px; }
-  .cam { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
-  .cam h2 { margin: 0; padding: 10px 14px; font-size: 14px; border-bottom: 1px solid var(--line);
-            display: flex; align-items: center; gap: 10px; }
-  .cam h2 .stat { margin-left: auto; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
-  .view { background: #000; display: block; width: 100%; aspect-ratio: 4/3; object-fit: contain; }
-  .controls { padding: 12px 14px; display: flex; flex-direction: column; gap: 14px; }
-  .stage { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
-  .stage .hdr { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-  .stage .hdr strong { font-size: 13px; }
-  .stage .hdr .type { color: var(--muted); font-size: 11px; font-family: ui-monospace, monospace; }
-  .stage .hdr .ms { margin-left: auto; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
-  .row { display: grid; grid-template-columns: 110px 1fr 62px; align-items: center; gap: 8px; margin: 5px 0; }
-  .row label { color: var(--muted); font-size: 12px; }
-  .row input[type=range] { width: 100%; accent-color: var(--accent); }
-  .row output { font-variant-numeric: tabular-nums; font-size: 12px; text-align: right; }
-  .row input[type=checkbox] { accent-color: var(--accent); justify-self: start; }
-  .actions { display: flex; gap: 8px; padding: 0 14px 14px; }
-  #log { padding: 8px 18px; border-top: 1px solid var(--line); color: var(--muted);
-         font-family: ui-monospace, monospace; font-size: 12px; min-height: 22px; }
-  #log.err { color: var(--warn); }
-  #log.ok { color: var(--ok); }
+  html, body { height: 100%; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-size:13px; overflow:hidden;
+         display:grid; grid-template-rows:auto 1fr auto; }
+
+  header { display:flex; align-items:center; gap:14px; padding:9px 16px;
+           border-bottom:1px solid var(--line); background:var(--panel); }
+  header h1 { margin:0; font-size:15px; font-weight:650; letter-spacing:.02em; }
+  header .meta { color:var(--muted); font-size:11px; font-variant-numeric:tabular-nums; }
+  header .spacer { margin-left:auto; }
+
+  button { background:var(--accent); color:#08101f; border:0; border-radius:6px;
+           padding:6px 11px; font-size:12px; font-weight:650; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--ink); border:1px solid var(--line); }
+  button:hover { filter:brightness(1.12); }
+  button:disabled { opacity:.5; cursor:default; }
+
+  /* Two camera columns. Each is its own grid: the image block is fixed, the
+     controls block scrolls independently beneath it. That is what keeps the
+     preview on screen while you tune a parameter far down the list. */
+  main { display:grid; grid-template-columns:repeat(auto-fit, minmax(430px,1fr));
+         gap:12px; padding:12px; min-height:0; }
+  .cam { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+         display:grid; grid-template-rows:auto 1fr; min-height:0; overflow:hidden; }
+
+  .viewport { border-bottom:1px solid var(--line); background:var(--panel2); }
+  .viewport h2 { margin:0; padding:8px 12px; font-size:13px; font-weight:650;
+                 display:flex; align-items:center; gap:9px; }
+  .viewport h2 .sub { color:var(--muted); font-size:11px; font-weight:400;
+                      font-family:ui-monospace,monospace; }
+  .viewport h2 .stat { margin-left:auto; color:var(--muted); font-size:11px;
+                       font-variant-numeric:tabular-nums; }
+  .view { display:block; width:100%; height:40vh; object-fit:contain; background:#000; }
+
+  .subaps { display:none; grid-template-columns:repeat(3,1fr); gap:6px; padding:6px 8px;
+            border-top:1px solid var(--line); }
+  .subaps.on { display:grid; }
+  /* Capped height: the tiles are an alignment aid, and letting them grow with
+     the column width steals room from the main preview, which is what you are
+     actually looking at most of the time. */
+  .subap img { width:100%; height:clamp(70px, 11vh, 130px); object-fit:contain;
+               background:#000; border:1px solid var(--line); border-radius:4px;
+               image-rendering:pixelated; }
+  .subap .cap { font-size:10px; color:var(--muted); padding-top:3px; text-align:center;
+                font-family:ui-monospace,monospace; }
+
+  .actions { display:flex; gap:7px; padding:8px 10px; border-top:1px solid var(--line);
+             align-items:center; flex-wrap:wrap; }
+  .actions .note { font-size:11px; color:var(--muted); margin-left:auto;
+                   font-family:ui-monospace,monospace; overflow:hidden;
+                   text-overflow:ellipsis; white-space:nowrap; max-width:60%; }
+  .actions .note.ok { color:var(--ok); } .actions .note.err { color:var(--err); }
+
+  /* The scrolling half. */
+  .controls { overflow-y:auto; overflow-x:hidden; padding:10px; min-height:0;
+              display:flex; flex-direction:column; gap:10px; scrollbar-width:thin; }
+  .panel { border:1px solid var(--line); border-radius:8px; background:var(--panel2); }
+  .panel > .hdr { display:flex; align-items:center; gap:8px; padding:7px 10px;
+                  border-bottom:1px solid var(--line); cursor:pointer; user-select:none; }
+  .panel > .hdr strong { font-size:12px; }
+  .panel > .hdr .type { color:var(--muted); font-size:10px; font-family:ui-monospace,monospace; }
+  .panel > .hdr .ms { margin-left:auto; color:var(--muted); font-size:10px;
+                      font-variant-numeric:tabular-nums; }
+  .panel > .hdr .chev { color:var(--muted); font-size:10px; width:10px; }
+  .panel > .body { padding:6px 10px 9px; }
+  .panel.collapsed > .body { display:none; }
+  .panel.collapsed > .hdr { border-bottom:0; }
+
+  .row { display:grid; grid-template-columns:104px 1fr 80px; align-items:center;
+         gap:8px; margin:6px 0; }
+  .row > label { color:var(--muted); font-size:11px; overflow:hidden;
+                 text-overflow:ellipsis; white-space:nowrap; }
+  .row input[type=range] { width:100%; accent-color:var(--accent); min-width:0; }
+  .row input[type=number] { width:100%; background:var(--bg); color:var(--ink);
+        border:1px solid var(--line); border-radius:4px; padding:3px 5px;
+        font-size:11px; font-variant-numeric:tabular-nums; text-align:right; }
+  .row input[type=number]:focus { outline:1px solid var(--accent); border-color:var(--accent); }
+  .row input[type=number].bad { border-color:var(--err); color:var(--err); }
+  .row input[type=checkbox] { accent-color:var(--accent); justify-self:start;
+                              width:15px; height:15px; }
+  .empty { color:var(--muted); font-size:11px; padding:4px 0; }
+
+  footer { padding:6px 16px; border-top:1px solid var(--line); background:var(--panel);
+           color:var(--muted); font-family:ui-monospace,monospace; font-size:11px;
+           white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  footer.ok { color:var(--ok); } footer.err { color:var(--err); }
 </style>
 </head>
 <body>
+
 <header>
   <h1>TrilobiteVision</h1>
   <span class="meta" id="session">&mdash;</span>
-  <button class="ghost" id="capture-all">Capture all (raw)</button>
+  <span class="spacer"></span>
+  <button id="all-raw">Save raw — both</button>
+  <button class="ghost" id="all-view">Save view — both</button>
 </header>
 
 <main id="cams"></main>
-<div id="log"></div>
+<footer id="log">&nbsp;</footer>
 
 <script>
+"use strict";
 const $ = (s, r = document) => r.querySelector(s);
-const log = (msg, cls = "") => { const el = $("#log"); el.textContent = msg; el.className = cls; };
+const SUBAPS = ["top_right", "centre", "bottom_left"];
+
+function log(msg, cls = "") { const e = $("#log"); e.textContent = msg || " "; e.className = cls; }
+function note(camId, msg, cls = "") {
+  const e = document.querySelector(`[data-note="${camId}"]`);
+  if (e) { e.textContent = msg; e.className = "note " + cls; }
+  log(msg, cls);
+}
 
 async function jget(url) {
   const r = await fetch(url);
-  if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+  if (!r.ok) throw new Error(`${r.status} ${(await r.text()).slice(0, 250)}`);
   return r.json();
 }
-async function jpost(url, body) {
+async function jsend(url, body, method = "POST") {
   const r = await fetch(url, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body ?? {})
+    method, headers: { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
   });
-  if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
-  return r.json();
+  const text = await r.text();
+  if (!r.ok) throw new Error(`${r.status} ${text.slice(0, 250)}`);
+  return text ? JSON.parse(text) : {};
+}
+const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; };
+function fmt(v, isInt) {
+  if (v === null || v === undefined) return "";
+  return isInt ? String(Math.round(v)) : String(Number(parseFloat(v).toFixed(4)));
 }
 
-// Build a control row straight from the JSON schema a stage published.
-// Nothing here knows what a stage does -- add a stage in Python and its
-// controls appear with no change to this file.
-function controlRow(camId, stageName, key, spec, value) {
+/* ---------------------------------------------------------------------------
+   One control row: slider AND number box, kept in sync, either can commit.
+
+   The number box exists because a slider cannot express "pitch = 20.375", and
+   that is exactly the precision MLA alignment needs. The slider is for
+   sweeping and watching the image; the box is for landing on a value.
+
+   Commit rules: the slider commits continuously but debounced, so you can drag
+   and watch. The box commits on Enter or blur, so half-typed numbers are never
+   sent. Whatever the SERVER returns is written back into both, so a value that
+   was clamped or rejected is visible rather than silently ignored -- which is
+   the failure mode that makes a control look dead.
+--------------------------------------------------------------------------- */
+function makeRow(key, spec, value, commit) {
   const row = document.createElement("div");
   row.className = "row";
 
@@ -89,64 +165,176 @@ function controlRow(camId, stageName, key, spec, value) {
   if (spec.description) label.title = spec.description;
   row.appendChild(label);
 
-  const send = debounce(async (v) => {
-    try {
-      await jpost(`/api/pipeline/${camId}/${stageName}`, { values: { [key]: v } });
-      log(`${camId}/${stageName}.${key} = ${v}`, "ok");
-    } catch (e) { log(String(e), "err"); }
-  }, 120);
-
   if (spec.type === "boolean") {
     const cb = document.createElement("input");
     cb.type = "checkbox"; cb.checked = !!value;
-    cb.onchange = () => send(cb.checked);
+    cb.onchange = async () => {
+      try { await commit(key, cb.checked); }
+      catch (e) { cb.checked = !cb.checked; }
+    };
     row.appendChild(cb);
     row.appendChild(document.createElement("span"));
+    row.sync = v => { cb.checked = !!v; };
     return row;
   }
 
   const isInt = spec.type === "integer";
   const min = spec.minimum ?? spec.exclusiveMinimum ?? 0;
   const max = spec.maximum ?? spec.exclusiveMaximum ?? 1;
+
   const slider = document.createElement("input");
-  slider.type = "range";
-  slider.min = min; slider.max = max;
-  slider.step = isInt ? 1 : (max - min) / 200;
+  slider.type = "range"; slider.min = min; slider.max = max;
+  // step="any" for floats. A computed step such as (max-min)/1000 produces
+  // values the browser then rejects as not on the step grid, because
+  // 625 * 0.008 is not exactly 5 in binary floating point -- the slider goes
+  // dead for no visible reason. Continuous is also what you want for sweeping.
+  slider.step = isInt ? 1 : "any";
   slider.value = value;
 
-  const out = document.createElement("output");
-  out.textContent = isInt ? value : Number(value).toFixed(3);
+  const box = document.createElement("input");
+  box.type = "number"; box.min = min; box.max = max;
+  box.step = isInt ? 1 : "any";
+  box.value = fmt(value, isInt);
 
+  function setBoth(v) { slider.value = v; box.value = fmt(v, isInt); box.classList.remove("bad"); }
+
+  // Guard against re-sending a value that is already in force. Three events
+  // can each fire for one edit (input, change, blur) and the box also commits
+  // on a debounce, so without this a single keystroke can post four times.
+  let inFlight = null;
+  async function submit(v) {
+    if (!Number.isFinite(v)) { box.classList.add("bad"); return; }
+    if (v === inFlight) return;
+    inFlight = v;
+    // Out-of-range values are sent anyway: the server owns validation and its
+    // 422 states the real limit. Clamping here would hide the limit behind a
+    // silent correction, which is how a control comes to look broken.
+    try {
+      const got = await commit(key, v);
+      setBoth(got === undefined || got === null ? v : got);
+    } catch (e) {
+      box.classList.add("bad");
+    } finally {
+      if (inFlight === v) inFlight = null;
+    }
+  }
+  const readBox = () => (isInt ? parseInt(box.value, 10) : parseFloat(box.value));
+
+  const pushSlider = debounce(v => submit(v), 100);
   slider.oninput = () => {
     const v = isInt ? parseInt(slider.value, 10) : parseFloat(slider.value);
-    out.textContent = isInt ? v : v.toFixed(3);
-    send(v);
+    box.value = fmt(v, isInt);
+    pushSlider(v);
   };
+
+  // The box commits on three paths on purpose. `change` alone is not enough:
+  // it does not fire for a pasted or scripted value, and a user who types a
+  // number and then walks away without pressing Enter would see nothing
+  // happen. Debounced `input` covers typing, Enter and blur cover the rest.
+  const pushBox = debounce(() => submit(readBox()), 500);
+  box.oninput = () => { box.classList.remove("bad"); pushBox(); };
+  box.onchange = () => submit(readBox());
+  box.onblur = () => submit(readBox());
+  box.onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); box.blur(); } };
+
   row.appendChild(slider);
-  row.appendChild(out);
+  row.appendChild(box);
+  row.sync = setBoth;
   return row;
 }
 
-function debounce(fn, ms) {
-  let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
+function makePanel(title, type, bodyEl, collapsed = false) {
+  const p = document.createElement("div");
+  p.className = "panel" + (collapsed ? " collapsed" : "");
+  const hdr = document.createElement("div");
+  hdr.className = "hdr";
+  hdr.innerHTML = `<span class="chev">${collapsed ? "▸" : "▾"}</span>` +
+                  `<strong></strong><span class="type"></span><span class="ms"></span>`;
+  hdr.querySelector("strong").textContent = title;
+  hdr.querySelector(".type").textContent = type;
+  hdr.onclick = () => {
+    p.classList.toggle("collapsed");
+    hdr.querySelector(".chev").textContent = p.classList.contains("collapsed") ? "▸" : "▾";
+  };
+  const body = document.createElement("div");
+  body.className = "body";
+  body.appendChild(bodyEl);
+  p.append(hdr, body);
+  return p;
 }
 
-async function renderPipeline(camId, host) {
+/* -------------------------------------------------------------------------- */
+
+async function buildSensorPanel(camId) {
+  const body = document.createElement("div");
+  let data;
+  try { data = await jget(`/api/controls/${camId}`); } catch { data = { spec: {} }; }
+
+  // libcamera advertises dozens of controls; all but a few are noise for this
+  // rig and would bury the ones that matter.
+  const WANTED = ["ExposureTime", "AnalogueGain", "AeEnable"];
+  const spec = data.spec || {};
+  const names = WANTED.filter(n => n in spec);
+  if (!names.length) {
+    body.innerHTML = `<div class="empty">This backend advertises no sensor controls.</div>`;
+    return makePanel("Sensor", "driver", body, true);
+  }
+  const commit = async (key, v) => {
+    try {
+      await jsend(`/api/controls/${camId}`, { controls: { [key]: v } });
+      note(camId, `sensor ${key} = ${v}`, "ok");
+      return v;
+    } catch (e) { note(camId, `sensor ${key}: ${e.message}`, "err"); throw e; }
+  };
+  for (const n of names) {
+    const s = spec[n];
+    const current = (data.requested || {})[n] ?? s.default ?? s.minimum ?? 0;
+    body.appendChild(makeRow(n, s, current, commit));
+  }
+  return makePanel("Sensor", "driver", body, false);
+}
+
+async function buildPipelinePanels(camId, host) {
   const stages = await jget(`/api/pipeline/${camId}`);
-  host.innerHTML = "";
   for (const st of stages) {
-    const box = document.createElement("div");
-    box.className = "stage";
-    const hdr = document.createElement("div");
-    hdr.className = "hdr";
-    hdr.innerHTML = `<strong>${st.name}</strong><span class="type">${st.type}</span>` +
-                    `<span class="ms" data-stage="${st.name}">${st.last_ms} ms</span>`;
-    box.appendChild(hdr);
+    const body = document.createElement("div");
     const props = (st.schema && st.schema.properties) || {};
+    const commit = async (key, v) => {
+      try {
+        const got = await jsend(`/api/pipeline/${camId}/${st.name}`, { values: { [key]: v } });
+        note(camId, `${st.name}.${key} = ${got[key]}`, "ok");
+        if (st.type === "mla_grid_overlay") refreshSubaps(camId);
+        return got[key];
+      } catch (e) {
+        note(camId, `${st.name}.${key}: ${e.message}`, "err");
+        throw e;
+      }
+    };
     for (const [key, spec] of Object.entries(props)) {
-      box.appendChild(controlRow(camId, st.name, key, spec, st.values[key]));
+      body.appendChild(makeRow(key, spec, st.values[key], commit));
     }
-    host.appendChild(box);
+    const panel = makePanel(st.name, st.type, body, false);
+    panel.dataset.stage = st.name;
+    panel.dataset.cam = camId;
+    host.appendChild(panel);
+  }
+}
+
+async function refreshSubaps(camId) {
+  const strip = document.querySelector(`[data-subaps="${camId}"]`);
+  if (!strip) return;
+  let info;
+  try { info = await jget(`/api/subapertures/${camId}`); } catch { return; }
+  if (!info.available || !info.enabled) { strip.classList.remove("on"); return; }
+  strip.classList.add("on");
+  for (const v of SUBAPS) {
+    const cap = strip.querySelector(`[data-cap-for="${v}"]`);
+    const view = info.views[v];
+    if (cap) {
+      cap.textContent = view
+        ? `${v.replace("_", " ")} (${view.index[0]}, ${view.index[1]})`
+        : v.replace("_", " ");
+    }
   }
 }
 
@@ -154,56 +342,120 @@ async function build() {
   const cams = await jget("/api/cameras");
   const root = $("#cams");
   root.innerHTML = "";
+
   for (const cam of cams) {
     const card = document.createElement("section");
     card.className = "cam";
-    card.innerHTML = `
-      <h2>${cam.cam_id}
-        <span class="type" style="color:var(--muted);font-size:11px">${cam.backend}</span>
+
+    const vp = document.createElement("div");
+    vp.className = "viewport";
+    vp.innerHTML = `
+      <h2><span class="ttl"></span>
+        <span class="sub"></span>
         <span class="stat" data-fps="${cam.cam_id}">&mdash;</span>
       </h2>
-      <img class="view" src="/stream/${cam.cam_id}.mjpg" alt="${cam.cam_id} preview">
-      <div class="controls" data-pipeline="${cam.cam_id}"></div>
+      <img class="view" src="/stream/${cam.cam_id}.mjpg" alt="preview">
+      <div class="subaps" data-subaps="${cam.cam_id}">
+        ${SUBAPS.map(v => `
+          <div class="subap">
+            <img data-tile="${cam.cam_id}/${v}" alt="${v}">
+            <div class="cap" data-cap-for="${v}">${v.replace("_", " ")}</div>
+          </div>`).join("")}
+      </div>
       <div class="actions">
-        <button data-cap="${cam.cam_id}">Capture raw</button>
-        <button class="ghost" data-cap-proc="${cam.cam_id}">Capture processed</button>
+        <button data-save="raw"  data-cam="${cam.cam_id}">Save raw</button>
+        <button class="ghost" data-save="view" data-cam="${cam.cam_id}">Save view</button>
+        <span class="note" data-note="${cam.cam_id}"></span>
       </div>`;
+    vp.querySelector(".ttl").textContent = cam.label || cam.cam_id;
+    vp.querySelector(".sub").textContent = `${cam.cam_id} · ${cam.backend}`;
+
+    const controls = document.createElement("div");
+    controls.className = "controls";
+
+    card.append(vp, controls);
     root.appendChild(card);
-    await renderPipeline(cam.cam_id, card.querySelector("[data-pipeline]"));
+
+    controls.appendChild(await buildSensorPanel(cam.cam_id));
+    await buildPipelinePanels(cam.cam_id, controls);
+    refreshSubaps(cam.cam_id);
   }
 
-  root.onclick = async (ev) => {
-    const raw = ev.target.dataset?.cap, proc = ev.target.dataset?.capProc;
-    const id = raw || proc;
-    if (!id) return;
+  root.addEventListener("click", async ev => {
+    const btn = ev.target.closest("[data-save]");
+    if (!btn) return;
+    const kind = btn.dataset.save, cam = btn.dataset.cam;
+    note(cam, `saving ${kind}…`);
+    btn.disabled = true;
     try {
-      const r = await jpost(`/api/capture/${id}?raw=${raw ? "true" : "false"}`);
-      log(`saved ${r.file}  ${r.shape.join("x")} ${r.dtype}`, "ok");
-    } catch (e) { log(String(e), "err"); }
-  };
+      const r = await jsend(`/api/capture/${cam}/${kind}`);
+      note(cam, `${r.file}  ${r.shape.join("×")} ${r.dtype}`, "ok");
+    } catch (e) {
+      note(cam, `save ${kind} failed: ${e.message}`, "err");
+    } finally {
+      btn.disabled = false;
+    }
+  });
 }
 
-$("#capture-all").onclick = async () => {
+async function saveAll(kind) {
+  log(`saving ${kind} on all cameras…`);
   try {
-    const r = await jpost("/api/capture-all?raw=true");
-    log(Object.entries(r).map(([k, v]) => `${k}: ${v.file || v.error}`).join("   |   "), "ok");
-  } catch (e) { log(String(e), "err"); }
-};
+    const r = await jsend(`/api/capture-all/${kind}`);
+    const parts = Object.entries(r).map(([k, v]) => `${k}: ${v.file || v.error}`);
+    log(parts.join("   |   "), Object.values(r).some(v => v.error) ? "err" : "ok");
+  } catch (e) { log(e.message, "err"); }
+}
+$("#all-raw").onclick = () => saveAll("raw");
+$("#all-view").onclick = () => saveAll("view");
 
+/* Sub-aperture tiles are POLLED, not streamed.
+
+   A browser allows roughly six concurrent connections per origin and an MJPEG
+   stream holds one open indefinitely. Two cameras with a main stream plus
+   three tile streams each is eight -- past the limit, at which point every
+   fetch() on this page, including every button press, queues behind them and
+   never returns. That failure looks exactly like dead controls.
+
+   One persistent stream per camera for the main preview; everything else is a
+   short request that completes and gives its connection back. */
+const TILE_HZ = 4;
+function pollTiles() {
+  for (const img of document.querySelectorAll("[data-tile]")) {
+    // Skip while a previous load is still in flight, so a slow encode cannot
+    // build a backlog of requests.
+    if (img.dataset.busy === "1") continue;
+    const strip = img.closest(".subaps");
+    if (!strip || !strip.classList.contains("on")) continue;
+    img.dataset.busy = "1";
+    const done = () => { img.dataset.busy = "0"; };
+    img.onload = done;
+    img.onerror = done;   // 204 while the lenslet is off-sensor: keep the last frame
+    img.src = `/subaperture/${img.dataset.tile}.jpg?t=${Date.now()}`;
+  }
+  setTimeout(pollTiles, 1000 / TILE_HZ);
+}
+
+let tick = 0;
 async function poll() {
   try {
     const s = await jget("/api/status");
     $("#session").textContent = `${s.session_dir}   up ${s.uptime_s}s`;
     for (const c of s.cameras) {
       const el = document.querySelector(`[data-fps="${c.cam_id}"]`);
-      if (el) el.textContent =
-        `${c.fps} fps  ${c.frames} frames` + (c.errors ? `  ${c.errors} errors` : "");
+      if (el) {
+        el.textContent = `${c.fps} fps  ${c.frames} frames` + (c.errors ? `  ${c.errors} ERR` : "");
+        el.style.color = c.errors ? "var(--err)" : "";
+      }
     }
-  } catch (e) { /* transient; the stream itself will show a stall */ }
+    // Sub-aperture indices shift as pitch changes; refresh captions at a low
+    // rate rather than on every keystroke.
+    if (++tick % 3 === 0) s.cameras.forEach(c => refreshSubaps(c.cam_id));
+  } catch (e) { /* transient; the streams themselves show a stall */ }
   setTimeout(poll, 1000);
 }
 
-build().then(poll).catch(e => log(String(e), "err"));
+build().then(() => { poll(); pollTiles(); }).catch(e => log("startup: " + e.message, "err"));
 </script>
 </body>
 </html>

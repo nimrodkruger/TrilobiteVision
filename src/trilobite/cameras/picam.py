@@ -84,10 +84,17 @@ class Picamera2Source(CameraSource):
             p in raw_fmt for p in ("RGGB", "BGGR", "GRBG", "GBRG")
         )
 
+        raw_stream: dict[str, Any] = {"size": sensor_res}
+        if self.cfg.raw_format:
+            # Explicit format, because libcamera's default on a Pi 5 is
+            # MONO_PISP_COMP1 -- companded, not linear, and wrong for anything
+            # that fits a model to pixel values.
+            raw_stream["format"] = self.cfg.raw_format
+
         config = picam.create_video_configuration(
             main={"size": self._full_res},
             lores={"size": tuple(self.cfg.preview_resolution), "format": "YUV420"},
-            raw={"size": sensor_res},
+            raw=raw_stream,
             buffer_count=4,
         )
         picam.configure(config)
@@ -173,11 +180,25 @@ class Picamera2Source(CameraSource):
     def capture_full(self, raw: bool = True) -> Frame:
         if not self._open:
             raise RuntimeError(f"{self.cam_id}: camera not open")
+        stream = "raw" if raw else "main"
         with self._lock:
             request = self._picam.capture_request()
             try:
-                stream = "raw" if raw else "main"
-                data = request.make_array(stream)
+                try:
+                    data = request.make_array(stream)
+                except Exception as exc:
+                    # picamera2 cannot decode every raw format into an array --
+                    # notably MONO_PISP_COMP1, the Pi 5 default. Say exactly
+                    # what happened and what to do, rather than surfacing a
+                    # bare "format not supported" from three layers down.
+                    fmt = self._raw_format_name()
+                    raise RuntimeError(
+                        f"{self.cam_id}: cannot decode the {stream!r} stream "
+                        f"(format {fmt!r}). If this is a PiSP compressed format, "
+                        f"set 'raw_format' in the camera config to an uncompressed "
+                        f"one from 'probe_cameras.py' (e.g. R10), or capture the "
+                        f"processed stream instead."
+                    ) from exc
                 meta = dict(request.get_metadata())
             finally:
                 request.release()
@@ -224,6 +245,37 @@ class Picamera2Source(CameraSource):
                     f"{', '.join(sorted(self._picam.camera_controls))}"
                 )
             self._picam.set_controls(supported)
+
+    def _raw_format_name(self) -> str:
+        try:
+            return str(self._picam.camera_configuration()["raw"]["format"])
+        except Exception:
+            return "unknown"
+
+    def control_spec(self) -> dict[str, dict[str, Any]]:
+        if not self._open:
+            return {}
+        spec: dict[str, dict[str, Any]] = {}
+        for name, limits in self._picam.camera_controls.items():
+            # libcamera reports each control as (min, max, default); default
+            # may be None for controls with no defined resting value.
+            try:
+                lo, hi, default = limits
+            except (TypeError, ValueError):
+                continue
+            if isinstance(lo, bool) or isinstance(hi, bool):
+                spec[name] = {
+                    "type": "boolean",
+                    "default": bool(default) if default is not None else False,
+                }
+            elif isinstance(lo, (int, float)) and isinstance(hi, (int, float)):
+                spec[name] = {
+                    "type": "integer" if isinstance(lo, int) and isinstance(hi, int) else "number",
+                    "minimum": lo,
+                    "maximum": hi,
+                    "default": default,
+                }
+        return spec
 
     def get_controls(self) -> dict[str, Any]:
         if not self._open:

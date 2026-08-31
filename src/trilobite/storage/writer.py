@@ -71,11 +71,15 @@ class SessionWriter:
         pipeline_settings: dict[str, Any] | None = None,
         camera_info: dict[str, Any] | None = None,
         tag: str = "still",
+        label: str | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             self._counter += 1
             n = self._counter
 
+        # cam_id leads the filename after the tag, so a directory listing sorts
+        # by what the file *is* and names which physical camera produced it
+        # without opening the sidecar.
         stem = f"{tag}_{frame.cam_id}_{n:06d}_{datetime.now().strftime('%H%M%S_%f')}"
         cam_dir = self.session_dir / frame.cam_id
         cam_dir.mkdir(parents=True, exist_ok=True)
@@ -99,6 +103,8 @@ class SessionWriter:
         sidecar = {
             "file": img_path.name,
             "cam_id": frame.cam_id,
+            "camera_label": label or frame.cam_id,
+            "tag": tag,
             "seq": frame.seq,
             "t_monotonic": frame.t_mono,
             "t_wall": frame.t_wall,

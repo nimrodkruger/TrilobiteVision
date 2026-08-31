@@ -22,7 +22,8 @@ storage:
   still_format: npy
 
 cameras:
-  - cam_id: cam0
+  - cam_id: left
+    label: Left camera
     backend: picamera2
     index: 0
     full_resolution: [1456, 1088]     # IMX296 native
@@ -44,7 +45,8 @@ cameras:
       - {type: levels,     name: display, params: {gain: 1.0, gamma: 1.0}}
       - {type: mla_grid_overlay, name: mla, params: {enabled: false, pitch_px: 20}}
 
-  - cam_id: cam1
+  - cam_id: right
+    label: Right camera
     backend: picamera2
     index: 1
     full_resolution: [1456, 1088]
