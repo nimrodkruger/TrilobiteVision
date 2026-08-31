@@ -80,6 +80,9 @@
 
   .row { display:grid; grid-template-columns:104px 1fr 80px; align-items:center;
          gap:8px; margin:6px 0; }
+  /* Box-only rows: the number field takes the slider's column too, so the
+     layout stays a single tidy grid instead of leaving a gap. */
+  .row.boxonly input[type=number] { grid-column:2 / span 2; text-align:left; }
   .row > label { color:var(--muted); font-size:11px; overflow:hidden;
                  text-overflow:ellipsis; white-space:nowrap; }
   .row input[type=range] { width:100%; accent-color:var(--accent); min-width:0; }
@@ -179,8 +182,25 @@ function makeRow(key, spec, value, commit) {
   }
 
   const isInt = spec.type === "integer";
+  const hasMin = (spec.minimum ?? spec.exclusiveMinimum) !== undefined;
+  const hasMax = (spec.maximum ?? spec.exclusiveMaximum) !== undefined;
   const min = spec.minimum ?? spec.exclusiveMinimum ?? 0;
   const max = spec.maximum ?? spec.exclusiveMaximum ?? 1;
+
+  /* Whether this parameter gets a slider at all. Three reasons it should not:
+
+     1. The parameter declares widget:"box" -- e.g. grid line width over
+        0.5-6 px, where a slider is all travel and no precision.
+     2. It has no finite bound. A saturation level declared `ge=0` with no
+        maximum was getting a 0-1 slider with the value sitting at 250,
+        permanently pinned off the end. A bar with no upper bound is not a
+        bar, it is a lie.
+     3. Its range spans orders of magnitude. Exposure time runs 30 us to
+        100 ms; the useful band is a narrow slice of that, and a linear drag
+        cannot resolve it. (A log slider would work, but the box is simpler
+        and you already know the number you want.) */
+  const wideRange = min >= 0 && max > 0 && max / Math.max(min, 1) > 500;
+  const boxOnly = spec.widget === "box" || !hasMin || !hasMax || wideRange;
 
   const slider = document.createElement("input");
   slider.type = "range"; slider.min = min; slider.max = max;
@@ -192,11 +212,17 @@ function makeRow(key, spec, value, commit) {
   slider.value = value;
 
   const box = document.createElement("input");
-  box.type = "number"; box.min = min; box.max = max;
+  box.type = "number";
+  if (hasMin) box.min = min;
+  if (hasMax) box.max = max;
   box.step = isInt ? 1 : "any";
   box.value = fmt(value, isInt);
 
-  function setBoth(v) { slider.value = v; box.value = fmt(v, isInt); box.classList.remove("bad"); }
+  function setBoth(v) {
+    if (!boxOnly) slider.value = v;
+    box.value = fmt(v, isInt);
+    box.classList.remove("bad");
+  }
 
   // Guard against re-sending a value that is already in force. Three events
   // can each fire for one edit (input, change, blur) and the box also commits
@@ -237,7 +263,11 @@ function makeRow(key, spec, value, commit) {
   box.onblur = () => submit(readBox());
   box.onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); box.blur(); } };
 
-  row.appendChild(slider);
+  if (boxOnly) {
+    row.classList.add("boxonly");
+  } else {
+    row.appendChild(slider);
+  }
   row.appendChild(box);
   row.sync = setBoth;
   return row;
@@ -398,16 +428,41 @@ async function build() {
   });
 }
 
-async function saveAll(kind) {
+async function saveAll(kind, btn) {
+  // Feedback lands in three places on purpose: the button itself (so the
+  // click is visibly acknowledged even before the write finishes), each
+  // camera's own note line (so you see per-camera success or failure next to
+  // the image it came from), and the footer (the full detail). A header
+  // button whose result only appears in a footer reads as doing nothing.
+  const original = btn ? btn.textContent : null;
+  if (btn) { btn.disabled = true; btn.textContent = "Saving…"; }
+  for (const el of document.querySelectorAll("[data-note]")) {
+    el.textContent = `saving ${kind}…`; el.className = "note";
+  }
   log(`saving ${kind} on all cameras…`);
   try {
     const r = await jsend(`/api/capture-all/${kind}`);
-    const parts = Object.entries(r).map(([k, v]) => `${k}: ${v.file || v.error}`);
-    log(parts.join("   |   "), Object.values(r).some(v => v.error) ? "err" : "ok");
-  } catch (e) { log(e.message, "err"); }
+    const failed = Object.values(r).some(v => v.error);
+    for (const [cam, v] of Object.entries(r)) {
+      note(cam, v.error ? `save ${kind} failed: ${v.error}`
+                        : `${v.file}  ${v.shape.join("×")} ${v.dtype}`,
+           v.error ? "err" : "ok");
+    }
+    log(Object.entries(r).map(([k, v]) => `${k}: ${v.file || v.error}`).join("   |   "),
+        failed ? "err" : "ok");
+    if (btn) { btn.textContent = failed ? "Save failed" : "Saved ✓"; }
+  } catch (e) {
+    log(e.message, "err");
+    for (const el of document.querySelectorAll("[data-note]")) {
+      el.textContent = e.message; el.className = "note err";
+    }
+    if (btn) btn.textContent = "Save failed";
+  } finally {
+    if (btn) setTimeout(() => { btn.disabled = false; btn.textContent = original; }, 1400);
+  }
 }
-$("#all-raw").onclick = () => saveAll("raw");
-$("#all-view").onclick = () => saveAll("view");
+$("#all-raw").onclick = ev => saveAll("raw", ev.currentTarget);
+$("#all-view").onclick = ev => saveAll("view", ev.currentTarget);
 
 /* Sub-aperture tiles are POLLED, not streamed.
 

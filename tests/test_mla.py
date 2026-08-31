@@ -114,3 +114,82 @@ def test_centre_marker_is_on_the_origin():
     mask = g.centre_marker_mask((200, 200))
     ox, oy = (int(round(v)) for v in g.origin)
     assert mask[oy, ox]
+
+
+# --- wholeness, corner selection, de-rotation --------------------------------
+
+
+def test_whole_predicate_matches_what_crop_actually_returns():
+    """The bug this pins: a selection predicate that is even slightly more
+    conservative than the extractor rejects the outermost lenslet, so you get
+    the second one in -- and which one changes as the offset drifts."""
+    img = np.zeros((544, 728), np.uint8)
+    for pitch in (23.0, 56.0, 100.0, 137.5):
+        for ox in (0.0, 7.3, -11.9):
+            g = geom(pitch=pitch, offset_x=ox)
+            side = g.crop_side()
+            for i, j in g.whole_indices():
+                tile = g.crop(img, i, j)
+                assert tile.shape == (side, side), (pitch, ox, i, j, tile.shape)
+
+
+def test_outermost_whole_lenslet_is_actually_selected():
+    """No off-by-one: the chosen corner view must be the furthest one that is
+    still complete, not its inboard neighbour."""
+    g = geom(pitch=100.0)          # 728x544 -> centres at 363.5 + 100i
+    named = g.named_indices()
+    i, j = named["top_right"]
+    assert g.is_whole(i, j)
+    # The next one further out must NOT be whole -- otherwise we left one behind.
+    assert not g.is_whole(i + 1, j), "a further-out lenslet was still whole"
+    assert not g.is_whole(i, j - 1), "a further-out lenslet was still whole"
+
+
+def test_corners_are_resolved_independently_under_offset():
+    """With the grid pushed off-centre, the two corners are NOT symmetric.
+    Forcing (i,-j) / (-i,j) throws away a usable lenslet on one side."""
+    g = geom(pitch=100.0, offset_x=45.0)
+    named = g.named_indices()
+    tr, bl = named["top_right"], named["bottom_left"]
+    assert abs(tr[0]) != abs(bl[0]), (tr, bl)
+    assert g.is_whole(*tr) and g.is_whole(*bl)
+
+
+def test_selection_is_stable_against_tiny_offset_changes():
+    """Jitter check: nudging the offset by a hundredth of a pixel must not
+    flip the chosen lenslet."""
+    base = geom(pitch=100.0).named_indices()
+    for eps in (1e-3, -1e-3, 5e-3):
+        assert geom(pitch=100.0, offset_x=eps).named_indices() == base, eps
+
+
+def test_derotated_tile_is_axis_aligned():
+    """Build an image whose intensity ramps along the ROTATED lattice u axis.
+    After de-rotation the tile must ramp purely along its own x axis, so every
+    row is identical. This is the property that says the resampling used the
+    lattice basis and not the sensor basis."""
+    W = H = 400
+    for rot in (0.0, 7.0, -13.5):
+        g = MLAGeometry(width=W, height=H, pitch=120.0, rotation_deg=rot)
+        a, _ = g.normalised((H, W))
+        img = np.clip((a - a.min()) / (a.max() - a.min()) * 255, 0, 255).astype(np.uint8)
+        tile = g.crop_derotated(img, 0, 0).astype(np.float32)
+        row_spread = tile.std(axis=0).max()      # variation down each column
+        assert row_spread < 1.5, (rot, row_spread)
+
+
+def test_derotation_is_a_noop_at_zero_rotation():
+    img = np.random.default_rng(0).integers(0, 255, (400, 400), dtype=np.uint8)
+    g = MLAGeometry(width=400, height=400, pitch=100.0, rotation_deg=0.0)
+    assert np.array_equal(g.crop_derotated(img, 0, 0), g.crop(img, 0, 0))
+
+
+def test_highlight_mask_outlines_only_the_named_lenslets():
+    g = geom(pitch=100.0)
+    named = g.named_indices()
+    mask = g.highlight_mask((544, 728), [named["centre"]], thickness=2)
+    cx, cy = g.centre_of(0, 0)
+    half = g.crop_side() / 2
+    # Border pixels marked, interior clean.
+    assert mask[int(cy - half) + 1, int(cx)]
+    assert not mask[int(cy), int(cx)]

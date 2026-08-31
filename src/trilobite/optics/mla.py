@@ -40,11 +40,46 @@ from dataclasses import dataclass
 
 import numpy as np
 
-# Named sub-apertures the UI shows. Signs are in image convention: x right,
-# y DOWN -- so "top right" is +i, -j.
+# Named sub-apertures the geometry can resolve. Signs are in image convention:
+# x right, y DOWN -- so "top right" is +i, -j.
 NAMED_SUBAPERTURES: tuple[str, ...] = (
     "top_left", "centre", "top_right", "bottom_left", "bottom_right",
 )
+
+# The three the UI actually displays, in left-to-right display order. Defined
+# here rather than in the web layer so the overlay's highlight boxes and the
+# extracted tiles are guaranteed to name the same lenslets.
+UI_SUBAPERTURES: tuple[str, ...] = ("top_right", "centre", "bottom_left")
+
+
+def _bilinear(image: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Sample `image` at fractional coordinates, clamping at the border.
+
+    Written out rather than pulled from cv2 or scipy because the tiles are
+    small, this is the only resampling in the project, and it keeps the optics
+    module free of an image-processing dependency that the Pi build would then
+    have to guarantee.
+    """
+    h, w = image.shape[:2]
+    x0 = np.floor(x).astype(np.int64)
+    y0 = np.floor(y).astype(np.int64)
+    fx = (x - x0).astype(np.float32)
+    fy = (y - y0).astype(np.float32)
+
+    x0c, x1c = np.clip(x0, 0, w - 1), np.clip(x0 + 1, 0, w - 1)
+    y0c, y1c = np.clip(y0, 0, h - 1), np.clip(y0 + 1, 0, h - 1)
+
+    src = image.astype(np.float32)
+    if src.ndim == 3:
+        fx, fy = fx[..., None], fy[..., None]
+    top = src[y0c, x0c] * (1 - fx) + src[y0c, x1c] * fx
+    bot = src[y1c, x0c] * (1 - fx) + src[y1c, x1c] * fx
+    out = top * (1 - fy) + bot * fy
+
+    if np.issubdtype(image.dtype, np.integer):
+        info = np.iinfo(image.dtype)
+        out = np.clip(np.rint(out), info.min, info.max)
+    return out.astype(image.dtype)
 
 
 @dataclass(frozen=True)
@@ -86,83 +121,117 @@ class MLAGeometry:
         (ux, uy), (vx, vy) = self.basis
         return (gx + i * ux + j * vx, gy + i * uy + j * vy)
 
-    # -- extent ---------------------------------------------------------
+    # -- wholeness and selection ------------------------------------------
 
-    def index_extent(self, scale: float = 1.0) -> tuple[int, int]:
-        """Largest (|i|, |j|) for which all four corner lenslets fit the frame.
+    def is_whole(self, i: int, j: int, scale: float = 1.0, derotate: bool = True) -> bool:
+        """Does lenslet (i, j) yield a complete tile?
 
-        The axes must be checked *together*, not separately. Under rotation the
-        corner lenslet (i, j) is further from the origin than either (i, 0) or
-        (0, j), so a per-axis bound happily returns indices whose corner tile
-        hangs off the sensor. That surfaces as a sub-aperture tile that is a
-        sliver instead of a square.
-
-        Conservative by construction: it shrinks until every corner fits, so a
-        rotated grid loses an outer lenslet rather than returning a clipped
-        crop.
+        This is the *exact* predicate the extraction uses -- it tests the same
+        sampling window that crop() will read, not a padded approximation of
+        it. That matters: an approximate bound that is a pixel or two
+        conservative rejects the outermost lenslet most of the time, so the
+        view you get is the second one in from the edge, and which one it picks
+        changes as the offset moves by a fraction of a pixel. Both symptoms
+        come from the predicate disagreeing with the extractor, so the fix is
+        to make them the same code.
         """
+        cx, cy = self.centre_of(i, j)
         half = self.crop_side(scale) / 2.0
-        t = abs(math.radians(self.rotation_deg))
-        # Half-extent of an axis-aligned box containing the rotated tile, plus
-        # a pixel for the rounding inside crop().
-        pad = half * (abs(math.cos(t)) + abs(math.sin(t))) + 1.0
-
-        def axis_bound(step: tuple[int, int]) -> int:
-            n = 0
-            for k in range(1, 4096):
-                if all(
-                    self._fits(self.centre_of(sgn * k * step[0], sgn * k * step[1]), pad)
-                    for sgn in (-1, 1)
-                ):
-                    n = k
-                else:
-                    break
-            return n
-
-        i = axis_bound((1, 0))
-        j = axis_bound((0, 1))
-
-        def corners_fit(i: int, j: int) -> bool:
-            return all(
-                self._fits(self.centre_of(si * i, sj * j), pad)
-                for si in (-1, 1)
-                for sj in (-1, 1)
-            )
-
-        while (i > 0 or j > 0) and not corners_fit(i, j):
-            if i >= j and i > 0:
-                i -= 1
-            elif j > 0:
-                j -= 1
-            else:
-                i -= 1
-        return i, j
-
-    def _fits(self, centre: tuple[float, float], pad: float) -> bool:
-        x, y = centre
-        return (
-            x - pad >= 0
-            and y - pad >= 0
-            and x + pad <= self.width
-            and y + pad <= self.height
+        if derotate and abs(self.rotation_deg) > 1e-9:
+            # The sampling window is a square rotated with the lattice, so all
+            # four of its corners must be inside the frame.
+            t = math.radians(self.rotation_deg)
+            ct, st = math.cos(t), math.sin(t)
+            pts = [
+                (cx + sx * half * ct - sy * half * st, cy + sx * half * st + sy * half * ct)
+                for sx in (-1.0, 1.0)
+                for sy in (-1.0, 1.0)
+            ]
+        else:
+            # Axis-aligned integer window, exactly as crop() computes it.
+            x0 = int(round(cx - half))
+            y0 = int(round(cy - half))
+            side = self.crop_side(scale)
+            return x0 >= 0 and y0 >= 0 and x0 + side <= self.width and y0 + side <= self.height
+        return all(
+            0.0 <= x <= self.width - 1 and 0.0 <= y <= self.height - 1 for x, y in pts
         )
 
-    def named_indices(self, scale: float = 1.0) -> dict[str, tuple[int, int]]:
+    def _search_radius(self, scale: float = 1.0) -> tuple[int, int]:
+        """Generous index bounds to enumerate over. Cheap; correctness first."""
+        reach = math.hypot(self.width, self.height)
+        n = int(reach / max(self.pitch, 1e-6)) + 2
+        return n, n
+
+    def whole_indices(self, scale: float = 1.0, derotate: bool = True) -> list[tuple[int, int]]:
+        ni, nj = self._search_radius(scale)
+        return [
+            (i, j)
+            for i in range(-ni, ni + 1)
+            for j in range(-nj, nj + 1)
+            if self.is_whole(i, j, scale, derotate)
+        ]
+
+    def index_extent(self, scale: float = 1.0, derotate: bool = True) -> tuple[int, int]:
+        """Largest |i| and |j| among whole lenslets. Reporting only."""
+        whole = self.whole_indices(scale, derotate)
+        if not whole:
+            return 0, 0
+        return max(abs(i) for i, _ in whole), max(abs(j) for _, j in whole)
+
+    def nearest_whole_to(
+        self, target: tuple[float, float], scale: float = 1.0, derotate: bool = True
+    ) -> tuple[int, int] | None:
+        """The whole lenslet whose centre is closest to a point on the sensor.
+
+        Used with a sensor corner as the target, this is a direct statement of
+        "the furthest lenslet towards that corner that is still complete" --
+        no per-axis bound, no symmetry assumption, and independent for each
+        corner, so an off-centre grid picks the genuinely best lenslet in each
+        direction rather than a symmetric pair chosen by whichever side ran out
+        first.
+
+        Ties are broken deterministically by index, so a value sitting exactly
+        between two candidates does not flicker between frames.
+        """
+        whole = self.whole_indices(scale, derotate)
+        if not whole:
+            return None
+        tx, ty = target
+        return min(
+            whole,
+            key=lambda ij: (
+                round((self.centre_of(*ij)[0] - tx) ** 2 + (self.centre_of(*ij)[1] - ty) ** 2, 6),
+                ij[0],
+                ij[1],
+            ),
+        )
+
+    def named_indices(
+        self, scale: float = 1.0, derotate: bool = True
+    ) -> dict[str, tuple[int, int]]:
         """Map the UI's sub-aperture names onto concrete lenslet indices.
 
-        The corners use the *outermost fully-contained* lenslet, because those
-        are the ones whose alignment error is largest and therefore the ones
-        worth looking at while tuning pitch and rotation. A centre lenslet that
-        looks right tells you almost nothing; the corners tell you everything.
+        Corners are resolved independently, each as the whole lenslet nearest
+        that corner of the sensor. The corners are what tell you whether the
+        grid is right: pitch and rotation error accumulates with distance from
+        the anchor, so a centre lenslet looks correct under almost any wrong
+        pitch while a corner one does not.
         """
-        i, j = self.index_extent(scale)
-        return {
-            "centre": (0, 0),
-            "top_right": (i, -j),
-            "bottom_left": (-i, j),
-            "top_left": (-i, -j),
-            "bottom_right": (i, j),
+        w, h = self.width - 1, self.height - 1
+        targets = {
+            "centre": self.origin,
+            "top_right": (w, 0.0),
+            "bottom_left": (0.0, h),
+            "top_left": (0.0, 0.0),
+            "bottom_right": (w, h),
         }
+        out: dict[str, tuple[int, int]] = {}
+        for name, pt in targets.items():
+            idx = self.nearest_whole_to(pt, scale, derotate)
+            if idx is not None:
+                out[name] = idx
+        return out
 
     # -- rendering and extraction ----------------------------------------
 
@@ -199,6 +268,35 @@ class MLAGeometry:
             mask[max(0, yi - arm) : min(h, yi + arm + 1), xi] = True
         return mask
 
+    def highlight_mask(
+        self, shape: tuple[int, int], indices, scale: float = 1.0, thickness: float = 2.0
+    ) -> np.ndarray:
+        """Outline the given lenslets, following the rotated tile boundary.
+
+        Drawn in the lattice's own coordinates, so under rotation the box sits
+        on the tile that is actually extracted rather than on its axis-aligned
+        bounding box -- which is both larger and visibly off-register against
+        the grid, and would misrepresent what the zoom is showing.
+
+        Seeing which lenslets are selected is what makes a shifting selection
+        diagnosable instead of mysterious: when the choice jumps as you drag
+        the pitch, you can watch where it jumped to.
+        """
+        h, w = shape
+        mask = np.zeros((h, w), dtype=bool)
+        idx = list(indices)
+        if not idx:
+            return mask
+        a, b = self.normalised((h, w))
+        half = 0.5 * float(scale)
+        t = max(float(thickness), 0.5) / self.pitch    # thickness in pitch units
+        for i, j in idx:
+            da, db = np.abs(a - i), np.abs(b - j)
+            inside = (da <= half) & (db <= half)
+            inner = (da <= half - t) & (db <= half - t)
+            mask |= inside & ~inner
+        return mask
+
     def crop_side(self, scale: float = 1.0) -> int:
         """Side length in pixels of every sub-aperture tile.
 
@@ -227,3 +325,34 @@ class MLAGeometry:
         if x1c <= x0c or y1c <= y0c:
             return np.zeros((0, 0), dtype=image.dtype)
         return np.ascontiguousarray(image[y0c:y1c, x0c:x1c])
+
+    def crop_derotated(self, image: np.ndarray, i: int, j: int, scale: float = 1.0) -> np.ndarray:
+        """Sub-aperture tile resampled into the lenslet's own axes.
+
+        The array is rotated relative to the sensor, so an axis-aligned crop
+        shows the lenslet's field tilted by that angle -- and every tile tilted
+        the same way, which is exactly the artefact you are trying to null out
+        by eye. Sampling along the lattice basis instead gives the tile as the
+        lenslet actually sees it, so the three views become directly
+        comparable.
+
+        Sampled once, straight from the full frame, rather than cropping and
+        then rotating: two resampling steps would blur a 100 px tile
+        noticeably, and blur is the thing that makes a focus judgement wrong.
+        """
+        if abs(self.rotation_deg) < 1e-9:
+            return self.crop(image, i, j, scale)
+
+        side = self.crop_side(scale)
+        cx, cy = self.centre_of(i, j)
+        t = math.radians(self.rotation_deg)
+        ct, st = math.cos(t), math.sin(t)
+
+        # Output pixel (a, b), measured from the tile centre, corresponds to
+        # the point c + a*u_hat + b*v_hat in the frame -- the lattice basis
+        # directions, which is what "the lenslet's own axes" means.
+        o = np.arange(side, dtype=np.float32) - (side - 1) / 2.0
+        bb, aa = np.meshgrid(o, o, indexing="ij")
+        sx = cx + aa * ct - bb * st
+        sy = cy + aa * st + bb * ct
+        return _bilinear(image, sx, sy)

@@ -1,5 +1,28 @@
 """Plenoptic-specific stages.
 
+A note on `derotate_views`, because it encodes a physical assumption you should
+make deliberately rather than inherit.
+
+An apparent rotation of the lenslet grid relative to the sensor rows has two
+possible causes, and they call for opposite handling:
+
+  * **The sensor is rotated relative to the optical assembly.** Then the sensor
+    samples a rotated version of everything, and each microlens image is
+    rotated by the same angle as the lattice. De-rotating the tile is correct
+    and restores the true field.
+
+  * **The MLA is rotated relative to the sensor, with the main objective
+    square to the sensor.** Then only the *lattice of centres* is rotated. Each
+    lenslet is a rotationally symmetric element re-imaging an intermediate
+    image that has not moved, so the tile content is NOT rotated. De-rotating
+    it introduces a rotation that was never there.
+
+Both look identical in the grid overlay. Default is on, because it also makes
+the tiles directly comparable to each other, which is what you want while
+aligning. If your rotation comes from the MLA mount rather than the sensor
+mount, turn it off before extracting anything you intend to measure. The
+saved sidecar records the flag either way.
+
 The grid overlay is an alignment aid, not a measurement -- it draws on the
 preview only. Its parameters (pitch, rotation, offset) are the same numbers the
 sub-aperture extraction uses, which is the point: you tune them by eye against
@@ -15,7 +38,7 @@ from __future__ import annotations
 import numpy as np
 from pydantic import Field
 
-from ...optics.mla import MLAGeometry
+from ...optics.mla import UI_SUBAPERTURES, MLAGeometry
 from ...types import Frame
 from ..base import Stage, StageParams
 from ..registry import register
@@ -29,12 +52,20 @@ class MLAParams(StageParams):
     """
 
     enabled: bool = False
-    pitch_px: float = Field(20.0, gt=1.0, le=1000.0, description="Lenslet pitch, pixels")
+    # Ranges are chosen so the slider has usable resolution, not so they are
+    # theoretically permissive. A pitch above ~400 px leaves three lenslets on
+    # a 1456 px sensor, and the origin never needs to move more than a pitch or
+    # two from centre -- the box takes exact values within these bounds anyway.
+    pitch_px: float = Field(20.0, gt=1.0, le=400.0, description="Lenslet pitch, pixels")
     rotation_deg: float = Field(0.0, ge=-45.0, le=45.0, description="Grid rotation, degrees")
-    offset_x: float = Field(0.0, ge=-2000.0, le=2000.0, description="Grid origin x from centre, px")
-    offset_y: float = Field(0.0, ge=-2000.0, le=2000.0, description="Grid origin y from centre, px")
+    offset_x: float = Field(0.0, ge=-500.0, le=500.0, description="Grid origin x from centre, px")
+    offset_y: float = Field(0.0, ge=-500.0, le=500.0, description="Grid origin y from centre, px")
     crop_scale: float = Field(
         1.0, gt=0.1, le=4.0, description="Sub-aperture crop side, as a multiple of pitch"
+    )
+    derotate_views: bool = Field(
+        True,
+        description="Resample sub-aperture tiles into the lattice axes (see docstring)",
     )
 
 
@@ -45,9 +76,22 @@ class MLAGridOverlay(Stage):
     accepts = ("mono8", "mono16", "rgb8")
 
     class Params(MLAParams):
-        line_width: float = Field(1.0, ge=0.5, le=6.0, description="Grid line width, pixels")
-        intensity: float = Field(0.9, ge=0.0, le=1.0, description="Overlay opacity")
+        # widget="box": a slider over a 0.5-6 px range is all travel and no
+        # precision, and it costs a row of width that the useful parameters
+        # want. Declared here rather than special-cased in the page, so the
+        # presentation stays a property of the parameter.
+        line_width: float = Field(
+            1.0, ge=0.5, le=6.0, description="Grid line width, pixels",
+            json_schema_extra={"widget": "box"},
+        )
+        intensity: float = Field(
+            0.9, ge=0.0, le=1.0, description="Overlay opacity",
+            json_schema_extra={"widget": "box"},
+        )
         show_centre: bool = Field(True, description="Crosshair on the grid origin")
+        highlight_views: bool = Field(
+            True, description="Outline the sub-apertures shown below the preview"
+        )
 
     def __init__(self, name: str | None = None, **params) -> None:
         super().__init__(name, **params)
@@ -55,7 +99,7 @@ class MLAGridOverlay(Stage):
         # rest of the pipeline combined -- and it changes only when a parameter
         # or the frame size changes. Cache it.
         self._key: tuple | None = None
-        self._mask: np.ndarray | None = None
+        self._mask: tuple[np.ndarray, np.ndarray] | None = None
 
     def reset(self) -> None:
         self._key = None
@@ -72,38 +116,57 @@ class MLAGridOverlay(Stage):
             offset_y=float(p.offset_y),
         )
 
-    def _overlay_mask(self, h: int, w: int) -> np.ndarray:
+    def _masks(self, h: int, w: int) -> tuple[np.ndarray, np.ndarray]:
+        """(grid mask, highlight mask), cached on the parameters and frame size.
+
+        Building these costs ~20 ms at preview resolution -- more than the rest
+        of the pipeline combined -- and they change only when a parameter does.
+        """
         p = self.params
         key = (
-            h, w, p.pitch_px, p.rotation_deg, p.offset_x, p.offset_y, p.line_width, p.show_centre,
+            h, w, p.pitch_px, p.rotation_deg, p.offset_x, p.offset_y,
+            p.line_width, p.show_centre, p.crop_scale, p.highlight_views,
         )
         if key == self._key and self._mask is not None:
             return self._mask
         geom = self.geometry(w, h)
-        mask = geom.grid_mask((h, w), line_width=float(p.line_width))
+        grid = geom.grid_mask((h, w), line_width=float(p.line_width))
         if p.show_centre:
-            mask = mask | geom.centre_marker_mask((h, w))
-        self._key, self._mask = key, mask
-        return mask
+            grid = grid | geom.centre_marker_mask((h, w))
+
+        if p.highlight_views:
+            named = geom.named_indices(float(p.crop_scale))
+            picked = [named[n] for n in UI_SUBAPERTURES if n in named]
+            hi = geom.highlight_mask((h, w), picked, float(p.crop_scale), thickness=2)
+        else:
+            hi = np.zeros((h, w), dtype=bool)
+
+        self._key, self._mask = key, (grid, hi)
+        return grid, hi
 
     def apply(self, frame: Frame) -> Frame:
         d = frame.data
         h, w = d.shape[:2]
-        mask = self._overlay_mask(h, w)
+        grid, hi = self._masks(h, w)
         out = d.copy()
 
         peak = 65535 if d.dtype == np.uint16 else 255
         alpha = float(self.params.intensity)
-        out[mask] = (out[mask] * (1 - alpha) + peak * alpha).astype(out.dtype)
+        # Grid lines are blended at the chosen opacity; the highlight boxes are
+        # drawn at full intensity over the top, so which lenslets are being
+        # zoomed is unambiguous even against a bright scene.
+        out[grid] = (out[grid] * (1 - alpha) + peak * alpha).astype(out.dtype)
+        out[hi] = peak
 
         geom = self.geometry(w, h)
-        i_max, j_max = geom.index_extent(float(self.params.crop_scale))
+        named = geom.named_indices(float(self.params.crop_scale))
         return frame.derive(
             out,
             mla_pitch_px=float(self.params.pitch_px),
             mla_rotation_deg=float(self.params.rotation_deg),
             mla_origin_px=list(geom.origin),
-            mla_index_extent=[i_max, j_max],
+            mla_index_extent=list(geom.index_extent(float(self.params.crop_scale))),
+            mla_views={k: list(v) for k, v in named.items()},
         )
 
 

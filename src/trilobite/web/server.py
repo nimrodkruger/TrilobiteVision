@@ -40,6 +40,7 @@ from pydantic import BaseModel, ValidationError
 
 from ..app import Application, CameraRuntime
 from ..config import StageConfig
+from ..optics.mla import UI_SUBAPERTURES
 from ..processing.registry import catalogue
 from ..sinks.jpeg import encode_jpeg
 
@@ -47,11 +48,9 @@ log = logging.getLogger(__name__)
 
 STATIC = Path(__file__).parent / "static"
 
-# The sub-apertures the UI shows, in display order. Centre plus two opposite
-# corners: the corners are where pitch and rotation error accumulates, so they
-# are what tells you whether the grid is right. A centre lenslet looks correct
-# under almost any wrong pitch.
-SUBAPERTURE_VIEWS: tuple[str, ...] = ("top_right", "centre", "bottom_left")
+# Defined in the optics module, so the overlay's highlight boxes and the tiles
+# served here are guaranteed to name the same lenslets.
+SUBAPERTURE_VIEWS = UI_SUBAPERTURES
 
 
 class ParamUpdate(BaseModel):
@@ -83,10 +82,17 @@ def _subaperture_tile(cam: CameraRuntime, view: str) -> np.ndarray | None:
     h, w = frame.data.shape[:2]
     geom = stage.geometry(w, h)
     scale = float(stage.params.crop_scale)
-    idx = geom.named_indices(scale).get(view)
+    derot = bool(getattr(stage.params, "derotate_views", True))
+    idx = geom.named_indices(scale, derotate=derot).get(view)
     if idx is None:
         return None
-    tile = geom.crop(frame.data, idx[0], idx[1], scale)
+    # Whether to resample into the lattice axes is a physical question, not a
+    # display preference -- see the note at the top of processing/stages/
+    # plenoptic.py. The stage owns the decision; this just honours it.
+    if bool(getattr(stage.params, "derotate_views", True)):
+        tile = geom.crop_derotated(frame.data, idx[0], idx[1], scale)
+    else:
+        tile = geom.crop(frame.data, idx[0], idx[1], scale)
     return tile if tile.size else None
 
 
