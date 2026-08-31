@@ -1,0 +1,97 @@
+# apt packages for the flyeye Pi 5 rig.
+#
+# Install everything uncommented here with:
+#
+#   sudo apt update && sudo apt full-upgrade -y
+#   while read -r p; do sudo apt install -y "$p" || echo "SKIPPED: $p"; done \
+#     < <(grep -vE '^\s*(#|$)' apt-packages.txt)
+#
+# The loop installs one at a time so a single wrong package name reports
+# itself and the rest still install -- unlike `apt install a b c`, which
+# aborts the whole batch. Anything that prints SKIPPED, tell me about.
+#
+# Everything below comes from apt on purpose. The camera stack in particular
+# must NOT be installed with pip: python3-picamera2 is a C++ extension built
+# against the system libcamera, and the pip build drifts out of step with it.
+# numpy and opencv are apt too, so they stay ABI-compatible with picamera2's
+# buffers -- and so you avoid a 40-minute OpenCV source build on the Pi.
+
+
+# ---------------------------------------------------------------------------
+# REQUIRED -- the camera stack. Nothing works without these.
+# ---------------------------------------------------------------------------
+
+python3-picamera2         # Python camera API. Pulls in python3-libcamera,
+                          # python3-simplejpeg, python3-kms++ as dependencies.
+rpicam-apps               # rpicam-hello / rpicam-still / rpicam-vid.
+                          # `rpicam-hello --list-cameras` is the first thing
+                          # to run when a camera does not appear -- it tells
+                          # you whether the problem is below Python or above.
+
+
+# ---------------------------------------------------------------------------
+# REQUIRED -- Python tooling and the numeric libraries flyeye imports
+# ---------------------------------------------------------------------------
+
+python3-venv              # for  python3 -m venv --system-site-packages
+python3-pip
+python3-dev               # headers, needed if any pip package builds a wheel
+python3-numpy
+python3-opencv            # image I/O and JPEG encode fallback
+python3-yaml              # config file parsing
+python3-pil               # second JPEG fallback; also handy for quick checks
+git
+
+
+# ---------------------------------------------------------------------------
+# RECOMMENDED -- diagnostics you will want the first time something is wrong
+# ---------------------------------------------------------------------------
+
+v4l-utils                 # v4l2-ctl: what the kernel thinks the sensor is
+i2c-tools                 # i2cdetect: is the camera responding on the bus at
+                          # all? Distinguishes a dead ribbon cable from a
+                          # software problem.
+libcamera-tools           # cam --list, lower-level than rpicam-hello
+htop
+tmux                      # keep a capture running after the SSH link drops.
+                          # On a Pi you will want this sooner than you expect.
+rsync                     # pulling image data off the Pi faster than scp
+
+
+# ---------------------------------------------------------------------------
+# RECOMMENDED -- storage. Put image data on an SSD, not the SD card.
+# ---------------------------------------------------------------------------
+
+exfatprogs                # mount an exFAT USB SSD shared with Windows
+nvme-cli                  # if you fit an NVMe HAT
+gdisk                     # partitioning a new drive
+
+
+# ---------------------------------------------------------------------------
+# LIKELY, given where this project is going -- analysis on the device
+# ---------------------------------------------------------------------------
+
+python3-scipy             # optimisation and interpolation for calibration fits
+python3-matplotlib        # plotting; also useful headless, saving PNGs
+python3-h5py              # HDF5, for frame sequences too large for .npy
+build-essential           # compiler, for any pip package without an arm wheel
+cmake
+pkg-config
+
+
+# ---------------------------------------------------------------------------
+# OPTIONAL -- uncomment when you actually need them. Each is a real download.
+# ---------------------------------------------------------------------------
+
+# python3-skimage         # scikit-image: registration, feature detection
+# python3-pandas          # tabular analysis of calibration sweeps
+# python3-sklearn         # if clustering lenslet centres
+# ffmpeg                  # muxing recorded frames into a video file.
+                          # NOTE: encoding on a Pi 5 is CPU-only -- the
+                          # VideoCore VII has no hardware H.264 encoder. Prefer
+                          # storing lossless frames and encoding off-device.
+# python3-serial          # talking to a microcontroller for hardware triggers
+# gpiod python3-libgpiod  # GPIO from Python on Pi 5 (the old RPi.GPIO does
+                          # not work on Pi 5 -- it uses a different GPIO chip)
+# sqlite3                 # if session indexing outgrows JSON sidecars
+# nginx                   # only if you later put the web UI behind a proxy
