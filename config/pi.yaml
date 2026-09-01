@@ -44,6 +44,13 @@ cameras:
       - {type: stats,      name: stats}
       - {type: levels,     name: display, params: {gain: 1.0, gamma: 1.0}}
       - {type: mla_grid_overlay, name: mla, params: {enabled: false, pitch_px: 20}}
+      # Live checkerboard presence, for the hands-free capture loop. Costs
+      # about 3 ms per preview frame and needs no camera access of its own.
+      # Must come AFTER the MLA stage: it counts into that grid.
+      # min_corners: roughly two thirds of (cols+2)x(rows+2) for your board --
+      # the Preconditions panel says what yours implies.
+      - {type: checkerboard_presence, name: presence,
+         params: {enabled: false, min_corners: 20}}
 
   - cam_id: right
     label: Right camera
@@ -60,3 +67,10 @@ cameras:
       - {type: stats,      name: stats}
       - {type: levels,     name: display, params: {gain: 1.0, gamma: 1.0}}
       - {type: mla_grid_overlay, name: mla, params: {enabled: false, pitch_px: 20}}
+      # Live checkerboard presence, for the hands-free capture loop. Costs
+      # about 3 ms per preview frame and needs no camera access of its own.
+      # Must come AFTER the MLA stage: it counts into that grid.
+      # min_corners: roughly two thirds of (cols+2)x(rows+2) for your board --
+      # the Preconditions panel says what yours implies.
+      - {type: checkerboard_presence, name: presence,
+         params: {enabled: false, min_corners: 20}}

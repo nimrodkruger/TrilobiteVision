@@ -21,6 +21,10 @@ The four:
   3. saddle map, full resolution     corner *counting* without corner finding
   4. saddle map, preview resolution  the same, on frames the pipeline already has
 
+Approaches 2 and 4 are the ones the rig now uses: the presence map runs on
+every preview frame, the five-tile cross once per pose. 1 is what it used to do
+and is here for the comparison. Run this before changing any of that.
+
 Approaches 3 and 4 answer a weaker question -- how many corner-like features
 are in each micro-image, not where they are -- which happens to be the exact
 question the live display asks. Their cost does not depend on the number of
@@ -144,8 +148,11 @@ def main() -> int:
     args = ap.parse_args()
 
     src = make_source()
-    full = src.read_full_mono().data
+    # Through the capture-thread handshake, like everything else: nothing
+    # outside the capture loop is allowed to touch a camera.
+    src.request_full_frame()
     preview = src.read_preview().data
+    full = src.take_full_frame().data
 
     gf = MLAGeometry(width=FULL[0], height=FULL[1], pitch=PITCH)
     gp = MLAGeometry(width=PREVIEW[0], height=PREVIEW[1],

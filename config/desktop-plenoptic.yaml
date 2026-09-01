@@ -12,9 +12,9 @@
 #
 #   trilobite --config config/desktop-plenoptic.yaml
 #
-# Then: enable the `mla` stage, leave pitch at 50 (the preview is half scale,
-# so 50 preview px is the 100 sensor px the source renders), switch to
-# Calibration, set the board to 4 x 3, and press Start detection.
+# Then: switch to Calibration, set the board to 4 x 3 inner corners at 7 mm,
+# and press Start session. The synthetic board drifts a few pixels, which is
+# enough to exercise the settle and movement gates.
 
 log_level: INFO
 
@@ -45,6 +45,10 @@ cameras:
       # pitch_px is in PREVIEW pixels -- half of synthetic_pitch_px. The stage
       # records that reference and the detector scales it to the sensor frame.
       - {type: mla_grid_overlay, name: mla, params: {enabled: true, pitch_px: 50}}
+      # The cheap live detector. Must come after the MLA stage -- it counts
+      # saddle points into that grid's micro-images. ~3 ms per frame.
+      - {type: checkerboard_presence, name: presence,
+         params: {enabled: true, min_corners: 20}}
 
   - cam_id: right
     label: Right camera
@@ -63,3 +67,5 @@ cameras:
       - {type: levels, name: display, params: {gain: 1.0, gamma: 1.0}}
       - {type: mla_grid_overlay, name: mla,
          params: {enabled: true, pitch_px: 50, rotation_deg: 2.0, crop_scale: 0.9}}
+      - {type: checkerboard_presence, name: presence,
+         params: {enabled: true, min_corners: 20}}

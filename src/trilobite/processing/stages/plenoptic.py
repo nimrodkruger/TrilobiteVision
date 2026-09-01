@@ -270,6 +270,127 @@ class MLAGridOverlay(Stage):
         )
 
 
+@register("checkerboard_presence")
+class CheckerboardPresence(Stage):
+    """Count checkerboard corners per micro-image, on every preview frame.
+
+    Not a corner detector: it counts saddle points of intensity, which is what
+    a checkerboard corner is, without identifying or localising any of them.
+    See trilobite.calibration.presence for the reasoning and the measurements.
+
+    It lives in the pipeline rather than in a worker thread of its own, and
+    that is the whole point. The frames it works on are the ones the preview
+    already produces, so it opens no second consumer of the camera -- which was
+    what took the rig down when full-field corner detection had its own thread
+    reaching into picamera2 on its own schedule. Its cost, about 3 ms at
+    preview resolution, appears in this stage's timing in the UI like any
+    other stage's, where it can be seen rather than assumed.
+
+    The MLA stage must come before it in the pipeline: this reads the same
+    geometry, so the tiles it counts into are the tiles the crops come from.
+    """
+
+    accepts = ("mono8", "mono16")
+
+    class Params(StageParams):
+        enabled: bool = False
+        min_corners: int = Field(
+            20, ge=1, le=400, title="Corners for 'seeing the board'",
+            description="A micro-image counts as seeing the pattern at this many "
+                        "saddle peaks. A tile showing the whole pattern reads "
+                        "about (cols+2)x(rows+2) -- every grid vertex, not just "
+                        "the inner corners -- so 4x3 reads ~30 and two thirds of "
+                        "that is a good threshold. The Preconditions panel says "
+                        "what your board implies.",
+            json_schema_extra={"widget": "box"})
+        peak_window: int = Field(
+            5, ge=3, le=21, title="Peak separation, px",
+            description="Local-maximum window. Smaller than one square, so two "
+                        "corners of the same square are never merged.",
+            json_schema_extra={"widget": "box"})
+        rel_threshold: float = Field(
+            0.15, gt=0.0, le=1.0, title="Peak threshold",
+            description="Fraction of the frame's strongest saddle response a peak "
+                        "must reach. Lower finds fainter patterns and more noise.",
+            json_schema_extra={"widget": "box"})
+        tint: bool = Field(
+            True, title="Tint the preview",
+            description="Brighten micro-images that are seeing the pattern, so "
+                        "aiming the board needs no second display.")
+
+    def __init__(self, name: str | None = None, **params) -> None:
+        super().__init__(name, **params)
+        self._detector = None
+        self._geometry_source = None
+        # The latest map, for the calibration layer to read. One frame deep:
+        # nothing here accumulates, and nothing here writes to disk.
+        self.result = None
+        self._tint_key: tuple | None = None
+        self._tint_labels: np.ndarray | None = None
+
+    def bind_geometry(self, mla_stage) -> None:
+        """Point this stage at the MLA stage whose grid it should count into."""
+        self._geometry_source = mla_stage
+
+    def reset(self) -> None:
+        self.result = None
+        self._tint_key = None
+        self._tint_labels = None
+
+    def apply(self, frame: Frame) -> Frame:
+        if self._geometry_source is None:
+            # Nothing to count into. Not an error -- the pipeline may simply
+            # not have an MLA stage yet -- but say so once rather than silently
+            # producing an empty map for ever.
+            if self.result is None:
+                log.warning("%s: no MLA stage bound; presence map disabled", self.name)
+            return frame
+
+        from ...calibration.presence import PresenceDetector  # noqa: PLC0415 - needs cv2
+
+        p = self.params
+        if self._detector is None:
+            self._detector = PresenceDetector(p.peak_window, p.rel_threshold)
+        self._detector.peak_window = int(p.peak_window)
+        self._detector.rel_threshold = float(p.rel_threshold)
+
+        h, w = frame.data.shape[:2]
+        geom = self._geometry_source.geometry_for(w, h)
+        scale = float(self._geometry_source.params.crop_scale)
+        self.result = self._detector.run(frame.data, geom, scale)
+        seeing = len(self.result.seeing(int(p.min_corners)))
+
+        out = frame.data
+        if p.tint:
+            out = self._tinted(frame.data, geom, scale, int(p.min_corners))
+
+        return frame.derive(
+            out,
+            presence_tiles_seeing=seeing,
+            presence_strength=round(self.result.strength, 1),
+            presence_ms=round(self.result.ms, 2),
+        )
+
+    def _tinted(self, data, geom, scale: float, min_corners: int):
+        """Brighten the micro-images that are seeing the pattern.
+
+        Aiming a board while watching a numeric readout is not workable with
+        both hands full, so the feedback goes on the image itself.
+        """
+        det = self._detector
+        labels, (i0, j0, cols, rows) = det.labels_for(geom, data.shape[:2], scale)
+        good = ((self.result.counts >= min_corners) & self.result.whole).ravel()
+        if not good.any():
+            return data
+        lut = np.zeros(cols * rows + 1, dtype=bool)
+        lut[:-1] = good
+        mask = lut[np.where(labels < 0, cols * rows, labels)]
+        out = data.copy()
+        peak = 65535 if out.dtype == np.uint16 else 255
+        out[mask] = (out[mask] * 0.75 + peak * 0.25).astype(out.dtype)
+        return out
+
+
 @register("lenslet_extract")
 class LensletExtract(Stage):
     """Placeholder: resample a raw plenoptic frame into per-lenslet views.

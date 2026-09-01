@@ -1,31 +1,23 @@
-"""Live per-tile checkerboard detection. **Nothing here writes to disk.**
+"""Checkerboard corner detection in a micro-image.
 
-That constraint is the point of this stage, not an omission. Before any pose is
-recorded there is a prior question to answer at the bench: *does the detector
-see a board in the micro-images at all, and in enough of them at once?* A rig
-that records unusable corners for twenty minutes and reveals it at the fit is
-far worse than one that shows you, live, that eleven tiles are finding the
-pattern and the other hundred and sixteen are not.
+A detector and nothing else: no threads, no camera access, no files. It is
+called from two places, both of which decide their own cadence:
 
-So this module answers exactly that question and holds the answer in memory
-until the next pass overwrites it. There is no session, no accumulator, no
-file. Recording is the next piece and it goes somewhere else.
+  * `calibration/session.py`, on a five-tile cross once per pose -- the
+    acceptance check that decides whether a pose is worth keeping. About 45 ms
+    per camera at full resolution.
+  * offline analysis, over every micro-image of a recorded frame, where there
+    is no time budget at all.
 
-What runs, per pass, per camera:
+The live "is the board in view" question is *not* answered here. It is answered
+by `calibration/presence.py`, which counts saddle points across the whole frame
+in about 3 ms without locating a single corner. The difference matters: running
+this detector over every tile of every frame is what made the first live design
+impossible on a Pi.
 
-  1. one full-resolution frame (`read_full_mono`) -- not the preview, which is
-     half-scale and would halve corner precision for nothing;
-  2. the MLA geometry converted to that frame's size (`geometry_for`) -- this
-     is where the preview-vs-sensor factor of two is dealt with, once;
-  3. every whole tile cropped and put through `findChessboardCornersSB`;
-  4. corners mapped back into frame coordinates;
-  5. the cross-of-five acceptance rule evaluated over the passing tiles.
-
-Cost is about 2 ms per tile for a 100 px micro-image, so 127 whole tiles is a
-quarter of a second on a desktop and closer to a second on a Pi 5. That is a
-1-2 Hz instrument, which is the right cadence for "hold the board still and
-watch" and hopeless as a per-frame operation -- hence a worker thread with its
-own clock rather than anything hung off the capture loop.
+Corner positions come back in FULL-FRAME sensor coordinates, never tile-local,
+so a record does not depend on the crop convention and a later change to
+`crop_scale` does not invalidate it.
 
 On refinement: `findChessboardCornersSB` with CALIB_CB_ACCURACY already runs
 its own sub-pixel stage, and it is the better one here. A `cornerSubPix` pass
@@ -36,10 +28,7 @@ ours -- a deliberate departure from calibration-ui-spec §4.4 step 3.
 
 from __future__ import annotations
 
-import contextlib
 import logging
-import os
-import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -322,181 +311,22 @@ def annotate(
     return view
 
 
-# --------------------------------------------------------------------------
-# Worker
-# --------------------------------------------------------------------------
-
-
-class DetectionWorker:
-    """One thread per camera, publishing the latest pass and nothing else.
-
-    Deliberately not fed by the capture loop. The capture thread's contract is
-    read-process-publish and nothing slow, and a detection pass is three orders
-    of magnitude slower than a preview frame. This pulls its own full-resolution
-    frame at its own rate, and a pass that takes too long simply produces fewer
-    updates -- it can never perturb the preview or the frame rate.
-
-    `latest()` returns the most recent completed pass, or None. There is no
-    history, because nothing is being recorded.
-
-    **Three limits on how hard this is allowed to work**, added after the first
-    run on the real rig took the Pi down:
-
-      * a shared semaphore, so by default only one camera detects at a time.
-        Two full-frame passes in parallel double the peak current draw, and a
-        Pi 5 with two cameras is already the wrong side of a marginal supply.
-      * a duty cycle. After a pass lasting T the worker sleeps until it has
-        been idle for the configured fraction of the time, so a pass that
-        turns out to cost a second costs a second every two seconds rather
-        than a permanently pinned core.
-      * a lowered thread priority, so the capture threads and the web server
-        keep the CPU when it is contended. A starved event loop is what makes
-        a busy rig look hung rather than slow.
-
-    None of these make a wrong pitch cheap -- that is caught before the start,
-    by the tile-count precondition. They bound what a *correct* configuration
-    can cost.
-    """
-
-    def __init__(
-        self,
-        cam: Any,
-        board: BoardSpec,
-        acceptance: AcceptanceSpec,
-        min_interval: float = 0.4,
-        annotate_overlay: bool = True,
-        normalize: bool = False,
-        accuracy: bool = False,
-        max_tiles: int = 320,
-        max_duty: float = 0.5,
-        gate: threading.Semaphore | None = None,
-    ) -> None:
-        self.cam = cam
-        self.min_interval = float(min_interval)
-        self.annotate_overlay = annotate_overlay
-        self.detector = CornerDetector(board, acceptance, normalize, accuracy)
-        self.max_tiles = int(max_tiles)
-        self.max_duty = min(max(float(max_duty), 0.05), 1.0)
-        self.gate = gate or threading.Semaphore(1)
-        self.passes = 0
-        self.started_at = time.time()
-        self.last_pass_ms = 0.0
-        self._latest: DetectionResult | None = None
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    # -- lifecycle --------------------------------------------------------
-
-    @property
-    def running(self) -> bool:
-        return bool(self._thread and self._thread.is_alive())
-
-    def start(self) -> None:
-        if self.running:
-            return
-        self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._run, name=f"detect-{self.cam.cam_id}", daemon=True
-        )
-        self._thread.start()
-        log.info("%s: detection worker started", self.cam.cam_id)
-
-    def stop(self, timeout: float = 5.0) -> None:
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=timeout)
-        self._thread = None
-        log.info("%s: detection worker stopped after %d passes", self.cam.cam_id, self.passes)
-
-    def latest(self) -> DetectionResult | None:
-        with self._lock:
-            return self._latest
-
-    # -- the loop ---------------------------------------------------------
-
-    def _run(self) -> None:
-        # Detection is the least urgent thing this process does. Give the
-        # capture threads and the event loop the CPU when it is contended --
-        # a preview that stutters and an API that stops answering are how a
-        # busy rig comes to look like a crashed one.
-        with contextlib.suppress(AttributeError, OSError):
-            os.nice(10)
-
-        while not self._stop.is_set():
-            t0 = time.monotonic()
-            try:
-                # Only one camera measures at a time by default. The semaphore
-                # rather than a single shared worker so that each camera keeps
-                # its own cadence, error state and result slot.
-                if not self.gate.acquire(timeout=5.0):
-                    continue
-                try:
-                    self._one_pass()
-                finally:
-                    self.gate.release()
-            except Exception as exc:
-                log.exception("%s: detection pass failed", self.cam.cam_id)
-                self._publish(
-                    DetectionResult(
-                        cam_id=self.cam.cam_id, t_wall=time.time(), seq=-1,
-                        frame_shape=(0, 0), board=(0, 0),
-                        error=f"{type(exc).__name__}: {exc}",
-                    )
-                )
-                # A failure that repeats every 400 ms fills the log and helps
-                # nobody. Back off to once a second and let the message stand.
-                self._stop.wait(1.0)
-                continue
-            spent = time.monotonic() - t0
-            self.last_pass_ms = spent * 1000.0
-            # Idle for long enough that the busy fraction stays under max_duty,
-            # and in any case for min_interval. At duty 0.5 a one-second pass
-            # is followed by a second of sleep, so the worst case is half a
-            # core per camera instead of all of it.
-            duty_sleep = spent * (1.0 / self.max_duty - 1.0)
-            self._stop.wait(max(0.0, self.min_interval - spent, duty_sleep))
-
-    def _one_pass(self) -> None:
-        stage = self.cam.mla_stage()
-        if stage is None:
-            raise RuntimeError(f"{self.cam.cam_id}: no mla_grid_overlay stage")
-        frame = self.cam.source.read_full_mono()
-        if frame is None:
-            self._stop.wait(0.2)
-            return
-        image = frame.data
-        h, w = image.shape[:2]
-        # The one place the preview-vs-sensor scale is applied. Everything
-        # downstream -- crops, corner coordinates, the overlay -- is in this
-        # frame's own pixels.
-        geom = stage.geometry_for(w, h)
-        scale = float(stage.params.crop_scale)
-        derot = bool(getattr(stage.params, "derotate_views", False))
-
-        # Second line of defence. The tile count is a precondition, checked
-        # before the run starts -- but the MLA parameters are live objects and
-        # nothing stops a pitch being changed underneath a running detector.
-        # Refusing here turns "the machine became unresponsive" into a message.
-        tiles = geom.whole_indices(scale, derotate=derot)
-        if len(tiles) > self.max_tiles:
-            raise RuntimeError(
-                f"grid now yields {len(tiles)} whole tiles, over the limit of "
-                f"{self.max_tiles}. The pitch changed while detection was "
-                f"running. Stopping rather than saturating the CPU."
-            )
-
-        result = self.detector.run(
-            image, geom, self.cam.cam_id, frame.seq, scale, derot, tiles=tiles
-        )
-        if self.annotate_overlay:
-            try:
-                result.overlay = annotate(image, result, geom, scale)
-            except Exception:
-                log.exception("%s: overlay failed", self.cam.cam_id)
-        self.passes += 1
-        self._publish(result)
-
-    def _publish(self, result: DetectionResult) -> None:
-        with self._lock:
-            self._latest = result
+# The worker that used to live here is gone. It ran this detector over every
+# micro-image of a full-resolution frame, on its own thread, per camera --
+# about a second per pass on a Pi 5, so two cameras at 1 Hz needed more than
+# one core, and its second claim on the picamera2 request pool took the rig
+# down repeatedly. A four-core CPU stress test did not, which is how the camera
+# access rather than the load was identified.
+#
+# What replaced it, and why each piece is where it is:
+#
+#   the live map        calibration/presence.py, running as a pipeline stage on
+#                       preview frames that already flow. ~3 ms, no camera
+#                       access of its own, and its cost does not grow with the
+#                       number of tiles.
+#   the accept check    calibration/session.py, calling detect_tile() below on a
+#                       five-tile cross, once per pose. ~45 ms.
+#   full-field corners  offline, on the desktop, from the recorded frames.
+#
+# This module is now a detector and nothing else: nothing here owns a thread or
+# touches a camera.

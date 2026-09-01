@@ -55,6 +55,7 @@ class CameraRuntime:
         self.label = cfg.label or cfg.cam_id.replace("_", " ").title()
         self.source: CameraSource = build_camera(cfg)
         self.pipeline = Pipeline.from_config(cfg.pipeline)
+        self.bind_pipeline()
         self.preview = LatestFrame()
         self.writer = writer
         self.rate = RateMeter()
@@ -140,6 +141,40 @@ class CameraRuntime:
             tag=tag,
             label=self.label,
         )
+
+    def grab_full(self, timeout: float = 3.0) -> Frame | None:
+        """A full-resolution mono frame, served by the capture thread.
+
+        The caller never touches the camera. It raises a flag, the capture loop
+        pulls `main` out of the request it is already holding, and the frame
+        comes back here -- same exposure as the preview it arrived with. See
+        cameras/base.py for why a second consumer is not allowed to exist.
+
+        Returns None if no frame arrives in `timeout`, which is what a stalled
+        camera looks like from here and is the caller's cue to say so rather
+        than to retry.
+        """
+        return self.source.wait_full_frame(timeout)
+
+    def presence_stage(self):
+        """The checkerboard-presence stage, if this camera has one."""
+        for st in self.pipeline.describe():
+            if st["type"] == "checkerboard_presence":
+                return self.pipeline.stage(st["name"])
+        return None
+
+    def bind_pipeline(self) -> None:
+        """Wire stages that need to read another stage's parameters.
+
+        Only one such link exists: the presence map counts saddle peaks into
+        the MLA's micro-images, so it must read the same geometry the crops use
+        rather than keeping a second copy that can drift. Re-run whenever the
+        pipeline changes -- a stage added at runtime has no idea what else is
+        in the pipeline with it.
+        """
+        presence, mla = self.presence_stage(), self.mla_stage()
+        if presence is not None:
+            presence.bind_geometry(mla)
 
     def mla_stage(self):
         """The MLA overlay stage, if this camera has one. None otherwise.
@@ -239,10 +274,11 @@ class Application:
         # everything else so the board and acceptance settings survive a
         # restart mid-way through a calibration afternoon.
         self.calibration = CalibrationSettings()
-        # Live detection: one worker per camera, started on demand, holding
-        # only the latest pass. Never writes anything.
-        self.detection: dict[str, Any] = {}
-        self.detection_settings: CalibrationSettings | None = None
+        # The open calibration session, if any. Owned here rather than by the
+        # web layer so it survives a browser reload: the operator has both
+        # hands on the board and cannot be expected to notice a dropped tab.
+        self.session: Any = None
+        self.session_settings: CalibrationSettings | None = None
         self.restore = restore
         self.state = StateStore(Path(state_path), self._state_snapshot) if state_path else None
         self.restore_notes: list[str] = []
@@ -279,84 +315,70 @@ class Application:
             self.calibration.optics, self.calibration.board, pitch
         ).model_dump()
 
-    # -- live detection ----------------------------------------------------
+    # -- the calibration session -------------------------------------------
     #
-    # No recording. The workers hold the latest pass per camera and nothing
-    # else: this stage answers "does the detector see the board in the
-    # micro-images", which has to be true before recording poses is worth
-    # building. See calibration/detect.py.
+    # One session at a time, owned here so it survives a browser reload and so
+    # the console is a view of it rather than the thing that holds it.
+    #
+    # What runs while a session is open: the presence map, which is a pipeline
+    # stage on preview frames the cameras already produce, and a decision loop
+    # that reads it. Nothing else. Full-resolution frames are pulled through
+    # the capture thread once per pose. See calibration/session.py.
 
     @property
-    def detection_running(self) -> bool:
-        return any(w.running for w in self.detection.values())
+    def session_running(self) -> bool:
+        return bool(self.session and self.session.running)
 
-    def detection_start(self) -> dict[str, Any]:
-        """Start a detection worker per camera. Raises on a blocked precondition."""
+    def session_start(self) -> dict[str, Any]:
+        """Open a capture session. Raises on a blocked precondition."""
         readiness = self.calibration_readiness()
         if not readiness["ready"]:
             raise RuntimeError("; ".join(readiness["blocking_failures"]))
-        self.detection_stop()
-        # The settings are frozen at start: the board a pass was measured
-        # against must not change under it mid-pass, and a detector rebuilt on
-        # every settings edit would produce results that cannot be compared.
-        self.detection_settings = self.calibration.model_copy(deep=True)
-        spec = self.detection_settings.detection
-        from .calibration.detect import DetectionWorker  # noqa: PLC0415 - needs cv2
+        self.session_stop()
+        from .calibration.session import CaptureSession  # noqa: PLC0415 - needs cv2
 
-        # Shared across the cameras, so `concurrent_cameras` limits how many
-        # full-frame passes run at once rather than each camera limiting only
-        # itself. Two at a time doubles the peak current draw, and that is the
-        # load a marginal Pi 5 supply fails on first.
-        gate = threading.Semaphore(max(1, int(spec.concurrent_cameras)))
-        for cam_id, cam in self.cameras.items():
-            worker = DetectionWorker(
-                cam,
-                self.detection_settings.board,
-                self.detection_settings.acceptance,
-                min_interval=float(spec.interval_s),
-                annotate_overlay=bool(spec.overlay),
-                normalize=bool(spec.normalize_illumination),
-                accuracy=bool(spec.high_accuracy),
-                max_tiles=int(spec.max_tiles),
-                max_duty=float(spec.max_duty),
-                gate=gate,
-            )
-            worker.start()
-            self.detection[cam_id] = worker
-        log.info("detection started on %s", ", ".join(self.detection))
-        return self.detection_status()
+        # Settings are frozen for the life of the session. Changing the board
+        # halfway through would make the poses already recorded describe a
+        # different object, and nothing in the files would say so.
+        self.session_settings = self.calibration.model_copy(deep=True)
+        self.session = CaptureSession(
+            self.cameras,
+            self.session_settings,
+            root=self.writer.session_dir,
+            storage_free_bytes=lambda: self.writer.state()["free_bytes"],
+        )
+        self.session.start()
+        return self.session_state()
 
-    def detection_stop(self) -> dict[str, Any]:
-        for worker in self.detection.values():
-            worker.stop()
-        self.detection.clear()
-        return self.detection_status()
+    def session_stop(self) -> dict[str, Any]:
+        if self.session is not None:
+            self.session.stop()
+        return self.session_state()
 
-    def detection_status(self) -> dict[str, Any]:
-        cams: dict[str, Any] = {}
-        for cam_id, worker in self.detection.items():
-            latest = worker.latest()
-            cams[cam_id] = {
-                "running": worker.running,
-                "passes": worker.passes,
-                "result": latest.as_dict() if latest else None,
+    def session_state(self) -> dict[str, Any]:
+        if self.session is None:
+            return {
+                "running": False, "phase": "idle", "title": "READY",
+                "hint": "press start", "poses": 0, "recorded": 0,
+                "events": [], "cameras": {}, "depth_px": [],
             }
-        return {
-            "running": self.detection_running,
-            "recording": False,   # stated explicitly: this stage never writes
-            "settings": (
-                self.detection_settings.model_dump() if self.detection_settings else None
-            ),
-            "cameras": cams,
-        }
+        return self.session.state()
 
-    def detection_overlay(self, cam_id: str):
-        """The annotated frame from the latest pass, or None."""
-        worker = self.detection.get(cam_id)
-        if worker is None:
+    def session_force(self) -> dict[str, Any]:
+        if self.session is not None:
+            self.session.force()
+        return self.session_state()
+
+    def session_discard(self) -> dict[str, Any]:
+        if self.session is not None:
+            self.session.discard_last()
+        return self.session_state()
+
+    def session_shot(self, cam_id: str):
+        """The annotated review image for the last pose, or None."""
+        if self.session is None:
             return None
-        latest = worker.latest()
-        return None if latest is None else latest.overlay
+        return self.session.last_shot.get(cam_id)
 
     # -- storage -----------------------------------------------------------
 
@@ -444,9 +466,9 @@ class Application:
         )
 
     def stop(self) -> None:
-        # Detection first: its workers pull frames from the cameras, so
-        # stopping them after the sources close would raise on the way out.
-        self.detection_stop()
+        # The session first: its loop pulls frames from the cameras, so
+        # stopping it after the sources close would raise on the way out.
+        self.session_stop()
         self._storage_stop.set()
         if self._storage_thread:
             self._storage_thread.join(timeout=3.0)
@@ -473,7 +495,7 @@ class Application:
             "session_dir": str(self.writer.session_dir),
             "storage": self.writer.state(),
             "health": host_health(),
-            "detection_running": self.detection_running,
+            "session_running": self.session_running,
             "state_file": str(self.state.path) if self.state else None,
             "cameras": [c.status() for c in self.cameras.values()],
         }

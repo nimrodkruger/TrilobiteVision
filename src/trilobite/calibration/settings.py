@@ -78,73 +78,113 @@ class AcceptanceSpec(BaseModel):
     target_per_tile: int = Field(
         8, ge=1, le=100, title="Target poses / tile",
         description="Accepted poses a tile needs before it turns green")
+    # These two are the *offline* duplicate check, applied when the recorded
+    # poses are fitted: they need a PnP solve, which is not something to run on
+    # the rig. The live gate that stops you banking fifty identical poses while
+    # holding the board still is CaptureSpec.move_threshold, which compares
+    # presence maps and costs nothing.
     move_fraction: float = Field(
-        0.05, gt=0.0, le=1.0, title="Min move (fraction)",
-        description="Board must move this fraction of the working distance "
-                    "between accepts, so holding still does not bank duplicates")
+        0.05, gt=0.0, le=1.0, title="Min move (fraction, offline)",
+        description="Offline: board must move this fraction of the working "
+                    "distance between accepted poses for both to be kept")
     move_rotation_deg: float = Field(
-        3.0, gt=0.0, le=90.0, title="…or rotate (deg)",
-        description="Alternative movement gate: rotation since the last accept")
+        3.0, gt=0.0, le=90.0, title="…or rotate (deg, offline)",
+        description="Offline alternative movement gate: rotation since the last accept")
+
+
+class CaptureSpec(BaseModel):
+    """The hands-free capture loop (calibration-ui-spec §5.4).
+
+    The operating assumption, and the reason every default here is what it is:
+    **both of your hands are on the board.** You cannot press a key to take a
+    shot, you cannot choose which part of the array to fill next, and you are
+    looking at the board rather than at the screen. So the rig watches, decides,
+    and tells you what happened out loud.
+
+    The loop is: see the board -> wait for it to stop moving -> check it
+    properly -> record it -> tell you -> refuse to record again until it has
+    moved. You move, pause, move, pause. Nothing else is required of you.
+    """
+
+    min_tiles_seeing: int = Field(
+        5, ge=1, le=400, title="Micro-images seeing the board",
+        description="How many must show the pattern before a pose is even "
+                    "considered. Below this the rig says 'show the board'.",
+        json_schema_extra={"widget": "box"})
+    settle_frames: int = Field(
+        4, ge=1, le=60, title="Frames held still",
+        description="Consecutive ticks the presence map must be unchanged "
+                    "before a shot is taken. At 8 Hz, 4 is half a second.",
+        json_schema_extra={"widget": "box"})
+    still_threshold: float = Field(
+        0.06, gt=0.0, le=1.0, title="Stillness tolerance",
+        description="Relative change in the presence map that still counts as "
+                    "holding still. Larger tolerates shakier hands and risks "
+                    "capturing mid-move.",
+        json_schema_extra={"widget": "box"})
+    move_threshold: float = Field(
+        0.25, gt=0.0, le=4.0, title="Movement before re-arming",
+        description="How different the picture must become before another pose "
+                    "is allowed. This is what stops a held board banking fifty "
+                    "near-identical poses and biasing the fit toward one place.",
+        json_schema_extra={"widget": "box"})
+    review_s: float = Field(
+        2.5, ge=0.0, le=30.0, title="Review pause (s)",
+        description="After each shot the display freezes on it with the "
+                    "detected corners drawn. Press Escape within this window to "
+                    "discard it. 0 disables the pause.",
+        json_schema_extra={"widget": "box"})
+    reject_cooldown_s: float = Field(
+        1.0, ge=0.0, le=30.0, title="Pause after a rejected shot (s)",
+        description="Stops a board that is present but undetectable from being "
+                    "re-checked eight times a second.",
+        json_schema_extra={"widget": "box"})
+    require_all_cameras: bool = Field(
+        True, title="Both cameras must see it",
+        description="Off records a pose when either camera sees the board. Such "
+                    "a pose still constrains that camera's own parameters but "
+                    "contributes nothing to the stereo relation.")
+    tick_hz: float = Field(
+        8.0, ge=1.0, le=30.0, title="Decision rate (Hz)",
+        description="How often the loop looks. It reads a map the pipeline has "
+                    "already computed, so this costs almost nothing.",
+        json_schema_extra={"widget": "box"})
+    max_poses: int = Field(
+        0, ge=0, le=10000, title="Stop after N poses (0 = never)",
+        description="A session ends when you press Finish. This is a disk "
+                    "guard, not a target; leave it at 0 unless you want one.",
+        json_schema_extra={"widget": "box"})
+    min_free_gb: float = Field(
+        1.0, ge=0.0, le=1000.0, title="Stop below N GB free",
+        description="Each pose is two full frames, about 3 MB. Filling the "
+                    "output device mid-session is the one failure that loses "
+                    "work already done.",
+        json_schema_extra={"widget": "box"})
 
 
 class DetectionSpec(BaseModel):
-    """How the live detector runs. Not a property of the optics or the board."""
+    """Flags for the corner detector used by the accept check.
 
-    interval_s: float = Field(
-        0.4, ge=0.05, le=10.0, title="Min pass interval (s)",
-        description="Floor on the time between detection passes. A pass that "
-                    "takes longer than this simply runs less often -- it never "
-                    "queues, and it never touches the preview.",
-        json_schema_extra={"widget": "box"})
-    overlay: bool = Field(
-        True, title="Draw overlay",
-        description="Annotate the measured frame with tile verdicts and corner "
-                    "positions. Costs a few ms per pass; turn off if the Pi is "
-                    "struggling and the numbers are enough.")
-    # Both default off, and both defaults are measured rather than assumed.
-    # On the synthetic board, 117 tiles of 100 px:
-    #
-    #   flags            per tile   corner straightness
-    #   (none)            1.95 ms      0.0055 px
-    #   NORMALIZE_IMAGE   2.13 ms      0.0440 px      <- eight times worse
-    #   ACCURACY          4.86 ms      0.0040 px
-    #
-    # NORMALIZE_IMAGE costing precision is the surprise, and it is why it is
-    # not on by default despite sounding like an unambiguous good. It earns its
-    # place only when a micro-image is too unevenly lit for the pattern to be
-    # found at all -- which is a real possibility with vignetted lenslets, and
-    # exactly why this is a switch and not a decision made here.
-    # --- load limits ----------------------------------------------------
-    #
-    # These exist because the first run on the real rig took the Pi down. The
-    # cost of a pass is (tiles x cameras x ~5 ms) and *nothing* in the earlier
-    # version bounded any of those three factors: with the grid left near its
-    # default pitch the geometry yields ~900 whole tiles instead of ~130, two
-    # worker threads then ran that continuously and in parallel, and a Pi 5
-    # with two cameras at four-core saturation browns out or throttles.
-    #
-    # A detector that can be asked to do an unbounded amount of work is a
-    # defect regardless of what the hardware does about it, so the bound is
-    # here rather than in advice.
-    max_tiles: int = Field(
-        320, ge=1, le=4000, title="Max tiles per pass",
-        description="Refuse to start if the grid yields more whole tiles than "
-                    "this. A 14x10 array is ~130; several hundred means the "
-                    "pitch is wrong, not that the array is large.",
-        json_schema_extra={"widget": "box"})
-    max_duty: float = Field(
-        0.5, ge=0.05, le=1.0, title="Max CPU duty",
-        description="Fraction of the time a detection worker may be busy. "
-                    "After a pass lasting T it sleeps until the fraction is "
-                    "met, so a slow pass costs frequency rather than the whole "
-                    "core. 0.5 leaves half of one core per camera free.",
-        json_schema_extra={"widget": "box"})
-    concurrent_cameras: int = Field(
-        1, ge=1, le=4, title="Cameras detecting at once",
-        description="1 means the cameras take turns. Two full-frame detection "
-                    "passes running together doubles the peak current draw, "
-                    "which is what a marginal Pi 5 supply notices first.",
-        json_schema_extra={"widget": "box"})
+    Two switches, and both defaults are measured rather than assumed. On the
+    synthetic board, 117 micro-images of 100 px:
+
+        flags              per tile   corner straightness
+        (none)              1.95 ms      0.0055 px
+        NORMALIZE_IMAGE     2.13 ms      0.0440 px      <- eight times worse
+        ACCURACY            4.86 ms      0.0040 px
+
+    NORMALIZE_IMAGE costing precision is the surprise, and it is why it is not
+    on despite sounding like an unambiguous good. It earns its place only when
+    a micro-image is too unevenly lit for the pattern to be found at all --
+    a real possibility with vignetted lenslets, which is why it is a switch and
+    not a decision made here.
+
+    The rate limits that used to live in this class -- pass interval, CPU duty,
+    concurrent cameras, tile cap -- are gone with the worker they bounded.
+    Nothing runs the detector on a loop of its own any more: the live map is a
+    pipeline stage (calibration/presence.py) and this detector runs on five
+    tiles once per pose. See docs/cleanup-log.md, 2026-09-01 (c).
+    """
 
     normalize_illumination: bool = Field(
         False, title="Normalise illumination",
@@ -153,11 +193,11 @@ class DetectionSpec(BaseModel):
                     "precision on evenly-lit tiles. Finding the pattern beats "
                     "locating it well, but not when it was already being found.")
     high_accuracy: bool = Field(
-        False, title="High accuracy",
-        description="CALIB_CB_ACCURACY: an extra sub-pixel refinement, about 2.5x "
-                    "the cost per tile for a small gain. Off for live viewing, "
-                    "where pass rate is what you are watching; the recording "
-                    "stage will want it on.")
+        True, title="High accuracy",
+        description="CALIB_CB_ACCURACY: an extra sub-pixel refinement, about "
+                    "2.5x the cost per tile. On by default now that this runs "
+                    "on five tiles once per pose rather than on every tile of "
+                    "every frame -- at that rate the cost is not measurable.")
 
 
 class CalibrationSettings(BaseModel):
@@ -165,6 +205,7 @@ class CalibrationSettings(BaseModel):
     optics: NominalOptics = Field(default_factory=NominalOptics)
     acceptance: AcceptanceSpec = Field(default_factory=AcceptanceSpec)
     detection: DetectionSpec = Field(default_factory=DetectionSpec)
+    capture: CaptureSpec = Field(default_factory=CaptureSpec)
 
 
 class DerivedOptics(BaseModel):
@@ -303,11 +344,17 @@ def _full_resolution(cam: Any) -> tuple[int, int]:
     return (1456, 1088)
 
 
-# Rough per-tile cost of findChessboardCornersSB on a 100 px micro-image on a
-# Pi 5. Measured at 1.9 ms on an x86 desktop; the Pi is about three times
-# slower. Used only to turn a tile count into a number of seconds a human can
-# judge, so being 50% out does not matter -- being absent did.
-MS_PER_TILE_PI = 6.0
+# A sanity bound on the lattice, not a cost bound. Nothing scans tile-by-tile
+# any more -- the live map is one pass over the frame whatever the pitch -- but
+# `whole_indices` is quadratic in 1/pitch and a coverage display of ten
+# thousand cells is not a display. A real 14x10 array is ~130.
+MAX_SANE_TILES = 1200
+
+# Below this, a micro-image in the preview cannot hold a resolvable
+# checkerboard. A 4x3 board needs six squares across the tile, and a saddle
+# detector needs a few pixels per square, so 24 px is about the floor. On this
+# rig the preview is half scale and a micro-image is 50 px, comfortably clear.
+MIN_PREVIEW_TILE_PX = 24.0
 
 
 def _preview_resolution(cam: Any) -> tuple[int, int] | None:
@@ -452,7 +499,7 @@ def readiness_report(
         full_w, full_h = _full_resolution(cam)
         ref = (getattr(stage, "reference_shape", None)
                or _preview_resolution(cam) or (full_w, full_h))
-        limit = int(settings.detection.max_tiles) if settings else 320
+        limit = MAX_SANE_TILES
         det_geom = None
         scale_error = ""
         try:
@@ -476,25 +523,71 @@ def readiness_report(
             )
         elif n_tiles > limit:
             message = (
-                f"{cid}: {n_tiles} whole tiles exceeds the limit of {limit}. At "
-                f"~{MS_PER_TILE_PI:.0f} ms each that is "
-                f"{n_tiles * MS_PER_TILE_PI / 1000.0:.0f} s of solid CPU per pass "
-                f"per camera, which is what took the Pi down the first time. A "
-                f"pitch of {det_geom.pitch:.0f} px on the sensor gives this many "
-                f"micro-images; a real 100 px grid gives about 130. Fix the "
-                f"alignment, or raise the limit in Detection if the array really "
-                f"is this large."
+                f"{cid}: {n_tiles} whole tiles at {det_geom.pitch:.0f} px on the "
+                f"sensor. A real 100 px grid gives about 130, so this is a wrong "
+                f"pitch rather than a large array. Nothing scans tile-by-tile any "
+                f"more, so this no longer costs a core -- but the lattice "
+                f"enumeration is quadratic in 1/pitch and the coverage display "
+                f"becomes unreadable."
             )
         else:
             message = (
-                f"{cid}: {n_tiles} whole tiles at {det_geom.pitch:.0f} px on the "
-                f"sensor, about {n_tiles * MS_PER_TILE_PI / 1000.0:.1f} s per pass "
-                f"on a Pi"
+                f"{cid}: {n_tiles} whole micro-images at {det_geom.pitch:.0f} px "
+                f"on the sensor"
             )
         checks.append(Check(
             id=f"{cid}.tile_count", ok=0 < n_tiles <= limit, blocking=True,
             message=message,
         ))
+
+        # The live presence map runs on the PREVIEW, and it can only count
+        # corners it can resolve. At an eighth scale a micro-image is 12 px
+        # across and its squares are two, which no saddle detector will find --
+        # and the symptom is the console saying "show the board" while the
+        # board is plainly in shot. Blocking, because in that state the whole
+        # hands-free loop is inert.
+        presence = cam.presence_stage() if hasattr(cam, "presence_stage") else None
+        if presence is not None:
+            prev = _preview_resolution(cam) or (full_w, full_h)
+            prev_pitch = float(p.pitch_px) * (
+                prev[0] / ref[0] if ref[0] else 1.0)
+            ok_res = prev_pitch >= MIN_PREVIEW_TILE_PX
+            checks.append(Check(
+                id=f"{cid}.preview_resolves", ok=ok_res, blocking=True,
+                message=(
+                    f"{cid}: micro-images are {prev_pitch:.0f} px in the preview "
+                    f"-- enough for the presence map"
+                    if ok_res else
+                    f"{cid}: micro-images are only {prev_pitch:.0f} px in the "
+                    f"{prev[0]}x{prev[1]} preview, below the {MIN_PREVIEW_TILE_PX} px "
+                    f"the presence map needs to resolve a board's squares. Raise "
+                    f"preview_resolution in the config -- the console would "
+                    f"otherwise ask you to show a board that is already in shot."
+                ),
+            ))
+
+            if settings is not None:
+                # A tile that sees the whole pattern reads about one saddle per
+                # grid vertex, which is (cols+2)x(rows+2) -- not cols x rows.
+                # Getting this wrong by that factor makes the loop either never
+                # arm or arm on an empty bench.
+                expect = (settings.board.cols + 2) * (settings.board.rows + 2)
+                thresh = int(presence.params.min_corners)
+                sane = 0.35 * expect <= thresh <= 0.95 * expect
+                checks.append(Check(
+                    id=f"{cid}.presence_threshold", ok=sane, blocking=False,
+                    message=(
+                        f"{cid}: presence threshold {thresh} suits a "
+                        f"{settings.board.cols}x{settings.board.rows} board (~{expect} "
+                        f"vertices)"
+                        if sane else
+                        f"{cid}: presence threshold is {thresh}, but a "
+                        f"{settings.board.cols}x{settings.board.rows} board fills a "
+                        f"micro-image with about {expect} saddle points. Try "
+                        f"{int(0.66 * expect)}: too high never arms, too low arms "
+                        f"on any textured scene."
+                    ),
+                ))
 
         # Can the board even fit inside a micro-image? This is the check that
         # would otherwise cost an afternoon: every tile detects nothing, the

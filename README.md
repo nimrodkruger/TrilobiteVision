@@ -30,8 +30,8 @@ Then open `http://localhost:8000/` (or `http://<pi-address>:8000/`).
 | Runtime parameters saved on exit, restored on start | working |
 | Full-resolution still capture, `.npy` + JSON sidecar | working |
 | Hot-pluggable output storage | working |
-| Calibration: live per-tile corner detection | working — **records nothing** |
-| Calibration: pose recording and session files | not built |
+| Calibration: live checkerboard presence map | working — 2% of a core |
+| Calibration: hands-free pose capture and recording | working |
 | Calibration: the fit | not built (offline, by design) |
 | Video recording | not built |
 | Hardware sync between the two sensors | not built (needs XVS wiring) |
@@ -191,8 +191,10 @@ the view path is nearly free and the two are always in temporal agreement.
 
 Corner detection is a third case and sits between them: full sensor
 resolution, because the preview would halve corner precision, but taken from
-the ISP output, because the ISP's companding moves no corner. That is
-`CameraSource.read_full_mono()`.
+the ISP output, because the ISP's companding moves no corner. It comes out of
+the **same request** as the preview frame — `CameraRuntime.grab_full()` raises a
+flag and the capture thread serves it — so it is the same exposure, and no
+second consumer of the camera exists.
 
 ---
 
@@ -218,24 +220,42 @@ The Storage panel lives here — see below.
 
 ### Calibration mode
 
-A left rail of settings (board, nominal optics, acceptance, detection) and a
-stage showing what the nominal optics imply, the preconditions, the frozen
-alignment, and the live views.
+**Hands-free.** The assumption behind every default: you are holding the board
+with both hands, you cannot press anything, and you are looking at the board
+rather than at the screen. So the rig watches and decides, and tells you out
+loud what it did.
 
-**Start detection** runs per-tile checkerboard detection at 1–2 Hz on
-full-resolution frames and **writes nothing**. It answers the question that has
-to be answered before pose recording is worth building: does the detector find
-the board in the micro-images, and in enough of them at once?
+    SHOW THE BOARD  →  HOLD STILL  →  CHECKING  →  CAPTURED  →  MOVE THE BOARD
 
-Each camera shows the annotated frame — the same frame the numbers came from,
-tiles boxed by verdict, corners drawn where they were measured — and a coverage
-lattice with one cell per lattice position: *cross*, *found*, *nothing found*,
-*not a whole tile*. The lattice is not redundant with the picture: a dead
-column at the edge of the array is obvious as a column of cells and invisible
-as a few missing boxes in a busy image.
+You move, pause, move, pause. A rising two-tone beep means a pose was kept; a
+low buzz means it was rejected. **Space** forces a shot through every gate — for
+the extreme angles that never arm on their own, or with a presenter clicker as
+a shutter release. After each capture the display freezes for a couple of
+seconds on the frame that was actually recorded, with its corners drawn;
+**Escape** within that window discards it. A session ends when you press Finish
+and at no other time.
 
-To rehearse it with no camera, run `config/desktop-plenoptic.yaml` and set the
-board to **4 × 3 inner corners, 7 mm**.
+Two detectors do this, and the split is what makes it fit on a Pi:
+
+- a **presence map** that counts saddle points per micro-image over the whole
+  preview frame — three convolutions and a `bincount`, about 3 ms, and its cost
+  does not depend on the number of tiles. It drives the state machine and tints
+  the live view so aiming needs no second display.
+- a **five-tile cross** put through `findChessboardCornersSB` at full
+  resolution, once per pose, about 45 ms. That is the acceptance check.
+
+Full-field corner detection over all ~130 micro-images happens offline, on the
+desktop, from the recorded frames. See `docs/calibration-ui-spec.md` §4 for the
+measurements behind that split, and §11 for the desktop head this is heading
+towards.
+
+Each pose writes both cameras' full frames, the cross corners in sensor
+coordinates, and a frozen copy of the MLA geometry. About 3 MB a pose. Nothing
+is ever deleted: a discarded pose is marked in the index and its files stay.
+
+To rehearse the whole loop with no camera, run
+`config/desktop-plenoptic.yaml` and set the board to **4 × 3 inner corners,
+7 mm**.
 
 ### Why the tiles are polled and not streamed
 
@@ -313,12 +333,14 @@ the Pi prints the same thing with more context.
 | POST | `/api/capture/{cam}/raw` | full-resolution capture, ISP bypassed |
 | POST | `/api/capture/{cam}/view` | the processed preview as displayed |
 | POST | `/api/capture-all/{raw\|view}` | trigger every camera |
-| GET, PUT | `/api/calibration/settings` | board, nominal optics, acceptance, detection |
+| GET, PUT | `/api/calibration/settings` | board, optics, acceptance, detection, capture |
 | GET | `/api/calibration/readiness` | preconditions, split blocking vs advisory |
-| POST | `/api/calibration/start` | begin live detection — records nothing |
-| POST | `/api/calibration/stop` | stop it |
-| GET | `/api/calibration/detection` | latest pass per camera, per-tile verdicts |
-| GET | `/calibration/detection/{cam}.jpg` | that pass, annotated |
+| POST | `/api/calibration/start` | open a hands-free capture session |
+| POST | `/api/calibration/stop` | finish it |
+| GET | `/api/calibration/session` | phase, banner, coverage, poses, event log |
+| POST | `/api/calibration/force` | shoot now, through every gate |
+| POST | `/api/calibration/discard` | mark the last pose discarded |
+| GET | `/calibration/shot/{cam}.jpg` | the last pose, cross and corners drawn |
 | GET | `/api/storage` | filesystems on offer, mounted or not, and where output is going |
 | POST | `/api/storage/target` | `{"path": "/media/stick"}` — move output there |
 | POST | `/api/storage/mount` | `{"device": "/dev/sda1"}` — mount a plugged-in disk |
@@ -361,8 +383,10 @@ src/trilobite/
   health.py                CPU temperature, under-voltage, memory — is the host coping
   optics/mla.py            lenslet geometry, shared by the overlay and the crops
   calibration/
-    settings.py            board, nominal optics, acceptance, readiness checks
-    detect.py              live per-tile corner detection (requires cv2)
+    settings.py            board, optics, acceptance, capture gates, readiness
+    presence.py            saddle counting: the cheap live detector
+    detect.py              corner detection — no threads, no camera, no files
+    session.py             the hands-free capture loop and the recorder
   sinks/jpeg.py            JPEG encode: simplejpeg → cv2 → Pillow
   storage/writer.py        session directories, .npy + sidecar, live retargeting
   storage/devices.py       which filesystems can hold a session, right now
@@ -375,6 +399,7 @@ scripts/
   install_pi.sh            apt, config.txt, venv — idempotent
   diagnose_cameras.sh      when libcamera reports zero cameras
   diagnose_host.sh         after a crash, or when a disk does not appear
+  benchmark_detectors.py   what each detector costs, on your machine
   measure_derotation_cost.py   what tile de-rotation actually costs in precision
 systemd/trilobite.service  run as a service
 tests/                     all of it runs anywhere, no camera needed
@@ -389,7 +414,9 @@ Four seams, each where a change is expected:
   updates itself.
 - **`LatestFrame`** — the capture thread only reads, processes and publishes.
   It never encodes, writes or waits on the network, so a slow browser cannot
-  perturb capture timing.
+  perturb capture timing. It is also the **only** consumer of the camera: a
+  full-resolution frame is requested by raising a flag, and the capture loop
+  serves it out of the request it is already holding.
 - **`create_app`** — MJPEG is the starting transport because it needs no client
   library. Replacing it with WebRTC touches this module and the page, nothing
   else.
@@ -471,20 +498,20 @@ browser.
 
 ## Things that will bite you
 
-**A Pi 5 with two cameras needs a real 5 V / 5 A supply.** The first
-calibration run on the rig took the board down. Sustained detection is the
-first workload here that can saturate all four cores, and the resulting current
-spike browns out a marginal supply — a hard reset, with nothing in any log. The
-header shows CPU temperature and load, and turns red if
-`vcgencmd get_throttled` reports under-voltage at any point since boot; that
+**Only the capture thread may touch a camera.** An earlier design had a
+detection worker calling `capture_request()` on its own schedule, competing
+with the preview loop for a four-deep picamera2 buffer pool. It took the rig
+down repeatedly; a four-core CPU stress test did not, which is how the camera
+path rather than the load was identified. Anything wanting a full-resolution
+frame now raises a flag and the capture loop serves it. If you add a feature
+that needs pixels, use `CameraRuntime.grab_full()` — do not open a second
+consumer.
+
+**A Pi 5 with two cameras still wants a real 5 V / 5 A supply.** The header
+shows CPU temperature, load and free memory, and turns red if
+`vcgencmd get_throttled` reports under-voltage at any point since boot — that
 bit is sticky, so it survives the crash it caused. `bash
 scripts/diagnose_host.sh` reads it out with everything else worth knowing.
-
-Detection is bounded so it cannot be the software's fault either: cameras take
-turns by default, a duty-cycle cap keeps each worker under half a core, the
-threads run at lowered priority, and a grid that would yield more tiles than
-`max_tiles` is refused before it starts rather than discovered at runtime. All
-four are in the Detection panel.
 
 **The Pi 5 has no hardware video encoder.** VideoCore VII dropped H.264 and
 JPEG encode, so every preview frame is compressed on the CPU. Encode the small
@@ -519,11 +546,11 @@ parameters, but the number on screen is the preview one.
 4. Mount the MLA and align it with `mla_grid_overlay`.
 5. Decide the calibration target (`docs/calibration-ui-spec.md` §10.1) and the
    lenslet aperture shape.
-6. Run live detection against the real rig and set `min corners` and
-   `target per tile` from what the detector actually returns.
-7. Pose recording — `calibration/session.py`, per `docs/calibration-ui-spec.md`
-   §7 and §8.
-8. The fit. Offline, off-device.
+6. Enable the `checkerboard_presence` stage in `config/pi.yaml` and set its
+   `min_corners` from what the Preconditions panel says your board implies.
+7. Run a session. Set `min corners`, `target per tile` and the capture gates
+   from what the rig actually does rather than from the defaults here.
+8. The fit, and full-field corner detection. Offline, off-device.
 9. Video recording. Store lossless and compress off-device; do not reach for
    H.264 on a Pi 5.
 10. Hardware sync between the two sensors (XVS).

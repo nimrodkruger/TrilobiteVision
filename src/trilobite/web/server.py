@@ -300,6 +300,9 @@ def create_app(application: Application) -> FastAPI:
             )
         except (ValueError, ValidationError) as exc:
             raise HTTPException(422, str(exc)) from None
+        # A stage added at runtime does not know what else is in the pipeline;
+        # re-run the wiring so a new presence stage finds the MLA geometry.
+        cam.bind_pipeline()
         application.mark_dirty()
         return cam.pipeline.describe()
 
@@ -307,6 +310,7 @@ def create_app(application: Application) -> FastAPI:
     def remove_stage(cam_id: str, stage_name: str) -> list[dict[str, Any]]:
         cam = _cam(cam_id)
         cam.pipeline.remove(stage_name)
+        cam.bind_pipeline()
         application.mark_dirty()
         return cam.pipeline.describe()
 
@@ -391,13 +395,12 @@ def create_app(application: Application) -> FastAPI:
 
     @api.post("/api/calibration/start")
     def calibration_start() -> dict[str, Any]:
-        """Begin live corner detection. **Records nothing.**
+        """Open a hands-free capture session.
 
-        This is the detection half of a calibration session with the recording
-        half deliberately absent: it answers whether the detector finds the
-        board in the micro-images, and how many, and where. Poses are not
-        stored, no files are written, and `recording: false` in the response
-        says so rather than leaving it to be inferred.
+        From here the rig decides when to take a shot: it watches the presence
+        map, waits for the board to stop moving, checks a five-tile cross at
+        full resolution, records the pose, and then refuses to record again
+        until the board has moved. The operator's hands stay on the board.
         """
         readiness = application.calibration_readiness()
         if not readiness["ready"]:
@@ -406,41 +409,61 @@ def create_app(application: Application) -> FastAPI:
                 "blocking": readiness["blocking_failures"],
             })
         try:
-            return application.detection_start()
+            return application.session_start()
         except Exception as exc:
-            log.exception("detection failed to start")
+            log.exception("session failed to start")
             raise HTTPException(500, f"{type(exc).__name__}: {exc}") from None
 
     @api.post("/api/calibration/stop")
     def calibration_stop() -> dict[str, Any]:
-        return application.detection_stop()
+        """Finish the session. Nothing else ends it -- coverage targets are
+        reported, never acted on."""
+        return application.session_stop()
 
-    @api.get("/api/calibration/detection")
-    def calibration_detection() -> dict[str, Any]:
-        """Latest pass per camera: per-tile verdicts and the acceptance result.
+    @api.get("/api/calibration/session")
+    def calibration_session() -> dict[str, Any]:
+        """Phase, banner text, coverage, pose count, and the event log.
 
-        Corner *coordinates* are not in here. At 127 tiles times a dozen
-        corners times two cameras twice a second that is a megabyte a minute of
-        numbers no one reads, and the annotated image below already shows where
-        they landed. When recording is built it will keep them; the dashboard
-        never needs them.
+        The event log carries a monotonic sequence number per entry so the
+        console can play each tone exactly once. That matters more than it
+        sounds: audio is the primary channel here, because the operator is
+        looking at the board rather than at the screen.
         """
-        return application.detection_status()
+        return application.session_state()
 
-    @api.get("/calibration/detection/{cam_id}.jpg")
-    def calibration_detection_image(cam_id: str) -> Response:
-        """The annotated frame from the most recent pass.
+    @api.post("/api/calibration/force")
+    def calibration_force() -> dict[str, Any]:
+        """Take a shot now, whatever the state machine thinks.
 
-        Polled, not streamed -- and at 1-2 Hz there is nothing to stream. It is
-        also the frame the numbers were measured on, so the picture and the
-        counts can never be one pass out of step with each other.
+        The keyboard override. Some of the most valuable poses -- a board at an
+        extreme angle, or in a dim corner of the field -- are ones the settle
+        test will never arm on by itself.
+        """
+        return application.session_force()
+
+    @api.post("/api/calibration/discard")
+    def calibration_discard() -> dict[str, Any]:
+        """Mark the most recent pose discarded.
+
+        The files stay on disk and the index records the decision. A pose
+        rejected by reflex and wanted back later is worth more than the 3 MB it
+        occupies, and an offline tool can always ignore the flag.
+        """
+        return application.session_discard()
+
+    @api.get("/calibration/shot/{cam_id}.jpg")
+    def calibration_shot(cam_id: str) -> Response:
+        """The last recorded pose, with its cross and corners drawn.
+
+        This is what the review pause shows: the frame that was actually
+        measured, not a later preview frame that resembles it.
         """
         _cam(cam_id)
-        overlay = application.detection_overlay(cam_id)
-        if overlay is None:
-            raise HTTPException(204, "no detection pass yet")
+        shot = application.session_shot(cam_id)
+        if shot is None:
+            raise HTTPException(204, "no pose recorded yet")
         return Response(
-            encode_jpeg(overlay, quality=quality),
+            encode_jpeg(shot, quality=quality),
             media_type="image/jpeg",
             headers={"Cache-Control": "no-store"},
         )

@@ -1,4 +1,4 @@
-"""Live corner detection, end to end, with no camera and no Pi.
+"""Corner detection in a micro-image, end to end, with no camera and no Pi.
 
 The synthetic `plenoptic_board` source exists for exactly this: a frame whose
 every micro-image contains a complete checkerboard, so a correct detector finds
@@ -13,6 +13,8 @@ looked like before geometry_for existed.
 """
 
 from __future__ import annotations
+
+import pathlib
 
 import numpy as np
 import pytest
@@ -45,6 +47,19 @@ def source(rotation=0.0):
     return s
 
 
+def full_frame(src):
+    """A full-resolution frame through the capture-thread handshake.
+
+    Deliberately not a direct call into the source. Nothing outside the capture
+    loop is allowed to touch the camera -- a second consumer of the picamera2
+    request pool is what took the rig down -- so the tests exercise the same
+    path the application uses: raise a flag, let the capture call service it.
+    """
+    src.request_full_frame()
+    src.read_preview()
+    return src.take_full_frame()
+
+
 def detector(**kw):
     board = BoardSpec(cols=BOARD[0], rows=BOARD[1], square_mm=5.0)
     acc = AcceptanceSpec(**{"min_corners_per_tile": 6, "min_cross_tiles": 5, **kw})
@@ -55,11 +70,39 @@ def sensor_geometry(rotation=0.0):
     return MLAGeometry(width=1456, height=1088, pitch=PITCH, rotation_deg=rotation)
 
 
+# -- the full-frame handshake ------------------------------------------------
+
+
+def test_a_full_frame_arrives_only_through_the_capture_call():
+    src = source()
+    src.request_full_frame()
+    assert src.take_full_frame() is None, "nothing until the capture loop runs"
+    src.read_preview()
+    frame = src.take_full_frame()
+    assert frame is not None
+    assert frame.data.shape == (1088, 1456)
+
+
+def test_the_full_frame_and_its_preview_share_a_sequence_number():
+    """They are one exposure. A pose's frame and the presence map that
+    triggered it must describe the same instant, not two a frame apart."""
+    src = source()
+    src.request_full_frame()
+    preview = src.read_preview()
+    assert src.take_full_frame().seq == preview.seq
+
+
+def test_wait_full_frame_times_out_rather_than_hanging():
+    src = source()
+    src.close()                                    # no capture loop will run
+    assert src.wait_full_frame(timeout=0.2) is None
+
+
 # -- the happy path ---------------------------------------------------------
 
 
 def test_every_whole_tile_yields_the_full_pattern():
-    frame = source().read_full_mono()
+    frame = full_frame(source())
     g = sensor_geometry()
     r = detector().run(frame.data, g, "left", frame.seq)
     assert len(r.tiles) > 100
@@ -71,7 +114,7 @@ def test_every_whole_tile_yields_the_full_pattern():
 def test_corners_come_back_in_frame_coordinates_inside_their_own_tile():
     """A corner reported outside the tile it was found in means the tile-to-frame
     map is wrong, which is silent: the fit would simply converge on nonsense."""
-    frame = source().read_full_mono()
+    frame = full_frame(source())
     g = sensor_geometry()
     r = detector().run(frame.data, g, "left", frame.seq)
     side = g.crop_side(1.0)
@@ -84,7 +127,7 @@ def test_corners_come_back_in_frame_coordinates_inside_their_own_tile():
 
 
 def test_rotation_does_not_stop_detection():
-    frame = source(rotation=3.0).read_full_mono()
+    frame = full_frame(source(rotation=3.0))
     g = sensor_geometry(rotation=3.0)
     r = detector().run(frame.data, g, "left", frame.seq, scale=0.9)
     assert len(r.found_tiles) > 0.9 * len(r.tiles)
@@ -94,7 +137,7 @@ def test_derotated_and_plain_crops_agree_on_corner_positions():
     """The claim that de-rotation costs precision but not validity
     (calibration-spec §2.6), as a test: both routes must put the corners in the
     same place to well under a pixel."""
-    frame = source(rotation=4.0).read_full_mono()
+    frame = full_frame(source(rotation=4.0))
     g = sensor_geometry(rotation=4.0)
     det = detector()
     plain = det.run(frame.data, g, "left", 1, scale=0.85, derotate=False)
@@ -106,8 +149,6 @@ def test_derotated_and_plain_crops_agree_on_corner_positions():
         other = by_key.get(t.key)
         if other is None or other.n_corners != t.n_corners:
             continue
-        # Both detectors order corners consistently for the same pattern, so a
-        # direct comparison is meaningful.
         d = np.linalg.norm(t.corners - other.corners, axis=1)
         assert d.mean() < 0.5
         compared += 1
@@ -118,7 +159,7 @@ def test_derotated_and_plain_crops_agree_on_corner_positions():
 
 
 def test_preview_scale_geometry_on_a_full_frame_finds_almost_nothing():
-    frame = source().read_full_mono()
+    frame = full_frame(source())
     wrong = MLAGeometry(width=1456, height=1088, pitch=PITCH / 2)   # preview pitch
     r = detector().run(frame.data, wrong, "left", 1)
     assert len(r.found_tiles) == 0
@@ -132,7 +173,7 @@ def test_geometry_for_recovers_the_right_scale():
     stage.apply(src.read_preview())          # learns the 728x544 reference
     assert stage.reference_shape == (728, 544)
 
-    frame = src.read_full_mono()
+    frame = full_frame(src)
     g = stage.geometry_for(frame.data.shape[1], frame.data.shape[0])
     assert g.pitch == pytest.approx(PITCH)
     r = detector().run(frame.data, g, "left", 1)
@@ -140,7 +181,7 @@ def test_geometry_for_recovers_the_right_scale():
 
 
 def test_wrong_board_size_finds_nothing():
-    frame = source().read_full_mono()
+    frame = full_frame(source())
     board = BoardSpec(cols=9, rows=6, square_mm=20.0)
     det = CornerDetector(board, AcceptanceSpec())
     r = det.run(frame.data, sensor_geometry(), "left", 1)
@@ -153,6 +194,22 @@ def test_flat_tiles_are_skipped_not_reported_as_examined_failures():
     r = detector().run(flat, sensor_geometry(), "left", 1)
     assert r.tiles and all(t.skipped for t in r.tiles)
     assert not r.accepted
+
+
+# -- the five-tile cross, which is all that runs live -----------------------
+
+
+def test_a_five_tile_cross_costs_a_fraction_of_the_full_field():
+    """Not a timing assertion -- a scope one. The live check must look at five
+    tiles, not at all hundred and seventeen, because that ratio is the whole
+    reason the design fits on a Pi."""
+    frame = full_frame(source())
+    g = sensor_geometry()
+    det = detector()
+    cross = [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)]
+    found = sum(det.detect_tile(g.crop(frame.data, i, j, 1.0))[0] for i, j in cross)
+    assert found == 5
+    assert len(g.whole_indices(1.0, derotate=False)) > 100
 
 
 # -- acceptance -------------------------------------------------------------
@@ -168,34 +225,28 @@ def result_with(found_keys):
 
 
 def test_a_full_cross_is_accepted():
-    det = detector()
-    r = result_with({(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)})
-    assert det.crosses(r) == [(0, 0)]
+    assert detector().crosses(result_with({(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)})) == [(0, 0)]
 
 
 def test_four_in_a_row_is_not_a_cross():
-    det = detector()
-    r = result_with({(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)})
-    assert det.crosses(r) == []
+    assert detector().crosses(result_with({(0, 0), (1, 0), (2, 0), (3, 0), (4, 0)})) == []
 
 
 def test_a_partial_cross_is_accepted_when_the_rule_is_relaxed():
     det = detector(min_cross_tiles=3)
-    r = result_with({(0, 0), (1, 0), (0, 1)})
-    assert (0, 0) in det.crosses(r)
+    assert (0, 0) in det.crosses(result_with({(0, 0), (1, 0), (0, 1)}))
 
 
 def test_a_tile_below_the_corner_threshold_does_not_count():
     det = detector(min_corners_per_tile=20)
-    r = result_with({(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)})   # 12 corners each
-    assert det.crosses(r) == []
+    assert det.crosses(result_with({(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)})) == []
 
 
 # -- overlay ----------------------------------------------------------------
 
 
 def test_annotate_produces_a_display_sized_colour_image():
-    frame = source().read_full_mono()
+    frame = full_frame(source())
     g = sensor_geometry()
     r = detector().run(frame.data, g, "left", 1)
     view = annotate(frame.data, r, g, display_width=728)
@@ -204,159 +255,19 @@ def test_annotate_produces_a_display_sized_colour_image():
 
 
 def test_detection_result_json_carries_no_corner_arrays():
-    frame = source().read_full_mono()
+    frame = full_frame(source())
     r = detector().run(frame.data, sensor_geometry(), "left", 1)
     payload = r.as_dict()
     assert payload["tiles_found"] == len(r.found_tiles)
     assert all("corners" not in t for t in payload["tiles"])
 
 
-# -- load limits ------------------------------------------------------------
-#
-# Added after the first run on the real rig took the Pi down. The cost of a
-# pass is tiles x cameras x ~5 ms, and nothing bounded any of the three.
+def test_nothing_in_this_module_owns_a_thread_or_a_camera():
+    """The worker that used to live here is what took the rig down. Its absence
+    is a property worth asserting, not just a fact about the current file."""
+    import trilobite.calibration.detect as mod
 
-
-def _load_app(tmp_path, pitch_preview, **detection):
-    from trilobite.app import Application
-    from trilobite.config import AppConfig, StageConfig, StorageConfig
-
-    cfg = AppConfig(
-        cameras=[CameraConfig(
-            cam_id="left", backend="synthetic", fps=1000,
-            full_resolution=(1456, 1088), preview_resolution=(182, 136),
-            pipeline=[StageConfig(type="mla_grid_overlay", name="mla",
-                                  params={"enabled": True, "pitch_px": pitch_preview})],
-        )],
-        storage=StorageConfig(root=str(tmp_path / "d")),
-    )
-    app = Application(cfg)
-    for k, v in detection.items():
-        setattr(app.calibration.detection, k, v)
-    return app
-
-
-def _check(report, suffix):
-    return next(c for c in report["checks"] if c["id"].endswith(suffix))
-
-
-def test_a_grid_that_would_saturate_the_cpu_is_refused_before_it_starts(tmp_path):
-    """The actual field failure: with the pitch left near its default the
-    geometry yields hundreds of tiles instead of ~130, and two workers then run
-    that continuously. The number is knowable before anything starts."""
-    app = _load_app(tmp_path, pitch_preview=2.5)      # 20 px on the sensor
-    app.start()
-    try:
-        r = app.calibration_readiness()
-        c = _check(r, "tile_count")
-        assert c["blocking"] and not c["ok"]
-        assert "exceeds the limit" in c["message"]
-        assert r["ready"] is False
-        with pytest.raises(RuntimeError, match="exceeds the limit"):
-            app.detection_start()
-    finally:
-        app.stop()
-
-
-def test_a_realistic_grid_passes_and_reports_the_cost(tmp_path):
-    app = _load_app(tmp_path, pitch_preview=12.5)     # 100 px on the sensor
-    app.start()
-    try:
-        c = _check(app.calibration_readiness(), "tile_count")
-        assert c["ok"]
-        assert "100 px on the sensor" in c["message"]
-        assert "s per pass" in c["message"]
-    finally:
-        app.stop()
-
-
-def test_a_pitch_larger_than_the_sensor_is_refused_with_its_own_message(tmp_path):
-    app = _load_app(tmp_path, pitch_preview=380.0)
-    app.start()
-    try:
-        c = _check(app.calibration_readiness(), "tile_count")
-        assert not c["ok"]
-        assert "no whole tiles" in c["message"]
-    finally:
-        app.stop()
-
-
-def test_a_preview_of_the_wrong_shape_is_refused_by_name(tmp_path):
-    """A preview that does not share the sensor's aspect ratio cannot carry a
-    grid onto the sensor frame at all. Saying so beats reporting zero tiles."""
-    from trilobite.app import Application
-    from trilobite.config import AppConfig, StageConfig, StorageConfig
-
-    cfg = AppConfig(
-        cameras=[CameraConfig(
-            cam_id="left", backend="synthetic", fps=1000,
-            full_resolution=(1456, 1088), preview_resolution=(640, 480),
-            pipeline=[StageConfig(type="mla_grid_overlay", name="mla",
-                                  params={"enabled": True, "pitch_px": 44.0})],
-        )],
-        storage=StorageConfig(root=str(tmp_path / "d")),
-    )
-    app = Application(cfg)
-    app.start()
-    try:
-        c = _check(app.calibration_readiness(), "tile_count")
-        assert not c["ok"]
-        assert "aspect ratio" in c["message"]
-    finally:
-        app.stop()
-
-
-def test_the_runtime_cap_stops_a_pitch_changed_under_a_running_detector(tmp_path):
-    """The precondition runs once; the MLA parameters are live objects. The
-    worker re-checks, so the failure mode is a message rather than a machine
-    that stops answering."""
-    from trilobite.calibration.detect import DetectionWorker
-
-    app = _load_app(tmp_path, pitch_preview=12.5)
-    app.start()
-    try:
-        cam = app.camera("left")
-        worker = DetectionWorker(
-            cam, app.calibration.board, app.calibration.acceptance,
-            max_tiles=10, annotate_overlay=False,
-        )
-        with pytest.raises(RuntimeError, match="over the limit"):
-            worker._one_pass()
-    finally:
-        app.stop()
-
-
-def test_the_duty_cycle_is_clamped_to_something_sane():
-    from trilobite.calibration.detect import DetectionWorker
-
-    class FakeCam:
-        cam_id = "x"
-
-    assert DetectionWorker(FakeCam(), BoardSpec(), AcceptanceSpec(), max_duty=99).max_duty == 1.0
-    assert DetectionWorker(FakeCam(), BoardSpec(), AcceptanceSpec(), max_duty=0).max_duty == 0.05
-
-
-def test_cameras_share_one_gate_so_they_take_turns(tmp_path):
-    """Two full-frame passes at once double the peak current draw, and that is
-    the load a marginal Pi 5 supply fails on first."""
-    from trilobite.app import Application
-    from trilobite.config import AppConfig, StageConfig, StorageConfig
-
-    cams = [
-        CameraConfig(
-            cam_id=cid, backend="synthetic", fps=1000,
-            full_resolution=(1456, 1088), preview_resolution=(182, 136),
-            pipeline=[StageConfig(type="mla_grid_overlay", name="mla",
-                                  params={"enabled": True, "pitch_px": 12.5})],
-        )
-        for cid in ("left", "right")
-    ]
-    app = Application(AppConfig(cameras=cams, storage=StorageConfig(root=str(tmp_path / "d"))))
-    app.start()
-    try:
-        app.detection_start()
-        gates = {id(w.gate) for w in app.detection.values()}
-        assert len(gates) == 1, "both cameras must share one semaphore"
-    finally:
-        app.detection_stop()
-        app.stop()
+    source_text = pathlib.Path(mod.__file__).read_text(encoding="utf-8")
+    assert "threading" not in source_text
+    assert "capture_request" not in source_text
+    assert not hasattr(mod, "DetectionWorker")

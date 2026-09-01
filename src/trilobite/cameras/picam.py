@@ -178,14 +178,35 @@ class Picamera2Source(CameraSource):
     def read_preview(self) -> Frame | None:
         if not self._open:
             return None
+        want_full = self.full_frame_pending
         with self._lock:
             request = self._picam.capture_request()
             try:
                 yuv = request.make_array("lores")
                 meta = dict(request.get_metadata())
+                # The full-resolution stream comes out of the SAME request, so
+                # it is the same exposure as the preview and costs no extra
+                # camera access. This is the only place `main` is ever read in
+                # the streaming path -- see the note in cameras/base.py about
+                # why a second consumer is not allowed to exist.
+                full = request.make_array("main") if want_full else None
             finally:
                 # Requests are a finite pool. Holding one starves the sensor.
                 request.release()
+
+        # One sequence number for both, because they are one exposure. That is
+        # the property the whole handshake exists to preserve: a pose's full
+        # frame and the presence map that triggered it describe the same
+        # instant, not two instants a frame apart.
+        seq = self._next_seq()
+
+        if full is not None:
+            if full.ndim == 3:
+                full = full[..., 0]
+            self._serve_full_frame(Frame.now(
+                np.ascontiguousarray(full), self.cam_id, seq,
+                space="mono8", stream="main", mono_sensor=self._mono, **meta,
+            ))
 
         # lores is YUV420; the first height rows are the luma plane. For a mono
         # sensor that plane *is* the image, and for a colour sensor it is a
@@ -195,37 +216,8 @@ class Picamera2Source(CameraSource):
         # Kept so that turning auto-exposure off can pin the values AE just
         # chose -- see set_controls.
         self._last_meta = meta
-        return Frame.now(luma, self.cam_id, self._next_seq(), space="mono8", **meta)
+        return Frame.now(luma, self.cam_id, seq, space="mono8", **meta)
 
-    def read_full_mono(self) -> Frame | None:
-        """Full-resolution luma from the `main` stream, for corner detection.
-
-        Pulls from the same request pool as the preview, so it costs one extra
-        buffer copy and no sensor reconfiguration -- which is the only reason
-        this can run in a loop at all. A mode switch per detection pass would
-        stall the preview for hundreds of milliseconds each time.
-
-        `main` is configured without an explicit format, so on a Pi 5 it comes
-        back as XBGR8888: four channels, all carrying the same luma for a mono
-        sensor. Slicing one plane is a 1.5 MB copy; a colour conversion would
-        be several times that for an identical result.
-        """
-        if not self._open:
-            return None
-        with self._lock:
-            request = self._picam.capture_request()
-            try:
-                data = request.make_array("main")
-                meta = dict(request.get_metadata())
-            finally:
-                request.release()
-        if data.ndim == 3:
-            data = data[..., 0]
-        meta["stream"] = "main"
-        meta["mono_sensor"] = self._mono
-        return Frame.now(
-            np.ascontiguousarray(data), self.cam_id, self._next_seq(), space="mono8", **meta
-        )
 
     def capture_full(self, raw: bool = True) -> Frame:
         if not self._open:

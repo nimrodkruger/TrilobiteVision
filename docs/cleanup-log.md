@@ -12,6 +12,75 @@ git checkout .              # everything back to HEAD
 
 ---
 
+## 2026-09-01 (c) — the capture loop, and the actual cause of the crash
+
+`stress-ng --cpu 4` ran on the rig without a crash and barely spun the fan.
+That eliminated power and thermal, which had been the leading hypothesis, and
+left the only other candidate: **a second consumer of the camera**.
+
+### The cause
+
+`CameraSource.read_full_mono()` called `picamera2.capture_request()` from a
+detection worker's own thread, at 1 Hz, while the preview loop called it at
+30 Hz. Two consumers of a four-deep request pool across three full-resolution
+streams. The CPU limits added in (b) reduced the load and did not help, because
+load was never the mechanism.
+
+### What replaced it
+
+| removed | replacement |
+|---|---|
+| `CameraSource.read_full_mono()` and its picamera2 override | `request_full_frame()` / `wait_full_frame()`. The capture loop pulls `main` out of the request it is **already holding**; nothing else ever touches the device. |
+| `DetectionWorker` (thread per camera, full-field corner detection) | `calibration/presence.py` as a pipeline stage on preview frames, plus a five-tile cross check once per pose |
+| `DetectionSpec.interval_s / max_tiles / max_duty / concurrent_cameras / overlay` | no longer meaningful — nothing runs on a loop of its own. The remaining `DetectionSpec` fields are the two detector flags. |
+| `/api/calibration/detection`, `/calibration/detection/{cam}.jpg` | `/api/calibration/session`, `/calibration/shot/{cam}.jpg` |
+
+A side benefit worth naming: the full frame now shares a sequence number with
+the preview frame it arrived with. They are one exposure.
+
+### New
+
+| file | what |
+|---|---|
+| `calibration/presence.py` | saddle counting — the cheap live detector |
+| `calibration/session.py` | the hands-free state machine and the recorder |
+| `scripts/benchmark_detectors.py` | the cost table, on whatever machine runs it |
+| `CaptureSpec` in `calibration/settings.py` | every gate in the capture loop |
+| `checkerboard_presence` stage | must sit **after** `mla_grid_overlay` in the pipeline |
+
+`config/pi.yaml` gains the presence stage, disabled. Enable it when the MLA is
+aligned.
+
+### Two bugs found while testing this, both worth knowing
+
+**Counting noise read as movement.** A saddle count fluctuates by one or two per
+micro-image between frames, and across 130 tiles that sums to about the size of
+a real stillness threshold. The loop sat at "0/4 still" indefinitely with
+nothing moving. Fixed with a dead band (`COUNT_NOISE = 2.0`) applied before the
+comparison; there is a test.
+
+**The preview must resolve the board's squares.** At an eighth scale a
+micro-image is 12 px across and its squares are two, which no saddle detector
+finds — and the symptom is the console asking for a board that is plainly in
+shot. Now a blocking precondition (`MIN_PREVIEW_TILE_PX = 24`).
+
+### Rollback
+
+Not committed. `git checkout .` reverses everything. If only the capture loop is
+suspect, `checkerboard_presence` can be disabled in the config and the imaging
+mode is untouched — the presence stage is the only thing that runs during
+normal streaming.
+
+### Verification
+
+`ruff` clean; 128 tests pass (41 new). A full session was driven through the
+browser against the synthetic lenslet array: searching → hold → checking →
+captured → move → captured, three poses written, space forcing a shot, escape
+discarding one, tones firing once each, and the files on disk carrying corners
+in sensor coordinates with the frozen geometry beside them.
+
+---
+
 ## 2026-09-01 (b) — after the first run on the rig
 
 Two field failures: starting calibration took the Pi down, and an external disk

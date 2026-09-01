@@ -181,15 +181,47 @@
   .notes { font-family:ui-monospace,monospace; font-size:10px; color:var(--muted);
            line-height:1.6; max-height:80px; overflow-y:auto; }
 
+  /* --- the capture banner -------------------------------------------------
+     Four words, full width, colour-coded. The operator is holding a board with
+     both hands and looking at it, not at this; the banner has to be readable
+     from arm's length in peripheral vision, which is why it is this large and
+     why the colour carries as much of the message as the text. */
+  .banner { border-radius:10px; padding:14px 18px; background:var(--panel2);
+            border:1px solid var(--line); transition:background .12s ease; }
+  .banner .big { font-size:34px; font-weight:750; letter-spacing:.01em; line-height:1.05; }
+  .banner .sub { font-size:12px; color:var(--muted); margin-top:4px;
+                 font-family:ui-monospace,monospace; }
+  .banner .tally { font-size:11px; color:var(--muted); margin-top:6px;
+                   font-variant-numeric:tabular-nums; }
+  .banner.warn { background:#3a2c12; border-color:var(--warn); }
+  .banner.warn .big { color:var(--warn); }
+  .banner.hold { background:#12283a; border-color:var(--accent); }
+  .banner.hold .big { color:var(--accent); }
+  .banner.ok   { background:#12341f; border-color:var(--ok); }
+  .banner.ok   .big { color:var(--ok); }
+  .banner.move { background:#2a1b33; border-color:#b07bd6; }
+  .banner.move .big { color:#c79bea; }
+
+  /* --- depth spread ------------------------------------------------------- */
+  .depth { margin-top:6px; }
+  .depth .bars { display:flex; align-items:flex-end; gap:2px; height:44px;
+                 padding:2px; background:var(--panel2); border:1px solid var(--line);
+                 border-radius:6px; }
+  .depth .bars i { flex:1; background:var(--accent); border-radius:2px 2px 0 0;
+                   min-height:1px; }
+  .depth .why { font-size:11px; color:var(--muted); margin-top:4px;
+                font-family:ui-monospace,monospace; }
+
   /* --- detection coverage -------------------------------------------------
      One cell per lattice position, laid out as the array is. Capped in size:
      it is a glance, not a picture, and at full column width it would push the
      live views off the screen -- which are the thing you aim the board with. */
   .cov { display:grid; gap:1px; margin:5px 0; max-width:230px; }
   .cov i { display:block; aspect-ratio:1; border-radius:1px; background:#1a1d26; }
-  .cov i.miss  { background:#4a2330; }   /* examined, found nothing */
-  .cov i.found { background:var(--ok); }
-  .cov i.cross { background:var(--accent); }
+  .cov i.partial { background:var(--warn); }   /* some poses banked */
+  .cov i.found   { background:var(--ok); }     /* at target */
+  .cov i.cross   { background:var(--accent); } /* seeing the board right now */
+  .cov i.off     { background:#141721; }       /* not a whole micro-image */
   .covkey { font-size:9px; color:var(--muted); display:flex; gap:9px; align-items:center; }
   .covkey i { width:8px; height:8px; border-radius:2px; display:inline-block;
               vertical-align:-1px; margin-right:3px; }
@@ -761,7 +793,6 @@ let MODE = "live";
    how the storage card ended up in the calibration rail. Every build carries
    the generation it started in and stops if it is no longer current. */
 let BUILD = 0;
-let DETECTING = false;   // declared here so renderReadiness can consult it
 let CAL = null;          // settings object, mirrored from the server
 let CAL_SCHEMA = null;
 let readinessTimer = null;
@@ -836,13 +867,63 @@ function renderReadiness(r) {
   const btn = $("#cal-start");
   const why = $("#cal-why");
   if (btn) {
-    btn.disabled = !r.ready || DETECTING;
+    btn.disabled = !r.ready || SESSION.running;
     why.textContent = r.ready
       ? (r.warnings.length ? `${r.warnings.length} advisory warning(s)` : "preconditions met")
       : `blocked: ${r.blocking_failures.length} precondition(s)`;
     why.style.color = r.ready ? "" : "var(--err)";
   }
 }
+
+/* ---------------------------------------------------------------------------
+   THE CAPTURE CONSOLE
+
+   Designed around one fact: the operator has both hands on the board, is
+   looking at the board and not at this page, and cannot press anything.
+
+   So the ordering of the channels is inverted from a normal dashboard.
+
+     1. SOUND is primary. A tone on capture, a lower one on reject, a double
+        tick on discard. You work by ear and never look up.
+     2. The BANNER is second: four words, full width, colour-coded, readable
+        from arm's length across a bench.
+     3. The numbers are third. They are for afterwards.
+
+   Everything the page does is a view of server state. The session lives in the
+   application, so closing this tab does not end it -- which matters when you
+   cannot free a hand to rescue a browser.
+--------------------------------------------------------------------------- */
+
+/* WebAudio, no assets. Frequencies chosen to be distinguishable across a room
+   with a fan running: a rising pair for success, a low buzz for a reject. */
+let AUDIO = null;
+function tone(freq, ms, type = "sine", gain = 0.16, delay = 0) {
+  try {
+    AUDIO = AUDIO || new (window.AudioContext || window.webkitAudioContext)();
+    if (AUDIO.state === "suspended") AUDIO.resume();
+    const t0 = AUDIO.currentTime + delay;
+    const osc = AUDIO.createOscillator(), amp = AUDIO.createGain();
+    osc.type = type; osc.frequency.value = freq;
+    // A hard start and stop clicks; a few milliseconds of ramp does not.
+    amp.gain.setValueAtTime(0.0001, t0);
+    amp.gain.exponentialRampToValueAtTime(gain, t0 + 0.012);
+    amp.gain.exponentialRampToValueAtTime(0.0001, t0 + ms / 1000);
+    osc.connect(amp).connect(AUDIO.destination);
+    osc.start(t0); osc.stop(t0 + ms / 1000 + 0.02);
+  } catch { /* no audio device, or autoplay blocked until a click */ }
+}
+const SOUNDS = {
+  captured:  () => { tone(880, 90); tone(1320, 110, "sine", 0.16, 0.09); },
+  rejected:  () => tone(190, 220, "square", 0.10),
+  discarded: () => { tone(520, 70); tone(390, 90, "sine", 0.14, 0.08); },
+  armed:     () => { tone(660, 80); tone(990, 100, "sine", 0.14, 0.08); },
+  stopped:   () => { tone(660, 120); tone(440, 200, "sine", 0.14, 0.12); },
+  warning:   () => { tone(300, 160, "sawtooth", 0.12); tone(300, 160, "sawtooth", 0.12, 0.25); },
+};
+
+let SESSION = { running: false, phase: "idle" };
+let LAST_EVENT = 0;
+let SOUND_ON = true;
 
 async function buildCalibration() {
   const gen = ++BUILD;
@@ -859,14 +940,16 @@ async function buildCalibration() {
   const rail = document.createElement("div");
   rail.className = "rail";
   rail.appendChild(calGroup("Board", "board", ["cols", "rows", "square_mm"]));
+  rail.appendChild(calGroup("Capture", "capture",
+    ["min_tiles_seeing", "settle_frames", "still_threshold", "move_threshold",
+     "review_s", "reject_cooldown_s", "require_all_cameras", "tick_hz",
+     "max_poses", "min_free_gb"]));
   rail.appendChild(calGroup("Optics (nominal)", "optics",
     ["focal_length_mm", "lens_to_mla_mm", "mla_to_sensor_mm", "working_distance_mm"]));
   rail.appendChild(calGroup("Acceptance", "acceptance",
-    ["min_corners_per_tile", "min_cross_tiles", "target_per_tile",
-     "move_fraction", "move_rotation_deg"]));
+    ["min_corners_per_tile", "min_cross_tiles", "target_per_tile"]));
   rail.appendChild(calGroup("Detection", "detection",
-    ["interval_s", "max_tiles", "max_duty", "concurrent_cameras",
-     "overlay", "normalize_illumination", "high_accuracy"]));
+    ["normalize_illumination", "high_accuracy"]));
 
   // Exposure and gain only. No pipeline, no MLA -- alignment is finished
   // before entering, and its parameters are frozen (shown below, read-only).
@@ -877,10 +960,29 @@ async function buildCalibration() {
     rail.appendChild(panel);
   }
 
-  // ---- right: derived numbers, checks, live views, start --------------
+  // ---- right: the banner first, everything else under it --------------
   const stage = document.createElement("div");
   stage.className = "stage";
   stage.innerHTML = `
+    <div class="banner" id="cal-banner">
+      <div class="big" id="cal-title">READY</div>
+      <div class="sub" id="cal-hint">press start</div>
+      <div class="tally" id="cal-tally"></div>
+    </div>
+    <div class="startbar">
+      <button id="cal-start">Start session</button>
+      <button class="ghost" id="cal-stop" disabled>Finish</button>
+      <span class="why" id="cal-why"></span>
+      <label class="why" style="margin-left:auto;display:flex;gap:5px;align-items:center">
+        <input type="checkbox" id="cal-sound" checked> sound
+      </label>
+      <span class="why">space = shoot now &nbsp; esc = discard last</span>
+    </div>
+    <div class="calviews" id="cal-views"></div>
+    <div>
+      <div class="sectitle">Working distance spread</div>
+      <div class="depth" id="cal-depth"></div>
+    </div>
     <div>
       <div class="sectitle">What the nominal optics imply</div>
       <div class="derived" id="cal-derived" style="margin-top:8px"></div>
@@ -893,16 +995,6 @@ async function buildCalibration() {
     <div>
       <div class="sectitle">Frozen alignment</div>
       <div class="frozen" id="cal-frozen" style="margin-top:6px"></div>
-    </div>
-    <div>
-      <div class="sectitle">Live</div>
-      <div class="calviews" id="cal-views" style="margin-top:8px"></div>
-    </div>
-    <div class="startbar">
-      <button id="cal-start">Start detection</button>
-      <button class="ghost" id="cal-stop" disabled>Stop</button>
-      <span class="why" id="cal-why"></span>
-      <span class="why" style="margin-left:auto">no images are recorded at this stage</span>
     </div>`;
 
   const views = stage.querySelector("#cal-views");
@@ -910,18 +1002,16 @@ async function buildCalibration() {
     const v = document.createElement("div");
     v.className = "calview";
     v.innerHTML = `<h3><span class="t"></span>
-                     <span class="stat" data-fps="${cam.cam_id}">&mdash;</span></h3>
-                   <img data-detimg="${cam.cam_id}" src="/stream/${cam.cam_id}.mjpg" alt="preview">
+                     <span class="stat" data-seeing="${cam.cam_id}">&mdash;</span></h3>
+                   <img data-calimg="${cam.cam_id}" src="/stream/${cam.cam_id}.mjpg" alt="live">
                    <div class="actions" style="display:block">
-                     <div class="detstat idle" data-detstat="${cam.cam_id}">detection idle</div>
                      <div class="cov" data-cov="${cam.cam_id}"></div>
                      <div class="covkey">
-                       <span><i style="background:var(--accent)"></i>cross</span>
-                       <span><i style="background:var(--ok)"></i>found</span>
-                       <span><i style="background:#4a2330"></i>nothing</span>
-                       <span><i style="background:#1a1d26"></i>off sensor</span>
+                       <span><i style="background:var(--ok)"></i>at target</span>
+                       <span><i style="background:var(--warn)"></i>some poses</span>
+                       <span><i style="background:var(--accent)"></i>seeing now</span>
+                       <span><i style="background:#1a1d26"></i>none yet</span>
                      </div>
-                     <span class="note" data-note="${cam.cam_id}"></span>
                    </div>`;
     v.querySelector(".t").textContent = cam.label || cam.cam_id;
     views.appendChild(v);
@@ -931,7 +1021,7 @@ async function buildCalibration() {
 
   // The MLA parameters are what crop the micro-images, so they are shown but
   // not editable here: changing them mid-session would silently invalidate
-  // every corner already recorded.
+  // every pose already recorded.
   const frozen = $("#cal-frozen");
   frozen.innerHTML = "";
   for (const cam of cams) {
@@ -939,11 +1029,8 @@ async function buildCalibration() {
       const stages = await jget(`/api/pipeline/${cam.cam_id}`);
       if (gen !== BUILD) return;
       const mla = stages.find(s => s.type === "mla_grid_overlay");
+      const pres = stages.find(s => s.type === "checkerboard_presence");
       const line = document.createElement("div");
-      // Pitch is quoted twice on purpose. It is set in preview pixels, which
-      // is what you aligned against, but detection runs on the sensor frame,
-      // and that factor of two is the one number in this whole dashboard that
-      // is worth being able to check at a glance.
       const rw = mla && mla.values.reference_width;
       const full = cam.info && cam.info.full_resolution;
       const k = rw && full ? full[0] / rw : 1;
@@ -952,8 +1039,8 @@ async function buildCalibration() {
           `(= ${(mla.values.pitch_px * k).toFixed(1)} px on the sensor), ` +
           `rot ${mla.values.rotation_deg}°, ` +
           `offset (${mla.values.offset_x}, ${mla.values.offset_y}), ` +
-          `crop ×${mla.values.crop_scale}, ` +
-          `derotate ${mla.values.derotate_views ? "ON" : "off"}`
+          `crop ×${mla.values.crop_scale}` +
+          (pres ? `, presence ≥ ${pres.values.min_corners}` : ", NO PRESENCE STAGE")
         : `${cam.cam_id}: no MLA stage`;
       frozen.appendChild(line);
     } catch { /* readiness will report it */ }
@@ -961,139 +1048,182 @@ async function buildCalibration() {
 
   renderDerived(cfg.derived);
 
+  $("#cal-sound").onchange = ev => {
+    SOUND_ON = ev.target.checked;
+    if (SOUND_ON) SOUNDS.armed();          // also unlocks audio on first click
+  };
   $("#cal-start").onclick = async ev => {
-    const btn = ev.currentTarget;
-    btn.disabled = true;
-    try {
-      applyDetectionState(await jsend("/api/calibration/start"));
-      log("detection running — corner finding only, nothing is being saved", "ok");
-    } catch (e) {
-      log(e.message, "err");
-      btn.disabled = false;
-    }
+    ev.currentTarget.disabled = true;
+    SOUNDS.armed();                         // a click is what unlocks WebAudio
+    try { applySession(await jsend("/api/calibration/start")); }
+    catch (e) { log(e.message, "err"); ev.currentTarget.disabled = false; }
   };
   $("#cal-stop").onclick = async ev => {
     ev.currentTarget.disabled = true;
-    try { applyDetectionState(await jsend("/api/calibration/stop")); log("detection stopped"); }
+    try { applySession(await jsend("/api/calibration/stop")); }
     catch (e) { log(e.message, "err"); }
   };
 
-  // A reload mid-session must not lie about whether detection is running.
-  try { applyDetectionState(await jget("/api/calibration/detection")); } catch { /* transient */ }
+  // A reload mid-session must not lie about whether one is open.
+  try { applySession(await jget("/api/calibration/session")); } catch { /* transient */ }
 
   await refreshReadiness();
   readinessTimer = setInterval(refreshReadiness, 2000);
 }
 
-/* ---------------------------------------------------------------------------
-   Detection display.
+/* Keyboard, global, because the calibration console is the only mode that
+   wants it and the operator may not have focus anywhere in particular.
+   Space forces a shot; Escape discards the last one during the review pause. */
+document.addEventListener("keydown", async ev => {
+  if (MODE !== "cal" || !SESSION.running) return;
+  if (ev.target && /^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName)) return;
+  if (ev.code === "Space") {
+    ev.preventDefault();
+    try { applySession(await jsend("/api/calibration/force")); } catch { /* transient */ }
+  } else if (ev.code === "Escape") {
+    ev.preventDefault();
+    try { applySession(await jsend("/api/calibration/discard")); } catch { /* transient */ }
+  }
+});
 
-   Two things are shown and they answer different questions. The annotated
-   image answers "is it finding the pattern where I think the pattern is" --
-   it is the frame the numbers were measured on, with the corners drawn at
-   their measured positions. The coverage lattice answers "which part of the
-   array is failing", which the image cannot: a dead column at one edge is
-   obvious as a column of grey cells and invisible as a few missing boxes in a
-   busy picture.
---------------------------------------------------------------------------- */
+const PHASE_CLASS = {
+  idle: "", searching: "warn", hold: "hold", verify: "hold",
+  review: "ok", move: "move", stopped: "",
+};
 
-function applyDetectionState(state) {
-  DETECTING = !!(state && state.running);
+function applySession(state) {
+  if (!state) return;
+  SESSION = state;
   const start = $("#cal-start"), stop = $("#cal-stop");
-  if (start) start.disabled = DETECTING;
-  if (stop) stop.disabled = !DETECTING;
+  if (start) start.disabled = !!state.running;
+  if (stop) stop.disabled = !state.running;
 
-  for (const img of document.querySelectorAll("[data-detimg]")) {
-    const cam = img.dataset.detimg;
-    if (DETECTING) {
-      // Drop the MJPEG stream. Not only for the connection budget: the
-      // annotated frame IS the live view while detecting, and showing an
-      // unannotated stream beside a set of counts derived from a different
-      // frame invites reading the two together.
-      if (img.dataset.mode !== "det") { img.dataset.mode = "det"; img.removeAttribute("src"); }
-    } else if (img.dataset.mode !== "stream") {
-      img.dataset.mode = "stream";
-      img.dataset.busy = "0";
+  const banner = $("#cal-banner");
+  if (banner) {
+    banner.className = "banner " + (PHASE_CLASS[state.phase] || "");
+    $("#cal-title").textContent = state.title || "";
+    $("#cal-hint").textContent = state.hint || "";
+    $("#cal-tally").textContent = state.running || state.poses
+      ? `${state.poses} poses` +
+        (state.depth_spread ? `  ·  depth spread ${state.depth_spread} px` : "") +
+        (state.directory ? `  ·  ${state.directory.split(/[\\/]/).pop()}` : "")
+      : "";
+  }
+
+  // Tones, once each. The sequence numbers come from the server so a slow or
+  // briefly disconnected page never plays a tone twice or misses one.
+  for (const e of state.events || []) {
+    if (e.seq <= LAST_EVENT) continue;
+    LAST_EVENT = e.seq;
+    if (SOUND_ON && SOUNDS[e.kind]) SOUNDS[e.kind]();
+    log(`${e.kind}: ${e.text}`, e.kind === "captured" ? "ok"
+        : e.kind === "rejected" || e.kind === "warning" ? "err" : "");
+  }
+
+  for (const [camId, d] of Object.entries(state.cameras || {})) {
+    const el = document.querySelector(`[data-seeing="${camId}"]`);
+    if (el) {
+      el.textContent = `${d.seeing}/${d.whole} seeing · strength ${d.strength}`;
+      el.style.color = d.seeing ? "var(--ok)" : "var(--muted)";
+    }
+    const cov = document.querySelector(`[data-cov="${camId}"]`);
+    if (cov) renderCoverage(cov, d);
+  }
+  renderDepth(state.depth_px || []);
+  swapViews(state.phase === "review");
+}
+
+/* During the review pause the live stream is replaced by the shot that was
+   actually recorded, with its cross and corners drawn. Looking at a later
+   preview frame that merely resembles it would defeat the point of the pause. */
+function swapViews(reviewing) {
+  for (const img of document.querySelectorAll("[data-calimg]")) {
+    const cam = img.dataset.calimg;
+    if (reviewing && img.dataset.mode !== "shot") {
+      img.dataset.mode = "shot";
+      img.removeAttribute("src");
+      img.src = `/calibration/shot/${cam}.jpg?t=${Date.now()}`;
+      img.style.outline = "2px solid var(--ok)";
+    } else if (!reviewing && img.dataset.mode !== "live") {
+      img.dataset.mode = "live";
+      img.style.outline = "";
       img.src = `/stream/${cam}.mjpg`;
     }
   }
-  if (state) renderDetection(state);
 }
 
-function renderDetection(state) {
-  for (const [camId, d] of Object.entries((state && state.cameras) || {})) {
-    const line = document.querySelector(`[data-detstat="${camId}"]`);
-    const cov = document.querySelector(`[data-cov="${camId}"]`);
-    const r = d.result;
-    if (line) {
-      if (!r) {
-        line.className = "detstat idle";
-        line.textContent = d.running ? "waiting for the first pass…" : "detection idle";
-      } else if (r.error) {
-        line.className = "detstat"; line.style.color = "var(--err)";
-        line.textContent = r.error;
-      } else {
-        line.className = "detstat" + (r.accepted ? "" : " idle");
-        line.style.color = "";
-        line.innerHTML =
-          `<b>${r.tiles_found}</b>/${r.tiles_examined} tiles · ` +
-          `<b>${r.cross_centres.length}</b> cross · ${r.pass_ms} ms · ` +
-          (r.accepted ? "POSE WOULD BE ACCEPTED" : "no qualifying cross");
-      }
-    }
-    if (cov && r && r.tiles && r.tiles.length) renderCoverage(cov, r);
-  }
-}
-
-function renderCoverage(host, r) {
-  const is = r.tiles.map(t => t.i), js = r.tiles.map(t => t.j);
-  const i0 = Math.min(...is), i1 = Math.max(...is);
-  const j0 = Math.min(...js), j1 = Math.max(...js);
-  const cols = i1 - i0 + 1, rows = j1 - j0 + 1;
-  const crosses = new Set(r.cross_centres.map(c => `${c[0]},${c[1]}`));
-
-  // Rebuild only when the lattice extent changes; otherwise recolour in place.
+/* One cell per lattice position. Two things are layered on it, and keeping
+   them apart is the point: how many poses a micro-image has banked over the
+   whole session (the thing you are filling), and which micro-images are seeing
+   the board right this second (the thing you are aiming). */
+function renderCoverage(host, d) {
+  const counts = d.counts || [];
+  if (!counts.length) return;
+  const rows = counts.length, cols = counts[0].length;
   if (host.dataset.dims !== `${cols}x${rows}`) {
     host.dataset.dims = `${cols}x${rows}`;
     host.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
     host.innerHTML = "";
     for (let n = 0; n < cols * rows; n++) host.appendChild(document.createElement("i"));
   }
+  const target = (CAL && CAL.acceptance && CAL.acceptance.target_per_tile) || 8;
+  const banked = new Map((d.coverage || []).map(([i, j, n]) => [`${i},${j}`, n]));
+  const [i0, j0] = d.origin || [0, 0];
   const cells = host.children;
-  // Unset means "not a whole tile" -- a lattice position whose crop runs off
-  // the sensor. Distinguishing that from "examined and found nothing" is the
-  // point of the display: the second is a fault to chase, the first is just
-  // the edge of the array.
-  for (const c of cells) c.className = "";
-  for (const t of r.tiles) {
-    const idx = (t.j - j0) * cols + (t.i - i0);
-    const cell = cells[idx];
-    if (!cell) continue;
-    cell.className = crosses.has(`${t.i},${t.j}`) ? "cross" : (t.found ? "found" : "miss");
-    cell.title = `(${t.i}, ${t.j})  ` +
-      (t.found ? `${t.n} corners` : (t.skipped ? "too flat to hold a pattern" : "no pattern"));
+  const thresh = (CAL && CAL.capture && CAL.capture.min_tiles_seeing) ? 0 : 0;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const cell = cells[r * cols + c];
+      if (!cell) continue;
+      const i = c + i0, j = r + j0;
+      const whole = (d.whole_mask && d.whole_mask[r]) ? d.whole_mask[r][c] : true;
+      const n = banked.get(`${i},${j}`) || 0;
+      const seeing = whole && counts[r][c] >= (thresh || 1) && counts[r][c] > 0;
+      cell.className = !whole ? "off"
+        : n >= target ? "found"
+        : n > 0 ? "partial"
+        : seeing ? "cross" : "";
+      cell.title = `(${i}, ${j})  ${n} poses  ·  ${counts[r][c]} corners now`;
+    }
   }
 }
 
-/* Detection images are polled, like the sub-aperture tiles and for the same
-   reason -- and at 1-2 Hz there is nothing worth streaming anyway. */
-const DET_HZ = 3;
-function pollDetection() {
-  const next = () => setTimeout(pollDetection, 1000 / DET_HZ);
-  if (MODE !== "cal" || !DETECTING) return next();
-  for (const img of document.querySelectorAll('[data-detimg][data-mode="det"]')) {
-    if (img.dataset.busy === "1") continue;
-    img.dataset.busy = "1";
-    const done = () => { img.dataset.busy = "0"; };
-    img.onload = done;
-    img.onerror = done;    // 204 before the first pass completes
-    img.src = `/calibration/detection/${img.dataset.detimg}.jpg?t=${Date.now()}`;
+/* The spread of apparent square sizes, which is the spread of working
+   distances. kappa and D enter the model only through kappa/(Z - D) and are
+   one parameter at a single depth: a session held at one distance fits
+   perfectly and is wrong, and nothing in the residuals says so. This histogram
+   is where that gets caught, which is why it is on the main screen. */
+function renderDepth(values) {
+  const host = $("#cal-depth");
+  if (!host) return;
+  if (!values.length) {
+    host.innerHTML = `<div class="empty">no poses yet — vary the distance, not just the angle</div>`;
+    return;
   }
-  jget("/api/calibration/detection")
-    .then(s => { DETECTING = !!s.running; renderDetection(s); })
-    .catch(() => {});
+  const lo = Math.min(...values), hi = Math.max(...values);
+  const bins = 12, span = Math.max(hi - lo, 1e-6);
+  const hist = new Array(bins).fill(0);
+  for (const v of values) hist[Math.min(bins - 1, Math.floor((v - lo) / span * bins))]++;
+  const peak = Math.max(...hist);
+  const occupied = hist.filter(n => n > 0).length;
+  host.innerHTML =
+    `<div class="bars">${hist.map(n =>
+      `<i style="height:${Math.round(100 * n / peak)}%"></i>`).join("")}</div>` +
+    `<div class="why">${values.length} poses, ${lo.toFixed(1)}–${hi.toFixed(1)} px per square,` +
+    ` ${occupied} of ${bins} bands occupied` +
+    (occupied >= 3 ? ` <span style="color:var(--ok)">✓</span>`
+                   : ` <span style="color:var(--warn)">— move nearer and further</span>`) +
+    `</div>`;
+}
+
+const SESSION_HZ = 5;
+function pollSession() {
+  const next = () => setTimeout(pollSession, 1000 / SESSION_HZ);
+  if (MODE !== "cal") return next();
+  jget("/api/calibration/session").then(applySession).catch(() => {});
   next();
 }
+
 
 async function refreshReadiness() {
   if (MODE !== "cal") return;
@@ -1243,7 +1373,7 @@ async function poll() {
   setTimeout(poll, 1000);
 }
 
-buildLive().then(() => { poll(); pollTiles(); pollDetection(); })
+buildLive().then(() => { poll(); pollTiles(); pollSession(); })
           .catch(e => log("startup: " + e.message, "err"));
 </script>
 </body>

@@ -86,6 +86,11 @@ class CameraConfig(BaseModel):
     # Inner corners per micro-image. The calibration board settings must be set
     # to match these, or detection will correctly find nothing.
     synthetic_board: tuple[int, int] = (4, 3)
+    # Slow drift of the whole array, in full-resolution pixels. Non-zero by
+    # default so the capture loop's settle and movement gates are exercised
+    # every time the synthetic config is run. Set to 0 when a test needs the
+    # grid to sit exactly where the geometry says it does.
+    synthetic_drift_px: float = 3.0
 
     pipeline: list[StageConfig] = Field(default_factory=list)
 

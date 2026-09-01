@@ -97,9 +97,11 @@ class SyntheticSource(CameraSource):
         ct, st = math.cos(t), math.sin(t)
         gx, gy = (w - 1) / 2.0, (h - 1) / 2.0
         # A slow Lissajous drift of a few pixels: enough to move the corners,
-        # small enough that the same tiles stay whole.
-        gx += 3.0 * math.sin(phase * 0.7)
-        gy += 3.0 * math.cos(phase * 0.5)
+        # small enough that the same tiles stay whole. Zero it when a test needs
+        # the grid exactly where the geometry says it is.
+        drift = float(self.cfg.synthetic_drift_px) * scale
+        gx += drift * math.sin(phase * 0.7)
+        gy += drift * math.cos(phase * 0.5)
 
         yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
         dx, dy = xx - gx, yy - gy
@@ -156,10 +158,21 @@ class SyntheticSource(CameraSource):
         phase += 0.3 * (abs(hash(self.cam_id)) % 7)
         image = self._render(self._prev, phase)
         self._last_mean = float(image.mean())
+        seq = self._next_seq()
+
+        # Same contract as the real backend: a full frame is produced here, in
+        # the capture call, at the same phase as the preview -- never by a
+        # second thread reaching into the source on its own schedule.
+        if self.full_frame_pending:
+            self._serve_full_frame(Frame.now(
+                self._render(self._full, phase), self.cam_id, seq,
+                space="mono8", Synthetic=True, stream="main", **self._controls,
+            ))
+
         return Frame.now(
             image,
             self.cam_id,
-            self._next_seq(),
+            seq,
             space="mono8",
             Synthetic=True,
             **self._controls,
@@ -317,7 +330,11 @@ class ReplaySource(CameraSource):
         self._idx += 1
         data = self._load(path)
         space = "rgb8" if data.ndim == 3 else ("mono16" if data.dtype == np.uint16 else "mono8")
-        return Frame.now(data, self.cam_id, self._next_seq(), space=space, source_file=str(path))
+        frame = Frame.now(data, self.cam_id, self._next_seq(), space=space, source_file=str(path))
+        if self.full_frame_pending:
+            # Replay has one resolution, so the "full" frame is the same frame.
+            self._serve_full_frame(self._to_mono(frame))
+        return frame
 
     def capture_full(self, raw: bool = True) -> Frame:
         frame = self.read_preview()
