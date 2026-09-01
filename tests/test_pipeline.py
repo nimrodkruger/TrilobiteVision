@@ -385,14 +385,49 @@ def test_readiness_blocks_on_disabled_mla(tmp_path):
         app.stop()
 
 
-def test_readiness_blocks_on_derotation(tmp_path):
-    """Resampled tiles would blur the corners the whole session depends on."""
+def test_derotation_warns_but_does_not_block(tmp_path):
+    """De-rotation does not invalidate a calibration: corners are recorded in
+    sensor coordinates either way, so they map back identically. It costs about
+    0.07 px of extra localisation noise (measured -- see
+    scripts/measure_derotation_cost.py), which is worth avoiding and not worth
+    refusing to start over. This test exists because the first version blocked
+    on it, which was wrong."""
     app = _cal_app(tmp_path, derotate=True)
     app.start()
     try:
         r = app.calibration_readiness()
-        assert r["ready"] is False
-        assert any("derotate" in m for m in r["blocking_failures"])
+        assert r["ready"] is True
+        assert any("derotate" in w for w in r["warnings"])
+    finally:
+        app.stop()
+
+
+def test_safe_crop_scale_depends_on_aperture_shape(tmp_path):
+    """Square apertures rotate with the lattice, so the usable axis-aligned
+    crop shrinks with the angle. A circular aperture has no orientation, so
+    rotation costs nothing -- which removes the only crop-related reason to
+    minimise the grid rotation physically."""
+    from trilobite.optics.mla import MLAGeometry
+
+    flat = MLAGeometry(728, 544, 100.0, rotation_deg=0.0)
+    tilted = MLAGeometry(728, 544, 100.0, rotation_deg=5.0)
+
+    assert flat.max_safe_crop_scale("square") == pytest.approx(1.0)
+    assert tilted.max_safe_crop_scale("square") == pytest.approx(0.9235, abs=1e-3)
+
+    # Rotation-independent for a circle.
+    assert flat.max_safe_crop_scale("circle") == pytest.approx(0.7071, abs=1e-3)
+    assert tilted.max_safe_crop_scale("circle") == pytest.approx(0.7071, abs=1e-3)
+
+
+def test_crop_scale_warning_reports_the_bound(tmp_path):
+    app = _cal_app(tmp_path)
+    app.camera("left").pipeline.update_params("mla", {"rotation_deg": 10.0, "crop_scale": 1.0})
+    app.start()
+    try:
+        r = app.calibration_readiness()
+        assert r["ready"] is True                      # advisory only
+        assert any("neighbouring micro-image" in w for w in r["warnings"]), r["warnings"]
     finally:
         app.stop()
 

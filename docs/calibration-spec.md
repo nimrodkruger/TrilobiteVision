@@ -66,10 +66,15 @@ the micro-image lattice:
 
 Three consequences worth stating explicitly:
 
-- **No rotation term appears in (1).** The MLA rotation lives entirely in `U`.
-  Because the rotation is MLA-to-sensor and each lenslet is rotationally
-  symmetric, the micro-image *content* is not rotated — only the lattice of
-  centres is. (This is why `derotate_views` defaults to off.)
+- **No rotation term appears in (1), because `U` already carries it.** `U` is a
+  general 2×2 matrix — two pitches, rotation and skew — and it is fitted. So
+  the grid rotation is accounted for exactly, at no extra parameter cost, and
+  there is no decision to make about whether to include it.
+
+  Separately: because the rotation is MLA-to-sensor and each lenslet is
+  rotationally symmetric, the micro-image *content* is not rotated — only the
+  lattice of centres is. That makes de-rotating a tile unnecessary, not
+  forbidden; see §2.6.
 - **Depth-independence is structural.** (1) is a projection from a fixed
   centre. Rays through `C[i,j]` are the angular receptive field of that
   sub-aperture, defined for all `Z`. Nothing is calibrated "at a distance".
@@ -250,7 +255,51 @@ If the heads are ever rigidly co-boresighted such that `t_LR` genuinely cannot
 be resolved, regularise it toward the mechanical drawing rather than removing
 it — a soft prior degrades gracefully, a hard constraint biases the rotation.
 
-### 2.5 Gauge constraints
+### 2.5 Grid rotation: fitted, not minimised
+
+Since `U` is a general 2×2 matrix, **any grid rotation is absorbed exactly by
+the fit.** There is no accuracy argument for reducing the angle physically.
+
+The angle does have one practical consequence, and only one: whether an
+axis-aligned crop stays inside its own lenslet. Straying into a neighbour feeds
+a different scene patch to the corner detector. The bound depends on the
+lenslet aperture shape, and the two cases differ in kind:
+
+| θ | square apertures | circular apertures |
+|---|---|---|
+| 0° | 100 % of pitch | 70.7 % |
+| 1° | 98.3 % | 70.7 % |
+| 2° | 96.7 % | 70.7 % |
+| 5° | 92.3 % | 70.7 % |
+| 10° | 86.3 % | 70.7 % |
+
+Square apertures rotate with the lattice, so the usable axis-aligned crop is
+`1/(|cos θ| + |sin θ|)`. **A circle has no orientation, so with circular
+lenslets rotation costs nothing at all** — the bound is the inscribed square,
+`1/√2`, whatever θ is.
+
+So: with circular apertures, do not bother minimising the angle. With square
+apertures, keeping it under ~2° costs under 4 % of the crop, and past ~10° you
+start losing corners worth having. `MLAGeometry.max_safe_crop_scale()` computes
+the bound and the readiness check reports it.
+
+### 2.6 De-rotated tiles
+
+De-rotation is a display convenience and does **not** affect validity. Corners
+are recorded in sensor coordinates whichever way the tile was extracted
+(§3.2), so a corner found in a de-rotated tile maps back to the same sensor
+position.
+
+Its only cost is one extra resampling pass. Measured on a synthetic board at
+20 px squares in 100 px tiles: **~0.07 px RMS added corner-localisation noise
+against a ~0.15 px baseline**, roughly independent of angle — it is the
+resampling, not the rotation. Reproduce with
+`scripts/measure_derotation_cost.py`.
+
+Small, avoidable for free by leaving it off, and not grounds for refusing to
+run a session. The readiness check advises; it does not block.
+
+### 2.7 Gauge constraints
 
 `Δĉ` is exactly degenerate with `(ĉ0, U)`: a constant offset is absorbable into
 `ĉ0`, a linear trend into `U`. Constrain
@@ -429,7 +478,7 @@ and refined in stage 1.
 | depth 3 | 3–4 | ≤ 0.7× working depth |
 
 **≈ 15 poses, spanning ≥ 3 depths.** The depth spread is what makes `κ` and `D`
-separable (§2.5) — without it the fit is under-determined and will still
+separable (§2.7) — without it the fit is under-determined and will still
 converge, to a wrong answer.
 
 Coverage matters more than pose count: a lenslet that never sees the board has

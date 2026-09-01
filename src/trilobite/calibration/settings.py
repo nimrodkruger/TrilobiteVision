@@ -246,13 +246,19 @@ def readiness_report(cameras: list[Any]) -> dict[str, Any]:
                      else f"{cid}: MLA grid is disabled -- align it in live mode first"),
         ))
 
+        # Advisory, not blocking. Corners are recorded in sensor coordinates
+        # whichever way the tile was extracted, so de-rotation does not
+        # invalidate anything -- it costs about 0.07 px of extra corner
+        # localisation noise against a ~0.15 px baseline (measured; see
+        # scripts/measure_derotation_cost.py). Worth avoiding, not worth
+        # refusing to start over.
         derot = bool(getattr(p, "derotate_views", False))
         checks.append(Check(
-            id=f"{cid}.derotate", ok=not derot, blocking=True,
-            message=(f"{cid}: tiles are unresampled" if not derot else
-                     f"{cid}: derotate_views is on. This rig's rotation is "
-                     f"MLA-to-sensor, so tile content is not rotated; resampling "
-                     f"would blur the corners the fit depends on."),
+            id=f"{cid}.derotate", ok=not derot, blocking=False,
+            message=(f"{cid}: tiles unresampled" if not derot else
+                     f"{cid}: derotate_views is on -- adds ~0.07 px corner noise "
+                     f"for no benefit here, since the rotation is MLA-to-sensor "
+                     f"and the tile content is not rotated. Valid either way."),
         ))
 
         streaming = bool(cam.source.is_open) and cam.errors == 0
@@ -277,12 +283,29 @@ def readiness_report(cameras: list[Any]) -> dict[str, Any]:
                      f"{cid}: grid is at every default value -- has alignment been done?"),
         ))
 
+        # The crop must stay inside its own lenslet: straying into a
+        # neighbour feeds a different scene patch to the corner detector.
+        # The bound depends on the aperture shape and, for square apertures,
+        # on the grid rotation.
+        # Depends only on the rotation, so it does not wait for a frame --
+        # an earlier version read the live frame and silently passed before the
+        # first preview arrived.
         scale = float(getattr(p, "crop_scale", 1.0))
+        geom = stage.geometry(1, 1)
+        safe_sq = geom.max_safe_crop_scale("square")
+        safe_cir = geom.max_safe_crop_scale("circle")
         checks.append(Check(
-            id=f"{cid}.crop_scale", ok=math.isclose(scale, 1.0), blocking=False,
-            message=(f"{cid}: crop scale 1.0" if math.isclose(scale, 1.0) else
-                     f"{cid}: crop scale is {scale}, not 1.0 -- tiles will not be "
-                     f"one lenslet pitch"),
+            id=f"{cid}.crop_scale", ok=scale <= safe_sq + 1e-9, blocking=False,
+            message=(
+                f"{cid}: crop scale {scale:g} fits the cell "
+                f"(square apertures allow {safe_sq:.3f} at {p.rotation_deg:g}°, "
+                f"circular {safe_cir:.3f})"
+                if scale <= safe_sq + 1e-9 else
+                f"{cid}: crop scale {scale:g} exceeds {safe_sq:.3f} -- at "
+                f"{p.rotation_deg:g}° rotation an axis-aligned tile this size "
+                f"reaches into the neighbouring micro-image. Circular apertures "
+                f"cap it at {safe_cir:.3f} regardless of rotation."
+            ),
         ))
 
     if not cameras:

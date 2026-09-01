@@ -20,9 +20,15 @@ is off: the tiles are plain crops, unresampled, and the rotation lives entirely
 in the lattice matrix. See docs/calibration-spec.md section 1 -- there is no
 rotation term anywhere in the projection model, for exactly this reason.
 
-Turn it on only to eyeball tiles side by side during alignment, and never for
-anything you intend to measure: bilinear resampling of a 100 px tile softens
-the corners that the calibration depends on.
+**This does not restrict the calibration.** The grid rotation is a fitted
+parameter -- it lives in the 2x2 lattice matrix U -- and corners are recorded
+in sensor coordinates whichever way the tile was extracted, so a de-rotated
+tile yields the same corner positions after mapping back. Measured cost of the
+extra resampling: about 0.07 px RMS of corner-localisation noise against a
+~0.15 px baseline (scripts/measure_derotation_cost.py). Small, avoidable for
+free by leaving this off, and not a reason to forbid anything.
+
+Turn it on whenever comparing tiles side by side helps.
 
 The grid overlay is an alignment aid, not a measurement -- it draws on the
 preview only. Its parameters (pitch, rotation, offset) are the same numbers the

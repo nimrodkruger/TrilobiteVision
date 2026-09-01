@@ -297,6 +297,30 @@ class MLAGeometry:
             mask |= inside & ~inner
         return mask
 
+    def max_safe_crop_scale(self, aperture: str = "square") -> float:
+        """Largest crop_scale whose axis-aligned tile stays inside one lenslet.
+
+        The constraint is not to stray into a neighbouring micro-image, which
+        would feed a different scene patch to the corner detector. What bounds
+        it depends on the lenslet aperture shape, and the two answers differ in
+        kind:
+
+          square apertures  -- the cell rotates with the lattice, so an
+            axis-aligned crop must fit inside a rotated square:
+            1/(|cos θ| + |sin θ|). Costs 3% at 2°, 8% at 5°.
+
+          circular apertures -- a circle has no orientation, so rotation costs
+            nothing at all; the bound is the inscribed square of the footprint
+            circle, 1/√2 ≈ 0.707, whatever θ is.
+
+        Worth knowing which you have: with circular lenslets there is no crop
+        reason to minimise the grid rotation physically.
+        """
+        if aperture == "circle":
+            return 1.0 / math.sqrt(2.0)
+        t = math.radians(self.rotation_deg)
+        return 1.0 / (abs(math.cos(t)) + abs(math.sin(t)))
+
     def crop_side(self, scale: float = 1.0) -> int:
         """Side length in pixels of every sub-aperture tile.
 
