@@ -40,15 +40,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
-# Named sub-apertures the geometry can resolve. Signs are in image convention:
-# x right, y DOWN -- so "top right" is +i, -j.
-NAMED_SUBAPERTURES: tuple[str, ...] = (
-    "top_left", "centre", "top_right", "bottom_left", "bottom_right",
-)
-
-# The three the UI actually displays, in left-to-right display order. Defined
+# The sub-apertures the UI displays, in left-to-right display order. Defined
 # here rather than in the web layer so the overlay's highlight boxes and the
 # extracted tiles are guaranteed to name the same lenslets.
+#
+# named_indices() resolves more names than these -- all four corners plus the
+# centre. Signs are in image convention: x right, y DOWN, so "top_right" is
+# +i, -j.
 UI_SUBAPERTURES: tuple[str, ...] = ("top_right", "centre", "bottom_left")
 
 

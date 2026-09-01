@@ -5,22 +5,21 @@ link, a disk flush, an expensive processing stage -- none of these are allowed
 to change the timing of the sensor read, because in optics work the capture
 cadence is part of the measurement.
 
-Two primitives cover every consumer so far:
+One primitive covers every consumer so far:
 
   LatestFrame  - single slot, newest wins. For anything where a stale frame is
                  worthless: the live preview, the telemetry readout. A reader
                  that falls behind silently skips ahead.
 
-  FrameQueue   - bounded FIFO with an explicit drop counter. For anything where
-                 every frame matters: recording, burst capture. When it
-                 overflows you get a number you can report, not a mystery.
+Recording will need the other shape: a bounded FIFO with an explicit drop
+counter, so that an overflow gives you a number you can report rather than a
+mystery. It is deliberately not here yet. An untested queue that nothing calls
+is worse than no queue, because it reads as a decision already made.
 """
 
 from __future__ import annotations
 
-import queue
 import threading
-from dataclasses import dataclass
 
 from .types import Frame
 
@@ -53,41 +52,3 @@ class LatestFrame:
             if self._version <= since:
                 self._cond.wait_for(lambda: self._version > since, timeout=timeout)
             return self._version, self._frame
-
-
-@dataclass
-class QueueStats:
-    accepted: int = 0
-    dropped: int = 0
-
-    @property
-    def drop_rate(self) -> float:
-        total = self.accepted + self.dropped
-        return self.dropped / total if total else 0.0
-
-
-class FrameQueue:
-    """Bounded queue that counts what it had to throw away."""
-
-    def __init__(self, maxsize: int = 64) -> None:
-        self._q: queue.Queue[Frame] = queue.Queue(maxsize=maxsize)
-        self.stats = QueueStats()
-
-    def offer(self, frame: Frame) -> bool:
-        """Non-blocking put. Returns False and counts a drop if full."""
-        try:
-            self._q.put_nowait(frame)
-        except queue.Full:
-            self.stats.dropped += 1
-            return False
-        self.stats.accepted += 1
-        return True
-
-    def take(self, timeout: float = 1.0) -> Frame | None:
-        try:
-            return self._q.get(timeout=timeout)
-        except queue.Empty:
-            return None
-
-    def __len__(self) -> int:
-        return self._q.qsize()

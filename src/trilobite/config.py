@@ -119,17 +119,6 @@ class AppConfig(BaseModel):
     def storage_root(self) -> Path:
         return Path(os.path.expanduser(self.storage.root))
 
-    @property
-    def camera_order(self) -> list[str]:
-        """cam_ids in config order -- which is the order the UI lays them out."""
-        return [c.cam_id for c in self.cameras]
-
-    def camera(self, cam_id: str) -> CameraConfig:
-        for c in self.cameras:
-            if c.cam_id == cam_id:
-                return c
-        raise KeyError(f"no camera {cam_id!r} in config")
-
 
 def load_config(path: str | Path) -> AppConfig:
     """Load and validate a config file. Raises on anything malformed.

@@ -1,188 +1,115 @@
 # TrilobiteVision
 
-Dual-camera capture, configurable processing and browser preview for a
-Raspberry Pi 5 with two IMX296 global shutter cameras. Built as a skeleton for
-plenoptic camera calibration work.
+Capture, processing and browser control for a Raspberry Pi 5 optics rig with
+two IMX296 mono global-shutter cameras. Built for **focused plenoptic
+(Plenoptic 2.0) camera calibration**: a microlens array sits behind the main
+objective, and the deliverable is pixel-to-pixel registration across
+sub-aperture views, valid at any object distance.
 
-### Names used here
+Runs with no hardware attached. Two synthetic camera backends drive the entire
+stack — web UI, pipeline, storage, corner detection — so development and tests
+happen on a desktop and only the parts that need photons happen on the Pi.
 
-| thing | name | why |
-|---|---|---|
-| repo / project folder | `TrilobiteVision` | the project |
-| distribution (pyproject `name`) | `trilobitevision` | matches the repo |
-| Python import package | `trilobite` | what you type: `python -m trilobite` |
-| venv | `~/.venvs/trilobite` | created by `install_pi.sh`; does not exist until then |
-| systemd unit | `trilobite.service` | `systemctl status trilobite` |
-| data directory | `~/trilobite-data` | change via `storage.root` in the config |
-| the Pi itself | `flyeye` | hostname and login user, unrelated to the code |
-| the cameras | `cam0`, `cam1` | `cam_id` in the config; rename them freely |
+```
+python -m trilobite --config config/desktop.yaml     # no camera needed
+python -m trilobite --config config/pi.yaml          # on the rig
+```
 
-The import package is shortened to `trilobite` so commands stay typeable. To
-use the full name instead, rename `src/trilobite/` and replace `trilobite`
-with `trilobitevision` in `pyproject.toml` and in the imports.
-
+Then open `http://localhost:8000/` (or `http://<pi-address>:8000/`).
 
 ---
 
-## The two paths
+## Status
 
-The single most important idea in this codebase. Every frame goes down one of
-two paths and they must not be confused:
+| area | state |
+|---|---|
+| Dual-camera preview, MJPEG to the browser | working |
+| Sensor controls (exposure, gain, auto-exposure) | working |
+| Declarative processing pipeline, live reconfiguration | working |
+| MLA grid overlay and sub-aperture crops | working |
+| Runtime parameters saved on exit, restored on start | working |
+| Full-resolution still capture, `.npy` + JSON sidecar | working |
+| Hot-pluggable output storage | working |
+| Calibration: live per-tile corner detection | working — **records nothing** |
+| Calibration: pose recording and session files | not built |
+| Calibration: the fit | not built (offline, by design) |
+| Video recording | not built |
+| Hardware sync between the two sensors | not built (needs XVS wiring) |
+| `lenslet_extract` — full 4D light-field resampling | placeholder; see its docstring |
 
-| | **view path** | **science path** |
-|---|---|---|
-| source | `lores` stream, ISP-processed | `raw` stream, ISP bypassed |
-| resolution | 728×544 | 1456×1088 native |
-| processing | gamma, gain, overlays | none |
-| destination | JPEG → browser | `.npy` + JSON sidecar → disk |
-| purpose | is it in focus? is it aligned? | measurement |
-
-The view path is allowed to lie — stretch contrast, draw grids, decimate. The
-science path is not allowed to touch a pixel. picamera2 produces both streams
-from the same sensor read, so the view path is nearly free and the two are
-always in temporal agreement.
-
-Conflating them is the classic way to lose a week: you calibrate against
-gamma-corrected preview frames and every radiometric result is wrong.
-
----
-
-## Architecture
-
-```
-                    ┌──────────────┐
-   sensor ─────────▶│ CameraSource │  picamera2 │ synthetic │ replay
-                    └──────┬───────┘
-                           │ Frame (pixels + sensor metadata + timestamps)
-              ┌────────────┴────────────┐
-              ▼                         ▼
-       ┌─────────────┐          ┌──────────────┐
-       │  Pipeline   │          │ capture_full │  ─── raw, unprocessed
-       │  (view)     │          └──────┬───────┘
-       └──────┬──────┘                 │
-              ▼                        ▼
-       ┌─────────────┐          ┌──────────────┐
-       │ LatestFrame │          │SessionWriter │  .npy + .json sidecar
-       │    (bus)    │          └──────────────┘
-       └──────┬──────┘
-              ▼
-       ┌─────────────┐
-       │ JPEG → HTTP │  MJPEG to the browser
-       └─────────────┘
-```
-
-Four seams, each placed where a future change is expected:
-
-**`CameraSource`** (`cameras/base.py`) — the whole stack runs with no hardware
-via the `synthetic` and `replay` backends. You develop the web UI, the
-parameter plumbing and the storage layout on Windows, and an event camera or a
-machine-vision USB3 camera later is a subclass, not a refactor.
-
-**`Stage`** (`processing/base.py`) — a stage *declares* its parameters as a
-pydantic model. From that declaration the system derives validation, the
-browser controls, and the settings record saved with every image. Adding a
-stage is one file; the UI updates itself. This is the thing that stops the
-codebase needing a rebuild as it grows.
-
-**`LatestFrame` / `FrameQueue`** (`bus.py`) — the capture thread only reads,
-processes and publishes. It never encodes, writes or waits on the network, so
-a slow browser cannot perturb capture timing.
-
-**`create_app`** (`web/server.py`) — MJPEG is the starting transport because
-it works everywhere with no client library. Replacing it with WebRTC later
-touches this module and the static page, nothing else.
-
-### Files
-
-```
-src/trilobite/
-  types.py                 Frame, CameraInfo. Metadata travels with pixels.
-  config.py                pydantic schema for the rig YAML
-  bus.py                   LatestFrame (newest wins), FrameQueue (counts drops)
-  app.py                   CameraRuntime (thread per camera), Application
-  __main__.py              CLI entry point
-  cameras/
-    base.py                CameraSource ABC — the hardware seam
-    picam.py               Picamera2 backend, main+lores+raw stream config
-    offline.py             synthetic and replay backends (no hardware)
-    registry.py            backend lookup, libcamera discovery
-  processing/
-    base.py                Stage ABC + StageParams — the parameter contract
-    registry.py            @register decorator, stage catalogue
-    pipeline.py            ordered runner, live reconfiguration, timing
-    stages/basic.py        passthrough, levels, crop, downsample, stats
-    stages/plenoptic.py    MLA grid overlay; lenslet_extract stub
-  optics/mla.py            lenslet geometry, shared by the overlay and the crops
-  calibration/
-    settings.py            board, nominal optics, acceptance, readiness checks
-    detect.py              live per-tile corner detection (needs cv2)
-  sinks/jpeg.py            JPEG encode (simplejpeg → cv2 → PIL)
-  storage/writer.py        session dirs, .npy + JSON sidecar, live retargeting
-  storage/devices.py       which filesystems can hold a session, right now
-  web/server.py            FastAPI: stream, params, controls, capture
-  web/static/index.html    UI generated from the stage schemas
-scripts/probe_cameras.py   run this first, on the Pi
-scripts/install_pi.sh      apt + config.txt + venv, idempotent
-systemd/trilobite.service     run as a service
-tests/                     all of it runs anywhere, no camera needed
-```
+Two open decisions are blocking further calibration work, both physical rather
+than software: the **target design** (see `docs/calibration-ui-spec.md` §10.1)
+and whether the **lenslet apertures are square or circular**, which determines
+whether grid rotation costs any usable crop area.
 
 ---
 
-## Environment
+## Names
 
-### On the Pi
+| thing | name |
+|---|---|
+| repo and project folder | `TrilobiteVision` |
+| distribution (`pyproject.toml` name) | `trilobitevision` |
+| Python import package | `trilobite` |
+| virtualenv on the Pi | `~/.venvs/trilobite` |
+| systemd unit | `trilobite.service` |
+| default data directory | `~/trilobite-data` |
+| the Pi's hostname and login user | `flyeye` (unrelated to the code) |
+| the cameras | `left`, `right` (`cam_id` in the config) |
 
-Nothing below exists on a freshly flashed Pi -- no venv, no Python packages,
-no camera overlays. `install_pi.sh` creates all of it and is safe to re-run.
+The import package is short so commands stay typeable.
+
+---
+
+## Install
+
+### Raspberry Pi 5
+
+Nothing below exists on a freshly flashed Pi. `install_pi.sh` creates all of
+it and is safe to re-run.
 
 ```bash
 git clone <your-repo> ~/TrilobiteVision
 cd ~/TrilobiteVision
-bash scripts/install_pi.sh      # apt packages, config.txt, venv, editable install
-sudo reboot                     # required: config.txt changed
+bash scripts/install_pi.sh
+sudo reboot                       # required: /boot/firmware/config.txt changed
 ```
-
-Then:
 
 ```bash
 source ~/.venvs/trilobite/bin/activate
-python scripts/probe_cameras.py --grab
+python scripts/probe_cameras.py --grab      # confirm indices and sensor modes
 python -m trilobite --config config/pi.yaml
 ```
 
-Open `http://<pi-address>:8000/`.
+Three things the script does that are not optional:
 
-**What the install script does, and why each piece matters:**
+- **apt, not pip, for the camera stack.** `python3-picamera2` is a C++
+  extension built against the system libcamera; pip versions drift out of step
+  and produce import errors or silent format mismatches. `python3-numpy`,
+  `python3-opencv` and `python3-simplejpeg` come from apt for ABI compatibility
+  with picamera2's buffers.
+- **`python3 -m venv --system-site-packages`.** Raspberry Pi OS is an
+  externally-managed environment (PEP 668), so pip will not install into the
+  system Python, and picamera2 lives in the system site-packages. Without the
+  flag every camera import fails with a `ModuleNotFoundError` that looks like a
+  broken install.
+- **Two explicit camera overlays** in `/boot/firmware/config.txt`. Auto-detect
+  is reliable for one camera and not for two.
 
-*apt, not pip, for the camera stack.* `python3-picamera2` is a C++ extension
-built against the system libcamera. The pip version drifts out of step and
-produces import errors or, worse, silent format mismatches. `python3-numpy`,
-`python3-opencv` and `python3-simplejpeg` come from apt too — for ABI
-compatibility with picamera2's buffers, and to avoid a 40-minute OpenCV source
-build on the Pi.
+  ```
+  camera_auto_detect=0
+  dtoverlay=imx296,cam0
+  dtoverlay=imx296,cam1
+  ```
 
-*The venv must be created with `--system-site-packages`.* Raspberry Pi OS is
-an externally-managed environment (PEP 668), so pip refuses to install into
-the system Python; but picamera2 lives in the system site-packages. Without
-that flag, the venv cannot see the camera library and every import fails with
-a `ModuleNotFoundError` that looks like a broken install. This one flag causes
-more wasted hours on Pi camera projects than anything else.
+Verify with `rpicam-hello --list-cameras` before blaming the Python. If
+libcamera reports zero cameras, run `bash scripts/diagnose_cameras.sh`.
 
-*Two explicit camera overlays.* In `/boot/firmware/config.txt`:
+**Do not pip-install OpenCV on the Pi.** The apt build shares numpy's ABI with
+picamera2; a pip wheel alongside it gives two `cv2` modules and an import order
+that decides which one you get.
 
-```
-camera_auto_detect=0
-dtoverlay=imx296,cam0
-dtoverlay=imx296,cam1
-```
-
-Auto-detection is reliable for one camera and not for two. `cam0` and `cam1`
-name the Pi 5's two CSI connectors. A reboot is required.
-
-Verify with `rpicam-hello --list-cameras` before blaming the Python.
-
-### On the Windows desktop
+### Desktop (Windows, macOS, Linux)
 
 ```powershell
 git clone <your-repo>
@@ -194,95 +121,262 @@ python -m trilobite --config config/desktop.yaml
 pytest
 ```
 
-No Pi, no cameras, no libcamera. Two synthetic cameras produce a drifting
-grating and a fixed grid; the full web UI, the whole pipeline and the storage
-layer all run. `picamera2` is imported lazily inside `Picamera2Source.open()`
-precisely so this works.
-
-Develop here. Deploy to the Pi to test the parts that actually need photons.
+No Pi, no cameras, no libcamera — `picamera2` is imported lazily inside
+`Picamera2Source.open()` so this works. The `desktop` extra brings numpy,
+Pillow and `opencv-python-headless` (needed by the corner detector).
 
 ### Deploy loop
 
 ```powershell
-# Windows
-git add -A; git commit -m "..."; git push
+git add -A; git commit -m "..."; git push          # desktop
 ```
 
 ```bash
-# Pi
 ssh flyeye@<address> 'cd ~/TrilobiteVision && git pull && sudo systemctl restart trilobite'
 ```
 
-During active development, leave the systemd service **disabled** and run the
-app by hand in an SSH terminal — a service holding the cameras will make your
-manual runs fail with a confusing "device busy".
+During active development leave the systemd service **disabled** and run the
+app by hand over SSH. A service holding the cameras makes manual runs fail with
+a confusing "device busy".
 
 ---
 
-## API
+## Running
 
-| method | path | purpose |
+```
+python -m trilobite [options]
+
+  -c, --config PATH    rig config YAML (default: config/pi.yaml)
+      --host HOST      override server host
+      --port PORT      override server port
+      --log-level L    override the config's log level
+      --state PATH     where runtime parameters are saved
+                       (default: <config-name>.state.json beside the config)
+      --no-restore     start from the config as written, ignoring saved state
+                       (the state file is still written on exit)
+```
+
+Parameters dialled in through the UI are saved on exit and restored on start.
+The state file is a JSON overlay on the config, kept separate so the commented
+YAML stays the readable record of intent. It is gitignored.
+
+Use Ctrl-C, not `kill -9`: libcamera does not always recover from a process
+that dies holding a sensor, and the fix is a reboot.
+
+### Configurations
+
+| file | cameras | for |
 |---|---|---|
-| GET | `/` | UI |
-| GET | `/api/status` | uptime, per-camera fps, error counts, session dir |
-| GET | `/api/cameras` | camera list and hardware description |
-| GET | `/api/stage-types` | every registered stage type and its schema |
-| GET | `/stream/{cam}.mjpg` | MJPEG preview |
-| GET | `/snapshot/{cam}.jpg` | single preview frame |
-| GET | `/api/pipeline/{cam}` | stages, schemas, current values, per-stage ms |
-| POST | `/api/pipeline/{cam}/{stage}` | `{"values": {...}}` — validated, 422 on bad input |
-| POST | `/api/pipeline/{cam}/_add` | insert a stage at runtime |
-| DELETE | `/api/pipeline/{cam}/{stage}` | remove a stage |
-| POST | `/api/controls/{cam}` | sensor controls: `ExposureTime`, `AnalogueGain`, ... |
-| POST | `/api/capture/{cam}?raw=true` | full-res capture with sidecar |
-| POST | `/api/capture-all?raw=true` | trigger every camera |
-| GET/PUT | `/api/calibration/settings` | board, nominal optics, acceptance, detection |
-| GET | `/api/calibration/readiness` | preconditions, split blocking vs advisory |
-| POST | `/api/calibration/start`, `/stop` | live corner detection — **records nothing** |
-| GET | `/api/calibration/detection` | latest pass per camera: per-tile verdicts |
-| GET | `/calibration/detection/{cam}.jpg` | that pass, annotated |
-| GET | `/api/storage` | filesystems on offer, and where output is going |
-| POST | `/api/storage/target` | move output to a device, while running |
-| POST | `/api/storage/release` | back to internal, so a device can be unplugged |
+| `config/pi.yaml` | two IMX296 via picamera2 | the rig |
+| `config/desktop.yaml` | two synthetic, drifting gratings | UI and pipeline work |
+| `config/desktop-plenoptic.yaml` | two synthetic lenslet arrays, a whole checkerboard per micro-image | calibration work off-rig |
 
-Sensor controls and pipeline parameters are deliberately separate endpoints.
-One changes what the sensor does, the other changes what happens to the
-numbers afterwards; conflating them makes it impossible to tell whether a
-change was optical or computational.
+---
+
+## The two paths
+
+Every frame goes down one of two paths, and they must not be confused.
+
+| | **view path** | **science path** |
+|---|---|---|
+| source | `lores` stream, ISP-processed | `raw` stream, ISP bypassed |
+| resolution | 728 × 544 | 1456 × 1088 native |
+| processing | gamma, gain, overlays | none |
+| destination | JPEG → browser | `.npy` + JSON sidecar → disk |
+| purpose | is it in focus? is it aligned? | measurement |
+
+The view path may stretch contrast, draw grids and decimate. The science path
+does not touch a pixel. picamera2 produces both from the same sensor read, so
+the view path is nearly free and the two are always in temporal agreement.
+
+Corner detection is a third case and sits between them: full sensor
+resolution, because the preview would halve corner precision, but taken from
+the ISP output, because the ISP's companding moves no corner. That is
+`CameraSource.read_full_mono()`.
+
+---
+
+## The dashboard
+
+Two modes, switched in the header. They are separate because alignment and
+calibration are different jobs: during alignment you stare at the image,
+during calibration you stare at coverage.
+
+### Imaging mode
+
+Per camera: the live preview with the MLA grid drawn on it, three sub-aperture
+tiles below it, and a scrolling column of controls generated from the stage
+schemas. Save raw or save view, per camera or both at once.
+
+The MLA parameters — pitch, rotation, offsets, crop scale — are what the
+sub-aperture crops use, so what you see aligned is what gets extracted. They
+are set in **preview pixels**, and the frame size they were measured against is
+recorded with them; anything reading a different-sized frame converts through
+`MLAGridOverlay.geometry_for()`.
+
+The Storage panel lives here — see below.
+
+### Calibration mode
+
+A left rail of settings (board, nominal optics, acceptance, detection) and a
+stage showing what the nominal optics imply, the preconditions, the frozen
+alignment, and the live views.
+
+**Start detection** runs per-tile checkerboard detection at 1–2 Hz on
+full-resolution frames and **writes nothing**. It answers the question that has
+to be answered before pose recording is worth building: does the detector find
+the board in the micro-images, and in enough of them at once?
+
+Each camera shows the annotated frame — the same frame the numbers came from,
+tiles boxed by verdict, corners drawn where they were measured — and a coverage
+lattice with one cell per lattice position: *cross*, *found*, *nothing found*,
+*not a whole tile*. The lattice is not redundant with the picture: a dead
+column at the edge of the array is obvious as a column of cells and invisible
+as a few missing boxes in a busy image.
+
+To rehearse it with no camera, run `config/desktop-plenoptic.yaml` and set the
+board to **4 × 3 inner corners, 7 mm**.
+
+### Why the tiles are polled and not streamed
+
+A browser allows about six concurrent HTTP/1.1 connections per origin, and an
+MJPEG stream holds one open forever. Two cameras with a preview and three tiles
+each is eight — over the limit, at which point every other request on the page,
+including every button press, queues behind them and never completes. The
+symptom is a UI whose controls silently do nothing.
+
+So: exactly one persistent stream per camera, everything else polled as
+single-shot JPEGs. This is a constraint, not a tuning parameter.
 
 ---
 
 ## Output storage
 
-The SD card is the wrong place for a capture session — slow, and sustained
-writes wear it out — and the right USB SSD is usually not plugged in when the
-application starts. So the output directory is movable **while the rig is
-running**, from the Storage panel on the imaging page.
+The SD card is the wrong place for a session — slow, and sustained writes wear
+it out — and the right USB SSD is usually not plugged in when the application
+starts. The output directory is therefore movable while the rig is running,
+from the Storage panel in imaging mode.
 
-Three properties, and the third is the one that matters:
-
-* **Devices are polled.** Something plugged in five minutes after startup
-  appears in the list without a reload. Listing never writes a probe file —
-  read-only mounts are read out of `/proc/mounts`, not discovered by trying.
-* **Choosing a device creates a new session directory on it**, under
+- **Devices are polled**, so something plugged in after startup appears without
+  a reload. Listing never writes a probe file; read-only mounts are read out of
+  `/proc/mounts`.
+- **Choosing a device creates a new session directory on it**, under
   `trilobite-data/`. Nothing already written is moved, mirrored or deleted, and
-  a note records where the earlier part of the afternoon went.
-* **Pulling the disk is survivable.** A watcher notices within two seconds and
-  falls back to the configured root, and a write that fails mid-capture
-  recovers and completes rather than losing the frame. This matters more than
-  it sounds: unplugging a USB stick leaves the mount point behind as an
-  ordinary empty directory, so writes keep *succeeding* — onto the SD card,
-  under a path that says otherwise.
+  a note records where the earlier part of the session went.
+- **Pulling the disk is survivable.** A watcher notices within two seconds and
+  falls back to `storage.root`; a write that fails mid-capture recovers and
+  completes rather than losing the frame. Unplugging a USB stick leaves the
+  mount point behind as an ordinary empty directory, so writes otherwise keep
+  *succeeding* — onto the SD card, under a path that says otherwise.
 
-There is no eject button, deliberately: unmounting someone's filesystem is not
-this application's business. The sequence is **Release**, check that the panel
-says the output is internal again, then pull the disk.
+There is no eject button: unmounting a filesystem is not this application's
+business. Press **Release**, check the panel says the output is internal again,
+then pull the disk.
+
+`storage.root` is the fallback, so it must be somewhere always mounted.
+
+---
+
+## HTTP API
+
+| method | path | purpose |
+|---|---|---|
+| GET | `/` | the dashboard |
+| GET | `/api/status` | uptime, per-camera fps and errors, storage state |
+| GET | `/api/cameras` | camera list and hardware description |
+| GET | `/api/stage-types` | every registered stage type and its schema |
+| GET | `/stream/{cam}.mjpg` | MJPEG preview (one per camera; see the budget above) |
+| GET | `/snapshot/{cam}.jpg` | single preview frame |
+| GET | `/subaperture/{cam}/{view}.jpg` | one sub-aperture tile, single shot |
+| GET | `/api/subapertures/{cam}` | which lenslet indices the named views resolve to |
+| GET | `/api/pipeline/{cam}` | stages, schemas, current values, per-stage ms |
+| POST | `/api/pipeline/{cam}/{stage}` | `{"values": {...}}` — validated, 422 on bad input |
+| POST | `/api/pipeline/{cam}/_add` | insert a stage at runtime |
+| DELETE | `/api/pipeline/{cam}/{stage}` | remove a stage |
+| GET | `/api/controls/{cam}` | advertised sensor controls with the sensor's own limits |
+| POST | `/api/controls/{cam}` | `{"controls": {"ExposureTime": 8000, ...}}` |
+| POST | `/api/capture/{cam}/raw` | full-resolution capture, ISP bypassed |
+| POST | `/api/capture/{cam}/view` | the processed preview as displayed |
+| POST | `/api/capture-all/{raw\|view}` | trigger every camera |
+| GET, PUT | `/api/calibration/settings` | board, nominal optics, acceptance, detection |
+| GET | `/api/calibration/readiness` | preconditions, split blocking vs advisory |
+| POST | `/api/calibration/start` | begin live detection — records nothing |
+| POST | `/api/calibration/stop` | stop it |
+| GET | `/api/calibration/detection` | latest pass per camera, per-tile verdicts |
+| GET | `/calibration/detection/{cam}.jpg` | that pass, annotated |
+| GET | `/api/storage` | filesystems on offer, and where output is going |
+| POST | `/api/storage/target` | `{"path": "/media/stick"}` — move output there |
+| POST | `/api/storage/release` | back to `storage.root`, so a device can be unplugged |
+
+Sensor controls and pipeline parameters are separate endpoints on purpose. One
+changes what the sensor does, the other what happens to the numbers afterwards;
+conflating them makes it impossible to tell whether an observed change was
+optical or computational.
+
+`capture-all` is **not** synchronised capture — the requests go out
+sequentially and the sensors free-run, so frames land tens of milliseconds
+apart. Real simultaneity needs the IMX296 XVS pins wired together.
+
+---
+
+## Layout
+
+```
+src/trilobite/
+  types.py                 Frame, CameraInfo — metadata travels with the pixels
+  config.py                pydantic schema for the rig YAML
+  bus.py                   LatestFrame: one slot, newest wins
+  state.py                 runtime parameters saved on exit, restored on start
+  app.py                   CameraRuntime (thread per camera), Application
+  __main__.py              CLI entry point
+  cameras/
+    base.py                CameraSource ABC — the hardware seam
+    picam.py               picamera2 backend: main + lores + raw streams
+    offline.py             synthetic and replay backends, no hardware
+    registry.py            backend lookup, libcamera discovery
+  processing/
+    base.py                Stage ABC + StageParams — the parameter contract
+    registry.py            @register decorator, stage catalogue
+    pipeline.py            ordered runner, live reconfiguration, timing
+    stages/basic.py        passthrough, levels, crop, downsample, stats
+    stages/plenoptic.py    MLA grid overlay; lenslet_extract placeholder
+  optics/mla.py            lenslet geometry, shared by the overlay and the crops
+  calibration/
+    settings.py            board, nominal optics, acceptance, readiness checks
+    detect.py              live per-tile corner detection (requires cv2)
+  sinks/jpeg.py            JPEG encode: simplejpeg → cv2 → Pillow
+  storage/writer.py        session directories, .npy + sidecar, live retargeting
+  storage/devices.py       which filesystems can hold a session, right now
+  web/server.py            FastAPI: streams, parameters, controls, capture
+  web/static/index.html    the dashboard, generated from the stage schemas
+config/                    rig configurations, heavily commented
+docs/                      the calibration model and the acquisition workflow
+scripts/
+  probe_cameras.py         run this first on the Pi
+  install_pi.sh            apt, config.txt, venv — idempotent
+  diagnose_cameras.sh      when libcamera reports zero cameras
+  measure_derotation_cost.py   what tile de-rotation actually costs in precision
+systemd/trilobite.service  run as a service
+tests/                     all of it runs anywhere, no camera needed
+```
+
+Four seams, each where a change is expected:
+
+- **`CameraSource`** — the hardware boundary. A new sensor is a subclass.
+- **`Stage`** — a stage *declares* its parameters as a pydantic model, and
+  validation, the browser controls and the settings record saved with every
+  image all follow from that declaration. Adding a stage is one file; the UI
+  updates itself.
+- **`LatestFrame`** — the capture thread only reads, processes and publishes.
+  It never encodes, writes or waits on the network, so a slow browser cannot
+  perturb capture timing.
+- **`create_app`** — MJPEG is the starting transport because it needs no client
+  library. Replacing it with WebRTC touches this module and the page, nothing
+  else.
 
 ---
 
 ## Adding a processing stage
-
-The whole procedure:
 
 ```python
 # src/trilobite/processing/stages/my_stage.py
@@ -304,64 +398,99 @@ class DarkSubtract(Stage):
 ```
 
 Add `- {type: dark_subtract, name: dark}` to the camera's pipeline in the YAML.
-That is all. The slider appears in the browser with the right range and
+That is all: the control appears in the browser with the right range and
 tooltip, the value is validated on the way in, and it is recorded in the
 sidecar of every image captured afterwards.
 
+Field conventions the UI honours:
+
+- `json_schema_extra={"widget": "box"}` — a number box, no slider. Use it where
+  a slider is all travel and no precision.
+- `json_schema_extra={"widget": "hidden"}` — not shown. For parameters that are
+  units rather than knobs, such as the MLA reference resolution.
+- An unbounded field, or one whose range spans more than ~500×, gets a box
+  automatically. A bar with no upper bound is not a bar.
+
 If a stage builds anything frame-independent, cache it keyed on the parameters
-and the frame shape — see `MLAGridOverlay._grid_mask`. Rebuilding a coordinate
-grid every frame cost 22 ms; caching it cost 8 ms.
+and the frame shape — see `MLAGridOverlay._masks`. Rebuilding the grid
+coordinates every frame cost 22 ms; caching them cost 8 ms.
+
+---
+
+## Development
+
+```bash
+pytest                       # 83 tests, no hardware
+ruff check src/ tests/
+python -m trilobite --config config/desktop-plenoptic.yaml
+```
+
+The tests cover the MLA geometry (including the preview-to-sensor scaling that
+calibration depends on), the pipeline and parameter plumbing, corner detection
+end to end against the synthetic lenslet array, and storage device selection
+including a simulated hot-unplug.
+
+For UI changes, drive the page headlessly with Playwright against a running
+instance rather than eyeballing it — several of the bugs in this project's
+history (dead buttons from the connection budget, a slider that rejected valid
+values, a build race between the two modes) were visible only in a real
+browser.
+
+---
+
+## Documents
+
+| file | what it is |
+|---|---|
+| `docs/calibration-spec.md` | the imaging model, the unknowns, the measurements, the fit. Start here. |
+| `docs/calibration-ui-spec.md` | the acquisition workflow: detection, acceptance, what gets saved, what is built |
+| `docs/cleanup-log.md` | removals and their rollback, newest first |
+| `apt-packages.txt` | every Pi package, tiered and annotated |
 
 ---
 
 ## Things that will bite you
 
 **The Pi 5 has no hardware video encoder.** VideoCore VII dropped H.264 and
-JPEG encode. Every preview frame is compressed on the CPU. Hence: encode the
-small `lores` stream, and cap `preview_fps` well below the sensor rate. Two
-1456×1088 streams at 60 fps is 190 MB/s of raw pixels — Python is not going to
-process that, and the design assumes it will not try.
+JPEG encode, so every preview frame is compressed on the CPU. Encode the small
+`lores` stream and keep `preview_fps` well below the sensor rate. Two
+1456 × 1088 streams at 60 fps is 190 MB/s of raw pixels.
 
-**`capture-all` is not synchronised capture.** The requests go out
-sequentially and the sensors free-run, so the two frames land tens of
-milliseconds apart. Measured on the synthetic backend: ~70 ms. For stereo or
-plenoptic work needing real simultaneity, wire the IMX296 XVS sync pins
-together and drive an external trigger. Software cannot fix this.
+**The mono IMX296 advertises no white-balance control.** `AwbEnable` in a
+config is dropped with a warning rather than aborting startup, but it does not
+belong there.
 
-**Auto-exposure ruins calibration.** `AeEnable: false` and `AwbEnable: false`
-are set in `config/pi.yaml` on purpose. Frames taken under auto-exposure are
-not comparable to each other.
+**Auto-exposure ruins calibration.** `AeEnable: false` is set in
+`config/pi.yaml` on purpose: frames taken under auto-exposure are not
+comparable to each other. Turning AE off pins the exposure it had converged to,
+and the UI writes that number back into the box.
 
-**Put the data on an SSD.** Continuous capture to the SD card is slow and
-wears it out. Change `storage.root` to a mounted USB SSD or an NVMe HAT, or
-pick the device at runtime from the Storage panel (see **Output storage**).
-`storage.root` remains the fallback the rig returns to when a chosen device
-goes away, so it must be somewhere that is always mounted.
+**MLA parameters are in preview pixels.** Pitch 50 on a 728-wide preview is
+pitch 100 on the sensor. The conversion is handled in one place
+(`MLAGeometry.rescaled`) and the reference resolution is recorded with the
+parameters, but the number on screen is the preview one.
 
-**Release the cameras on exit.** libcamera does not always recover from a
-process killed while holding a sensor; the fix is a reboot. SIGINT and SIGTERM
-are handled, so use Ctrl-C rather than `kill -9`.
+**Put the data on an SSD.** See **Output storage**.
 
 ---
 
-## Next steps, roughly in order
+## Roadmap
 
-1. `probe_cameras.py --grab` on the Pi. Confirm indices, sensor modes, and
-   whether your IMX296 is the mono or colour variant. Fix `config/pi.yaml`.
-2. Get both previews live. Check `fps` and `errors` in `/api/status`.
-3. Exposure and gain sweeps via `/api/controls`, watching
-   `stat_saturated_fraction` from the `stats` stage.
-4. Mount the MLA. Use `mla_grid_overlay` to align it physically.
-5. Calibration. Switch to the Calibration dashboard, set the board, and press
-   **Start detection** — it finds corners per micro-image and records nothing,
-   which is the question to answer before building the recorder. Rehearse it
-   with `config/desktop-plenoptic.yaml`, which renders a synthetic lenslet
-   array with a whole checkerboard in every micro-image; the board must be set
-   to 4 × 3 inner corners, 7 mm, to match it.
-6. Pose recording (`calibration/session.py`) — see
-   `docs/calibration-ui-spec.md` §7 and §9.
-7. Video recording — a `Recorder` consuming a `FrameQueue`, writing raw frames.
-   Do not reach for H.264 on the Pi 5; store lossless and compress off-device.
-8. Hardware sync between the two sensors.
-9. `lenslet_extract`. Read its docstring first — there is a design decision
-   about the `Frame` type that needs making before writing any of it.
+1. Confirm both cameras enumerate on the Pi (`probe_cameras.py --grab`; if
+   libcamera reports zero, `diagnose_cameras.sh`).
+2. Both previews live; check `fps` and `errors` in `/api/status`.
+3. Exposure and gain sweeps, watching `stat_saturated_fraction` from the
+   `stats` stage.
+4. Mount the MLA and align it with `mla_grid_overlay`.
+5. Decide the calibration target (`docs/calibration-ui-spec.md` §10.1) and the
+   lenslet aperture shape.
+6. Run live detection against the real rig and set `min corners` and
+   `target per tile` from what the detector actually returns.
+7. Pose recording — `calibration/session.py`, per `docs/calibration-ui-spec.md`
+   §7 and §8.
+8. The fit. Offline, off-device.
+9. Video recording. Store lossless and compress off-device; do not reach for
+   H.264 on a Pi 5.
+10. Hardware sync between the two sensors (XVS).
+11. `lenslet_extract`. Read its docstring first — there is a decision about the
+    `Frame` type to make before writing any of it.
