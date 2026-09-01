@@ -40,6 +40,7 @@ class Picamera2Source(CameraSource):
         self._mono = False
         self._full_res: tuple[int, int] = (0, 0)
         self._dropped_controls: list[str] = []
+        self._last_meta: dict[str, Any] = {}
 
     @staticmethod
     def _split_controls(picam: Any, controls: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -175,6 +176,9 @@ class Picamera2Source(CameraSource):
         # perfectly good preview. Slicing beats a colour conversion.
         h = int(self.cfg.preview_resolution[1])
         luma = np.ascontiguousarray(yuv[:h, : self.cfg.preview_resolution[0]])
+        # Kept so that turning auto-exposure off can pin the values AE just
+        # chose -- see set_controls.
+        self._last_meta = meta
         return Frame.now(luma, self.cam_id, self._next_seq(), space="mono8", **meta)
 
     def capture_full(self, raw: bool = True) -> Frame:
@@ -232,6 +236,9 @@ class Picamera2Source(CameraSource):
     def set_controls(self, controls: dict[str, Any]) -> None:
         if not self._open:
             raise RuntimeError(f"{self.cam_id}: camera not open")
+
+        controls = self._resolve_ae(dict(controls))
+
         with self._lock:
             # Unlike startup, a runtime request naming an unsupported control
             # is a mistake worth reporting: the caller asked for something
@@ -245,6 +252,50 @@ class Picamera2Source(CameraSource):
                     f"{', '.join(sorted(self._picam.camera_controls))}"
                 )
             self._picam.set_controls(supported)
+        self._requested.update(controls)
+
+    def _resolve_ae(self, controls: dict[str, Any]) -> dict[str, Any]:
+        """Make auto-exposure transitions actually take effect.
+
+        Two libcamera behaviours make a bare AeEnable toggle unreliable, and
+        both show up as "auto-exposure will not turn off":
+
+        1. Switching AE off does not by itself pin the exposure. The AE
+           algorithm stops updating, but ExposureTime and AnalogueGain are left
+           at whatever they were, and some pipelines then drift or revert to a
+           default. The fix is to send the *current* values -- the ones AE just
+           converged on -- in the same call. That is also the behaviour you
+           want: "stop here", not "stop and jump somewhere else".
+
+        2. Setting ExposureTime while AE is on is contradictory; AE overwrites
+           it on the next frame, so the control appears dead. Asking for a
+           manual exposure therefore implies AE off, and we make that explicit
+           rather than letting the request silently evaporate.
+        """
+        ae = controls.get("AeEnable")
+
+        if ae is False:
+            meta = self._last_meta
+            if "ExposureTime" not in controls and "ExposureTime" in meta:
+                controls["ExposureTime"] = int(meta["ExposureTime"])
+            if "AnalogueGain" not in controls and "AnalogueGain" in meta:
+                controls["AnalogueGain"] = float(meta["AnalogueGain"])
+            log.info(
+                "%s: auto-exposure off, pinning ExposureTime=%s AnalogueGain=%s",
+                self.cam_id,
+                controls.get("ExposureTime"),
+                controls.get("AnalogueGain"),
+            )
+        elif ae is None and self.auto_exposure and (
+            "ExposureTime" in controls or "AnalogueGain" in controls
+        ):
+            controls["AeEnable"] = False
+            log.info("%s: manual exposure requested, turning auto-exposure off", self.cam_id)
+        elif ae is True:
+            # Do not send a manual exposure alongside a request to automate it.
+            for key in ("ExposureTime", "AnalogueGain"):
+                controls.pop(key, None)
+        return controls
 
     def _raw_format_name(self) -> str:
         try:

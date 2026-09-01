@@ -12,6 +12,7 @@ import uvicorn
 
 from .app import Application
 from .config import load_config
+from .state import default_state_path
 from .web.server import create_app
 
 
@@ -23,6 +24,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--host", default=None, help="override server host")
     ap.add_argument("--port", type=int, default=None, help="override server port")
     ap.add_argument("--log-level", default=None)
+    ap.add_argument(
+        "--state", default=None,
+        help="where to save/restore runtime parameters "
+             "(default: alongside the config, <name>.state.json)",
+    )
+    ap.add_argument(
+        "--no-restore", action="store_true",
+        help="start from the config as written, ignoring any saved state "
+             "(the state file is still written on exit)",
+    )
     args = ap.parse_args(argv)
 
     cfg_path = Path(args.config)
@@ -37,7 +48,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     log = logging.getLogger("trilobite")
 
-    application = Application(cfg)
+    state_path = Path(args.state) if args.state else default_state_path(cfg_path)
+    application = Application(cfg, state_path=state_path, restore=not args.no_restore)
     try:
         application.start()
     except Exception as exc:

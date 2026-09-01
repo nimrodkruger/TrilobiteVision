@@ -1,394 +1,307 @@
 # Sub-aperture calibration strategy
 
-**Configuration this is written for**, as specified:
+**Rig:** focused plenoptic (2.0), MLA behind a main objective, ~100 px pitch on
+a 1456 × 1088 IMX296 → ~14 × 10 ≈ 140 micro-images, minimal overlap, mono, two
+cameras. **Goal:** pixel-to-pixel registration across views, valid at *any*
+object distance. Geometry only.
 
-- Focused plenoptic (Plenoptic 2.0): microlens array behind a main objective,
-  each lenslet re-imaging the intermediate image formed by that objective.
-- Lenslet pitch ≈ 100 px on a 1456 × 1088 IMX296 → roughly 14 × 10 ≈ 140
-  lenslets, 100 × 100 px microlens images.
-- Minimal overlap between adjacent microlens images.
-- Geometry only; no radiometric calibration required.
-- **The deliverable is pixel-to-pixel registration across views**, not a
-  photometric or absolute-scale calibration.
-
-That last point is what makes this tractable, and it changes the whole
-formulation. Read §1 before anything else.
+Equations are plain text so they render without a LaTeX extension.
 
 ---
 
-## 1. What "registration" actually requires
+## 0. Correction to the previous draft
 
-Registration is a statement about *relative* geometry. If every sub-aperture's
-pixels can be mapped into one common coordinate system such that the same
-physical point lands at the same coordinate regardless of which lenslet saw
-it, the rig is registered — and it does not matter whether that common system
-is metric, or which absolute focal length produced it.
+The earlier version said λ = a/b depends on object depth. **That was wrong.**
 
-This kills most of the parameters before we start:
+`a` is the object-side conjugate of the *microlens*, fixed by `1/a + 1/b =
+1/f_μ` with `b` the mechanical MLA-to-sensor spacing. Both are properties of
+the camera, not of the scene. **λ is a camera constant.**
 
-- **Absolute scale is a free gauge.** No need to determine millimetres per
-  pixel, so no need for a metrically known target, and one strong correlation
-  (focal length against target distance) disappears with it.
-- **A global rotation between sensor and optics is also a free gauge.** Define
-  the common frame *as the sensor frame* and it vanishes identically. There is
-  no rotation term anywhere in the model below, which is worth noticing because
-  the grid overlay has a rotation slider — that slider describes where the
-  lenslets *are*, not a transformation the registration has to undo.
-- **Per-lenslet distortion is not free to be arbitrary.** Every lenslet views
-  the same intermediate image through the same main objective. The objective's
-  distortion is applied once, upstream, and is common to all views.
+What depends on object depth is where the main objective forms its intermediate
+image relative to the microlenses' object plane Π. That offset is what changes
+the *disparity* of a scene point between neighbouring micro-images — Raytrix
+call it virtual depth `v`. Depth is a measurement the camera makes, not a
+parameter of the calibration.
 
-Your instinct in the brief is correct, and §2 derives exactly why.
+The consequence matters: the pixel→ray map below is depth-independent as it
+stands, and there is no per-depth recalibration to do.
 
 ---
 
-## 2. The map, derived
+## 1. Does λ give you angular receptive fields? Partly.
 
-### 2.1 Notation
+Your question is the right one. Taken alone, λ is not enough — but not for the
+reason of depth.
 
-- $\mathbf{m}$ — transverse position in the **intermediate image plane**, the
-  aerial image formed by the main objective. This is the common frame; call
-  its coordinates the *canonical* coordinates. Registration means every pixel
-  gets a canonical coordinate.
-- $\mathbf{p}$ — a sensor pixel coordinate.
-- $\mathbf{c}_{ij}$ — the centre of lenslet $(i,j)$, in sensor pixels. From the
-  lattice: $\mathbf{c}_{ij} = \mathbf{c}_0 + \mathbf{U}\,(i, j)^\top$ with
-  $\mathbf{U} \in \mathbb{R}^{2\times 2}$ carrying both pitches, the rotation
-  and any skew — the four numbers the grid overlay approximates with pitch and
-  rotation.
-- $a$ — distance from the intermediate image plane to the MLA.
-- $b$ — distance from the MLA to the sensor.
-- $f_\mu$ — lenslet focal length, with $\tfrac{1}{a} + \tfrac{1}{b} = \tfrac{1}{f_\mu}$.
+A pixel `p` under lenslet (i, j) determines **two points**:
 
-### 2.2 One lenslet
+```
+    on the MLA plane          :  c[i,j]          (the lenslet centre)
+    on the microlens object   :  m  =  c[i,j] − λ · ( p − c[i,j] )
+    plane Π, at distance a
+```
 
-Lenslet $(i,j)$ is a thin lens on axis at $\mathbf{c}_{ij}$. A point at
-canonical position $\mathbf{m}$ has object height $\mathbf{m} - \mathbf{c}_{ij}$
-measured from that lenslet's own axis. The thin lens images it with
-magnification $-b/a$, so its image height is $-\tfrac{b}{a}(\mathbf{m} - \mathbf{c}_{ij})$
-and its absolute sensor position is
+Two points define a **ray**, not a point. So `{lattice, λ}` already gives every
+pixel a ray in the space between the main objective and the MLA — position and
+direction, no depth assumption anywhere. That is the angular receptive field,
+expressed inside the camera.
 
-$$\mathbf{p} \;=\; \mathbf{c}_{ij} \;-\; \frac{b}{a}\left(\mathbf{m} - \mathbf{c}_{ij}\right)$$
+The reason λ is not sufficient is the *other* end: to express that ray **in the
+real world** you must refract it through the main objective. That needs the
+objective's effective focal length, principal-plane (or exit-pupil) position,
+and distortion. Those are 4–8 more parameters, all global.
 
-Invert it. Writing $\boxed{\lambda \equiv a/b}$ for the inverse magnification of
-the microlens relay:
+```
+    pixel ──► (m, c[i,j]) ──► ray in MLA space ──► main objective ──► ray in object space
+              λ + lattice                          F, pupil, distortion
+```
 
-$$\boxed{\;\mathbf{m} \;=\; \mathbf{c}_{ij} \;-\; \lambda\,\bigl(\mathbf{p} - \mathbf{c}_{ij}\bigr)\;}$$
+Everything in this chain is depth-independent. Calibrate once, use at any
+distance.
 
-**This is the entire registration map.** Read it physically: take a pixel,
-measure its offset from its own lenslet's centre, scale that offset by
-$-\lambda$, and add it back to the lenslet centre. Three ingredients: the
-lattice $\{\mathbf{c}_{ij}\}$, one scalar $\lambda$, and nothing else.
+### Should a(i,j) be a polynomial?
 
-Note what is *absent*: no per-lenslet focal length, no per-lenslet rotation, no
-per-lenslet distortion. All of that is either common or absorbed. The minus
-sign is the microlens image inversion, and it is why adjacent tiles appear to
-move opposite to the scene.
+Yes, but low order — and for a different reason than depth.
 
-### 2.3 The main objective's distortion
+`a` is fixed *per lenslet*, but not necessarily *equal across lenslets*:
 
-$\mathbf{m}$ is a coordinate in the aerial image, which is itself a distorted
-picture of the world. If registration between views is the requirement, **you
-do not need to remove that distortion at all** — every view inherits the same
-$\mathbf{m}$, so two views of one point agree in $\mathbf{m}$ whether or not
-$\mathbf{m}$ is a distorted rendering of the object.
+- **MLA tilt.** If the array is not exactly parallel to the sensor, `b` varies
+  linearly across it, so λ does too. Two parameters, not 140.
+- **Multi-focus arrays.** Raytrix deliberately interleave 3 lenslet types with
+  different `f_μ`. Labussière et al. fit one focal length *per type*, not per
+  lenslet. If your array is single-focus, this term is absent.
+- **Field curvature** of the main objective — enters as a slowly varying term
+  in where Π effectively sits.
 
-Correct it only if you additionally want the assembled image to be rectilinear.
-Then it is a standard Brown radial model applied *once*, in canonical
-coordinates, about the optical axis $\mathbf{m}_0$:
+So the honest model is
 
-$$\mathbf{m}^{\text{rect}} = \mathbf{m}_0 + \left(1 + k_1 r^2 + k_2 r^4\right)\left(\mathbf{m} - \mathbf{m}_0\right),
-\qquad r = \lVert \mathbf{m} - \mathbf{m}_0 \rVert$$
+```
+    λ[i,j]  =  λ0  +  α·i  +  β·j        (+ per-type offsets if multi-focus)
+```
 
-Four parameters ($k_1, k_2, \mathbf{m}_0$), shared by every lenslet, estimated
-after registration and separable from it. Keeping the two stages separate is
-deliberate: a registration failure and a distortion failure then look
-different, instead of both showing up as a vague increase in residual.
-
-### 2.4 Manufacturing error
-
-Real lenslets are not exactly on the ideal lattice and their axes are not
-exactly at their geometric centres. Both defects have the same first-order
-effect — the tile's effective centre is displaced — so both are absorbed by a
-single per-lenslet 2-vector:
-
-$$\mathbf{c}_{ij} = \mathbf{c}_0 + \mathbf{U}(i,j)^\top + \Delta\mathbf{c}_{ij}$$
-
-This is what you meant by each lenslet carrying only a flat correction. Worth
-being explicit that it is *geometric* — a centre offset — and unrelated to
-radiometric flat-fielding, which you have ruled out. It is 2 parameters per
-lenslet, and §4 says how to get most of them for free.
+Three parameters, physically motivated. Fit 140 free λ values only as a
+*diagnostic* (§5); if the spread is structured you have a tilt, and the linear
+model absorbs it. If the spread is noise, drop back to a single λ.
 
 ---
 
-## 3. The one complication: λ depends on depth
+## 2. What the literature does
 
-$\lambda = a/b$. The sensor–MLA distance $b$ is fixed by the mechanics, but $a$
-is the distance from the MLA to *the intermediate image*, and the main
-objective puts the intermediate image at a different place for every object
-depth. So:
+Light-field calibration is a small field and the focused-plenoptic corner of it
+is smaller. The relevant threads:
 
-$$\text{object depth changes} \;\Rightarrow\; a \text{ changes} \;\Rightarrow\; \lambda \text{ changes}$$
+**Ray-space intrinsics.** [Dansereau, Pizarro & Williams (CVPR 2013)][dpw] is
+the standard for lenslet cameras: a 5×5 homogeneous matrix `H` with 12 non-zero
+terms (10 free) mapping pixel index `[i,j,k,l,1]` directly to a ray
+`[s,t,u,v,1]`, plus a 5-parameter distortion applied in *ray direction* space.
+Explicitly depth-independent, for exactly the reason in §1. RMS ray-reprojection
+errors of 0.063–0.363 mm. This is the formulation your requirement points at —
+and Donald Dansereau is at USYD, which makes this the cheapest expertise you
+can access.
 
-Two consequences, and the first is not optional:
+**Focused-plenoptic specifically.** [Johannsen et al. (2013)][joh] fit 15
+intrinsics globally (f, focus distance h, MLA-sensor distance b, lateral and
+*depth* distortion) plus 6 per target pose, with `b_L = h + v·b` linking virtual
+depth to metric depth, and a depth-distortion term for Petzval curvature. They
+report 0.36 mm relative accuracy but note absolute distance can be off by up to
+20 cm — the thin-lens model's limit.
 
-**A registration calibrated at one object depth is not valid at another.** With
-a single $\lambda$, a point at the wrong depth reprojects to a different
-canonical coordinate through each lenslet, and the disagreement grows linearly
-with distance from the lenslet: for two lenslets separated by
-$\Delta \mathbf{c}$, the canonical disagreement is
+[Strobl & Lingenauber (CVIU 2016)][sl] make the case for a **stepwise** fit:
+lateral parameters (f, k1, k2, distortion centre, poses) from total-focus
+brightness images first, then the inner lengths b and h from virtual-depth
+images. Their argument is the one that matters for you: fitting everything at
+once lets noisy depth data corrupt the well-conditioned lateral parameters.
+Notably, they take the MLA grid as **estimated separately and held fixed**.
 
-$$\delta \mathbf{m} \;=\; \left(\lambda_{\text{true}} - \lambda_{\text{used}}\right)\bigl(\mathbf{p}_2 - \mathbf{p}_1\bigr) \;\approx\; \frac{\Delta\lambda}{\lambda}\,\Delta\mathbf{c}$$
+[Labussière et al. (CVPR 2020)][lab] is the closest to a modern recipe for
+multi-focus: (16 + I) intrinsics — main lens F and 5 distortion terms,
+principal point, sensor distance, 6-DOF MLA misalignment, and one focal length
+per lenslet *type*. Their contribution is the Blur-Aware Plenoptic feature
+(centre + blur radius ρ): defocus blur is what makes per-type microlens focal
+lengths observable at all, "impossible to retrieve" from a pinhole model.
 
-At 100 px pitch and a 1% error in $\lambda$, adjacent-lenslet registration is
-off by 1 px and corner-to-corner by ~14 px. **$\lambda$ must be known to
-roughly $10^{-3}$ for sub-pixel registration across the array.** This is the
-tightest numerical requirement in the whole procedure and it is worth stating
-before designing anything around it.
+**Against sub-aperture calibration.** [Bok, Jeon & Kweon (TPAMI 2017)][bok]
+argue it directly: sub-aperture images "must be generated *after* geometric
+calibration of raw images", which is circular; and micro-lens images are "too
+small (10 × 10 pixels for Lytro)" for reliable corner detection. They use
+**line** features on the raw image instead, since black/white borders survive in
+a tiny micro-image where corners do not.
 
-**That same sensitivity is the depth signal.** This is a plenoptic camera; the
-depth-dependence of $\lambda$ is the feature, not a defect. Which gives two
-operating modes, and you should choose deliberately:
+**That objection is much weaker for you.** At 100 px micro-images you have 100×
+the area Lytro has. Corner detection in a 100 px tile is ordinary. Their
+circularity objection still applies to *decoded* sub-aperture images, but not to
+what you are doing — cropping raw micro-images at a known lattice is not
+decoding.
 
-| mode | what you do | when |
-|---|---|---|
-| **Fixed depth** | calibrate $\lambda$ once at the working depth; registration is then a fixed linear map | the experiment operates in a thin depth range |
-| **λ per frame** | fit $\lambda$ per capture from the data itself; registration and depth estimation become the same computation | depth varies, or depth is a measurand |
-
-For the fixed-depth mode, quantify the tolerance: differentiating the thin-lens
-relation, a fractional change in $\lambda$ of $10^{-3}$ corresponds to a
-fractional change in $a$ of about the same, which for a typical macro
-conjugate is a working-distance window of well under a millimetre. **Check this
-against your intended depth range before committing to a single $\lambda$.** If
-the range is wider, you are in the second mode whether you wanted to be or not.
+**Pattern-free / neighbour disparity.** [Pattern-free Plenoptic 2.0
+Calibration (MMSP 2022)][pf] recovers MLA-sensor and main-lens-MLA distances
+from disparity between neighbouring micro-images with no target at all,
+σ ≈ 0.03–0.1 mm. Good as an independent cross-check on λ, not as the primary
+method.
 
 ---
 
-## 4. Parameter budget and the estimation ladder
+## 3. White image, or relative geometry from neighbours?
 
-| level | adds | count at $N = 140$ | what it buys |
+You suspected the white image is less accurate. **Correct, and the literature
+uses it accordingly — as pre-calibration, not as the answer.**
+
+- Dansereau uses white images to find lenslet centres and correct vignetting,
+  taking "the brightest spot in each white lenselet image" as the centre.
+- Labussière compute micro-image centres by intensity centroid, then *optimise*
+  the grid parameters afterwards.
+- Strobl estimates the grid separately and holds it fixed — the opposite
+  choice, and the one that gives up accuracy for separability.
+
+The centroid of a defocused disc is limited by the disc edge profile and by
+vignetting asymmetry; target corners use the full image content and are
+intrinsically better conditioned. So:
+
+**Use the white image for what it is uniquely good at** — deciding which pixels
+belong to which lenslet, measuring the true usable disc radius (hence your real
+overlap), and giving a lattice initialisation good to ~0.1 px with no target.
+
+**Then let the target data refine the centres inside the global fit.** Your
+neighbour-relative idea is exactly right and is what the pattern-free work
+exploits: a corner seen in two adjacent micro-images constrains the *difference*
+of their centres far better than either centroid constrains its own, because
+the shared scene content cancels. Include those constraints; do not replace the
+white image with them, because they cannot tell you which pixels belong to
+which lenslet in the first place.
+
+---
+
+## 4. The recipe, in one acquisition
+
+**Detection with OpenCV, fitting without it.** `findChessboardCornersSB` +
+`cornerSubPix` on each cropped 100 px micro-image is the right tool and will
+give ~0.05 px corners. **Do not run `calibrateCamera` per tile.** A 100 px tile
+subtends a tiny field angle; focal length, principal point and distortion are
+near-degenerate from it, and 140 independent ill-conditioned fits will not
+average into a good global answer — they will average into a confident wrong
+one. OpenCV supplies correspondences; the model in §1 supplies the constraints.
+
+**One capture session:**
+
+| # | what | count | for |
 |---|---|---|---|
-| L0 | $\mathbf{c}_0, \mathbf{U}, \lambda$ | 7 | ideal array, one magnification |
-| L1 | $\Delta\mathbf{c}_{ij}$ | +280 | per-lenslet decentring |
-| L2 | $\lambda_p$ per pose/depth | +$P$ | depth variation |
-| L3 | $k_1, k_2, \mathbf{m}_0$ | +4 | rectilinear output (optional, §2.3) |
-| L4 | per-lenslet scale $\lambda_{ij}$ | +140 | **expect not needed — test it** |
+| 1 | dark frames, capped | 50 | offset and fixed-pattern noise |
+| 2 | flat field | 50 | lattice, vignetting, disc radius, overlap |
+| 3 | checkerboard poses | 15–20 × 10 frames | everything else |
+| 4 | flat field again | 50 | **invariance check** |
 
-Fit them in that order and **stop when held-out residual stops improving**.
-That stopping rule is the whole of what makes this "simplified": not choosing a
-small model up front and hoping, but adding structure only when the data pays
-for it. L4 in particular should be tried once and, if it does not help,
-recorded as tested and discarded — a per-lenslet scale that improves training
-residual but not held-out residual is the array absorbing noise.
+Board: squares at 20–25 px on the sensor → 4×4 to 5×5 corners per tile, i.e.
+~40 observations per lenslet per pose. Poses must cover every lenslet including
+the corners across the set; tilt matters less than in classical calibration
+(no focal length to disentangle from distance), so stay near fronto-parallel
+where corners localise best. Include ≥3 distinct depths — not to recalibrate λ,
+but to *verify* depth-independence and to constrain the main objective.
 
-Compare with a per-sub-aperture pinhole model: 15 parameters × 140 = 2100, most
-of them unobservable from 100 px tiles. L0+L1+L2 is ~300 and every one of them
-is identifiable.
+Step 4 is the cheapest insurance in the procedure: refit the lattice from the
+closing flat field and compare to the opening one. Movement beyond a fraction
+of a pixel means the rig shifted mid-session and the poses are mutually
+inconsistent. Discard and repeat.
 
-### Gauge fixing
+Lock and tape focus and aperture; any change to the objective moves Π and
+invalidates λ. `AeEnable: false` (the default in `config/pi.yaml`). Warm up 20
+minutes — thermal drift of the MLA-sensor spacing moves `b`, and λ is the
+ratio. Both cameras must see the same board placement, with the inter-camera
+transform estimated inside the same bundle rather than composed from two
+independent solutions.
 
-$\Delta\mathbf{c}_{ij}$ is exactly degenerate with $(\mathbf{c}_0, \mathbf{U})$
-unless constrained. Impose
+**Then one joint fit:**
 
-$$\sum_{ij}\Delta\mathbf{c}_{ij}=\mathbf{0}, \qquad
-\sum_{ij} i\,\Delta\mathbf{c}_{ij}=\sum_{ij} j\,\Delta\mathbf{c}_{ij}=\mathbf{0}$$
+```
+    minimise over  { λ0, α, β,  c0, U,  Δc[i,j],  F, pupil, k1, k2,  poses }
 
-— a constant offset is absorbable into $\mathbf{c}_0$, a linear trend into
-$\mathbf{U}$. Without these the fit is not wrong, it is *non-unique*: two runs
-on the same data give different answers and neither is identifiable as the
-right one. Enforce them by projecting $\Delta\mathbf{c}$ onto the orthogonal
-complement of $\{1, i, j\}$ after each iteration.
+        Σ  ρ( ‖ predicted corner − detected corner ‖² )   +   μ·‖Δc‖²
+```
 
----
+with a robust loss ρ (Huber — a few misdetections are certain, and squared loss
+gives a 10 px outlier 100× the weight of a good 1 px point) and a ridge term on
+the per-lenslet centre offsets. Parameter count ≈ 3 + 6 + 280 + 8 + 6P ≈ 400.
+Sparse Levenberg–Marquardt; `scipy.optimize.least_squares(jac_sparsity=…)` is
+adequate at this scale.
 
-## 5. Getting the lattice for free: the white image
+**Gauge fixing** — `Δc[i,j]` is exactly degenerate with `(c0, U)` unless
+constrained:
 
-Before any checkerboard, capture a **uniformly illuminated flat field** — a
-diffuser sheet backlit, or an integrating sphere. Each lenslet projects a
-bright disc; its intensity-weighted centroid is that lenslet's centre:
+```
+    Σ Δc[i,j] = 0            Σ i·Δc[i,j] = 0            Σ j·Δc[i,j] = 0
+```
 
-$$\hat{\mathbf{c}}_{ij}=\frac{\sum_{\mathbf{q}\in W_{ij}} I(\mathbf{q})\,\mathbf{q}}{\sum_{\mathbf{q}\in W_{ij}} I(\mathbf{q})}$$
+A constant offset is absorbable into `c0`, a linear trend into `U`. Without
+these the fit is not wrong, it is non-unique: two runs on the same data
+disagree and neither is identifiably right.
 
-over a window $W_{ij}$ about the nominal centre. At 100 px tiles with decent
-SNR this is good to a few hundredths of a pixel. Then fit $(\mathbf{c}_0, \mathbf{U})$
-by ordinary linear least squares over all lenslets, and take the residuals as
-your initial $\Delta\mathbf{c}_{ij}$.
-
-Three returns on one capture:
-
-1. It fixes 4 of the 7 L0 parameters and initialises all 280 of L1, without a
-   target and without an optimiser.
-2. The residual spread is a direct measurement of how good the lattice
-   assumption is. Sub-pixel: the model in §2 is sound. Several pixels with
-   spatial structure: the array is not what you think, and no amount of bundle
-   adjustment will fix that.
-3. It measures the lenslet disc radius, which tells you the true usable crop
-   and hence the actual overlap — worth knowing precisely rather than by
-   design intent.
-
-**This is also the precise version of what the UI sliders do by eye.** The grid
-overlay gets you to maybe half a pixel; the centroid fit gets you two orders of
-magnitude better and reports its own uncertainty.
+**Follow Strobl's stepwise warning within the single session:** fit the lateral
+parameters first from in-focus data, then release the depth-coupled ones. One
+acquisition, staged optimisation.
 
 ---
 
-## 6. Estimating λ
+## 5. Verification
 
-Three routes, cheapest first. All three should agree; if they do not, that
-disagreement is the most informative measurement in the procedure.
-
-**6.1 From overlap, no target.** Any scene point in the overlap between
-adjacent microlens images gives, from §2.2,
-
-$$\mathbf{p}_2 - \mathbf{p}_1 = \left(1 + \tfrac{1}{\lambda}\right)\left(\mathbf{c}_{2} - \mathbf{c}_{1}\right)$$
-
-so a normalised cross-correlation between neighbouring tiles yields $\lambda$
-directly from the shift. Cheap, needs only a textured scene, and it works
-frame by frame — which makes it the natural implementation of the per-frame
-$\lambda$ mode in §3.
-
-Its weakness is your stated configuration: **minimal overlap leaves little to
-correlate**. Which leads to:
-
-**6.2 Deliberately over-overlap during calibration.** Nothing forces you to
-calibrate at the operating configuration. Move the target (or refocus the main
-objective) so the microlens images overlap substantially, estimate the
-parameters that do not depend on that choice — $\mathbf{c}_0$, $\mathbf{U}$,
-$\Delta\mathbf{c}$, and the distortion — then return to minimal overlap and
-re-estimate only $\lambda$. The model is parametric, so this is legitimate, and
-it converts your hardest measurement condition into an easy one. Probably the
-single most useful procedural trick here.
-
-**6.3 From the checkerboard.** With a board spanning many lenslets, each
-detected corner carries a known target-frame position. Fit $\lambda$ and the
-pose jointly so that corners seen through different lenslets map to consistent
-canonical coordinates. This is the definitive estimate and the one to report.
+1. **Cross-view consistency, on held-out poses.** For each corner seen by two
+   or more lenslets, map to object-space rays and take the spread of their
+   closest approach. This is the deliverable, so it is the metric. Target
+   < 0.2 px equivalent; Dansereau's 0.063 mm ray reprojection is the published
+   comparison.
+2. **Depth-independence.** Register a target at a depth *not* in the fit. Error
+   must not grow with distance from the calibration depth. If it does, the ray
+   model is not actually depth-independent and something is being absorbed
+   wrongly — most likely the objective's pupil position.
+3. **Residual map over (i, j).** Should look like noise. A radial pattern
+   points at uncorrected objective distortion, a linear ramp at a gauge
+   constraint fighting the data.
+4. **Free λ[i,j] once**, as a diagnostic (§1). Structured spread = MLA tilt,
+   absorbed by the 3-parameter model. Noise = single λ is sufficient, and you
+   can say so with evidence.
 
 ---
 
-## 7. Checkerboard acquisition
+## 6. Order of work
 
-At 100 px tiles a conventional board is entirely workable — this is the regime
-where it is the right tool, so your instinct there is right too.
+1. Flat field → lattice, disc radius, **actual overlap**. Everything downstream
+   is conditional on the periodicity residual being small.
+2. Set the UI grid parameters from the fit rather than by eye — same numbers.
+3. Corner detection per micro-image, validated against the `synthetic` backend
+   with a planted lattice, planted λ and planted Δc. Recovering known ground
+   truth is the only way to tell an estimator bug from a rig problem.
+4. Global bundle, lateral parameters first.
+5. Verification §5.1 and §5.2.
+6. Stereo pair.
 
-**Board design.** Squares at 20–25 px on the sensor give 4 × 4 to 5 × 5 corners
-per tile, i.e. 32–50 observations per lenslet per pose. Against 2 unknowns per
-lenslet that is generous, and the surplus is what makes the residual
-diagnostics in §8 meaningful. Do not go finer: corner localisation degrades
-below ~10 px squares, and blur from the microlens relay will already be
-softening things.
+## Open
 
-**Poses.** Fewer than the classical recipe, because most parameters are shared:
-
-| | count | why |
-|---|---|---|
-| poses at the working depth | 10–15 | $\Delta\mathbf{c}$ for every lenslet, at the depth that matters |
-| poses at other depths | 3 each, ≥ 3 depths | $\lambda(z)$, and it separates $\lambda$ from the lattice |
-| high-overlap poses (§6.2) | 5 | the easy-condition estimates |
-
-Coverage matters more than count: across the set, the board must reach every
-lenslet including the corner ones, because a lenslet that never sees a corner
-has its $\Delta\mathbf{c}$ determined entirely by the gauge constraint. Tilt
-matters much less here than in classical calibration — there is no focal length
-to disentangle from distance — so keep the board close to fronto-parallel,
-where corner detection is most accurate.
-
-**Bench discipline.**
-
-- Lock and tape focus and aperture. Any change to the main objective moves the
-  intermediate image, changes $a$, and invalidates $\lambda$.
-- Fixed exposure and gain; `AeEnable: false`, already the default in
-  `config/pi.yaml`. Auto-exposure between poses corrupts the centroids.
-- 20 minutes of warm-up before the first capture. Thermal drift of the
-  MLA-to-sensor spacing moves $b$, and $\lambda$ is the ratio.
-- Average ~10 frames per pose. Cheap, and it improves corner localisation by
-  roughly $\sqrt{10}$.
-- **Repeat the white image at the end of the session.** Refit the lattice and
-  compare. If the centres have moved more than a fraction of a pixel, something
-  shifted and the session is internally inconsistent — discard it. A
-  five-second check against a week of confusing residuals.
-
-**Both cameras.** Capture with left and right seeing the same board placement,
-and estimate the inter-camera transform inside the same fit rather than
-composing two independent calibrations — composing accumulates each camera's
-error into the baseline, which is the quantity the stereo pair exists to
-measure. Note the existing caveat: `capture-all` is sequential and the sensors
-free-run, so the two frames are tens of milliseconds apart. Harmless for a
-static board; wire the IMX296 XVS pins together before extending this to
-anything moving.
+- **Single-focus or multi-focus MLA?** Decides whether per-type focal lengths
+  (Labussière) are needed.
+- **Is defocus blur usable?** If micro-images are ever defocused, the BAP
+  feature makes `f_μ` observable. With minimal overlap and in-focus operation it
+  may not be, in which case `f_μ` comes from the datasheet.
+- **Rotation source** — MLA-to-sensor or sensor-to-optics? Does not affect the
+  ray map, but decides `derotate_views` for display. See the note in
+  `processing/stages/plenoptic.py`.
 
 ---
 
-## 8. Verifying registration, in the units that matter
+## References
 
-Reprojection error against the fitted data is not evidence. Since registration
-is the deliverable, measure registration directly.
+[dpw]: https://openaccess.thecvf.com/content_cvpr_2013/papers/Dansereau_Decoding_Calibration_and_2013_CVPR_paper.pdf
+[joh]: https://www.cg.informatik.uni-siegen.de/sites/www.grk1564.uni-siegen.de/files/inm2013/plenoptic.pdf
+[sl]: https://elib.dlr.de/103337/2/strobl16cviu.pdf
+[lab]: https://openaccess.thecvf.com/content_CVPR_2020/papers/Labussiere_Blur_Aware_Calibration_of_Multi-Focus_Plenoptic_Camera_CVPR_2020_paper.pdf
+[bok]: https://link.springer.com/content/pdf/10.1007/978-3-319-10599-4_4.pdf
+[pf]: https://dipot.ulb.ac.be/dspace/bitstream/2013/352469/3/MMSP2022_pattern_free_calibration_postprint.pdf
 
-**8.1 Cross-view consistency — the primary metric.** For every target point
-visible through two or more lenslets, map each observation into canonical
-coordinates with §2.2 and take the spread:
-
-$$e_n = \max_{(i,j),(k,l)} \left\lVert \mathbf{m}^{(ij)}_n - \mathbf{m}^{(kl)}_n \right\rVert$$
-
-Report the distribution of $e_n$, in pixels, on **held-out poses**. This is
-literally the quantity you care about. Target under 0.2 px; achievable given
-0.05 px corner localisation and 140 lenslets of averaging.
-
-**8.2 Residual map over the array.** Plot mean residual as a vector field over
-$(i,j)$. It should look like noise. Structure means the shared model is too
-rigid and is pushing error into a spatial pattern — a radial pattern points at
-uncorrected main-lens distortion, a linear ramp at a gauge constraint fighting
-the data, a discontinuity at a tile-boundary indexing error.
-
-**8.3 Test the per-lenslet-scale assumption once.** Fit L4, free
-$\lambda_{ij}$ per lenslet, and look at the spread. If it is consistent with
-noise, the "identical lenslets" assumption is measured rather than assumed, and
-you can cite that. If it varies systematically across the array, the MLA is not
-plane-parallel to the sensor — a tilt makes $b$, and therefore $\lambda$, vary
-linearly across the array. In that case add a 2-parameter linear model
-$\lambda_{ij} = \lambda_0 + \alpha i + \beta j$ rather than 140 free ones; that
-is the physically motivated extension, and it is cheap.
-
-**8.4 Registration at a wrong depth, deliberately.** Register a target at a
-depth you did *not* calibrate, and measure how the error grows. It should
-follow the $\Delta\lambda$ relation in §3. Confirming that scaling law tells
-you the depth model is right and gives you the usable depth-of-registration
-window as a measured number rather than an estimate.
-
----
-
-## 9. Suggested order
-
-1. White image; fit lattice; **check the residual spread**. Everything else is
-   conditional on this looking right.
-2. Set the UI grid parameters from the fitted lattice rather than by eye. They
-   are the same four numbers.
-3. High-overlap captures; estimate $\lambda$ by tile cross-correlation (§6.1).
-   A quick independent number to sanity-check the rest against.
-4. Checkerboard at the working depth; fit L0 → L1, with the gauge constraints.
-5. Cross-view consistency on held-out poses (§8.1). If it is under 0.2 px, the
-   registration goal is met and levels L2–L4 are optional.
-6. Multi-depth captures; fit $\lambda(z)$ if the depth range demands it (§3).
-7. Distortion (L3) only if you need rectilinear output.
-8. Extend to the stereo pair.
-
-Build the estimator against the `synthetic` camera backend first, with a known
-lattice, known $\lambda$ and known $\Delta\mathbf{c}$ injected. Recovering
-planted ground truth is the only way to distinguish an estimator bug from a rig
-problem, and it costs an afternoon against the alternative of never being quite
-sure which one you are looking at.
-
----
-
-## Open items
-
-1. **Depth range.** §3 gives the tolerance: $\lambda$ to $\sim10^{-3}$ for
-   sub-pixel registration across the array. Does your intended working range
-   fit inside that, or is per-frame $\lambda$ required? This is the one
-   decision that changes the architecture rather than the parameters.
-2. **Source of the grid rotation.** MLA-to-sensor, or sensor-to-optics? It does
-   not affect the registration map (§2.3), but it decides whether the
-   sub-aperture tiles should be de-rotated for display — see the note at the
-   top of `processing/stages/plenoptic.py` and the `derotate_views` flag.
-3. **Overlap fraction as built.** The white image measures it directly (§5).
-   Worth knowing before committing to §6.1 versus §6.2.
+- Dansereau, Pizarro, Williams — *Decoding, Calibration and Rectification for
+  Lenselet-Based Plenoptic Cameras*, CVPR 2013. [PDF][dpw]
+- Johannsen, Heinze, Goldluecke, Perwass — *On the Calibration of Focused
+  Plenoptic Cameras*, 2013. [PDF][joh]
+- Strobl, Lingenauber — *Stepwise Calibration of Focused Plenoptic Cameras*,
+  CVIU 2016. [PDF][sl]
+- Labussière, Teulière, Bernardin, Ait-Aider — *Blur Aware Calibration of
+  Multi-Focus Plenoptic Camera*, CVPR 2020. [PDF][lab]
+- Bok, Jeon, Kweon — *Geometric Calibration of Micro-Lens-Based Light Field
+  Cameras Using Line Features*, ECCV 2014 / TPAMI 2017. [PDF][bok]
+- *Pattern-free Plenoptic 2.0 Camera Calibration*, MMSP 2022. [PDF][pf]

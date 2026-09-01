@@ -10,3 +10,7 @@ probe_out/
 .pytest_cache/
 .ruff_cache/
 *.npy
+
+# Per-session runtime state (parameters you dialled in). Local, not shared.
+*.state.json
+*.state.tmp

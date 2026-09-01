@@ -262,7 +262,9 @@ def create_app(application: Application) -> FastAPI:
     def set_params(cam_id: str, stage_name: str, body: ParamUpdate) -> dict[str, Any]:
         cam = _cam(cam_id)
         try:
-            return cam.pipeline.update_params(stage_name, body.values)
+            out = cam.pipeline.update_params(stage_name, body.values)
+            application.mark_dirty()
+            return out
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from None
         except ValidationError as exc:
@@ -279,12 +281,14 @@ def create_app(application: Application) -> FastAPI:
             )
         except (ValueError, ValidationError) as exc:
             raise HTTPException(422, str(exc)) from None
+        application.mark_dirty()
         return cam.pipeline.describe()
 
     @api.delete("/api/pipeline/{cam_id}/{stage_name}")
     def remove_stage(cam_id: str, stage_name: str) -> list[dict[str, Any]]:
         cam = _cam(cam_id)
         cam.pipeline.remove(stage_name)
+        application.mark_dirty()
         return cam.pipeline.describe()
 
     # -- sensor controls ---------------------------------------------------
@@ -316,7 +320,16 @@ def create_app(application: Application) -> FastAPI:
             raise HTTPException(422, str(exc)) from None
         except Exception as exc:
             raise HTTPException(500, f"{type(exc).__name__}: {exc}") from None
-        return {"ok": True, "applied": body.controls}
+        application.mark_dirty()
+        # Echo what the source actually settled on, not what was asked for.
+        # Turning auto-exposure off pins the exposure AE had converged to, and
+        # the caller needs that number to put in its box.
+        return {
+            "ok": True,
+            "requested": body.controls,
+            "effective": cam.source.requested_controls(),
+            "live": cam.live_controls(),
+        }
 
     # -- capture ----------------------------------------------------------
 

@@ -12,6 +12,7 @@ import logging
 import threading
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any
 
 from .bus import LatestFrame
@@ -19,6 +20,7 @@ from .cameras.base import CameraSource
 from .cameras.registry import build_camera
 from .config import AppConfig, CameraConfig
 from .processing.pipeline import Pipeline
+from .state import StateStore
 from .storage.writer import SessionWriter
 from .types import Frame
 
@@ -161,21 +163,105 @@ class CameraRuntime:
             "errors": self.errors,
             "last_error": self.last_error,
             "preview_shape": list(frame.shape) if frame is not None else None,
+            "live": self.live_controls(),
             "info": self.source.describe().as_dict() if self.source.is_open else None,
         }
 
     def latest(self) -> Frame | None:
         return self.preview.get()[1]
 
+    # -- live sensor readback --------------------------------------------
+
+    def live_controls(self) -> dict[str, Any]:
+        """What the sensor is *actually* doing right now, from frame metadata.
+
+        Distinct from what was requested. Under auto-exposure the two differ by
+        definition, and the whole point of showing this is that the AE-chosen
+        exposure is a number you want to read off and then pin.
+        """
+        frame = self.latest()
+        if frame is None:
+            return {}
+        out: dict[str, Any] = {}
+        for key in ("ExposureTime", "AnalogueGain", "DigitalGain", "AeLocked"):
+            if key in frame.meta:
+                v = frame.meta[key]
+                out[key] = round(float(v), 4) if isinstance(v, (int, float)) else v
+        out["AeEnable"] = bool(self.source.auto_exposure)
+        return out
+
+    # -- state -----------------------------------------------------------
+
+    def state_snapshot(self) -> dict[str, Any]:
+        return {
+            "pipeline": self.pipeline.settings_snapshot(),
+            "controls": self.source.requested_controls(),
+        }
+
+    def apply_state(self, state: dict[str, Any]) -> list[str]:
+        """Restore a saved snapshot. Returns human-readable notes about
+        anything that could not be applied, rather than raising -- a state file
+        written before a config change must not stop the rig from starting."""
+        notes: list[str] = []
+        for stage_name, values in (state.get("pipeline") or {}).items():
+            values = {k: v for k, v in values.items() if k != "type"}
+            try:
+                self.pipeline.update_params(stage_name, values)
+            except KeyError:
+                notes.append(f"{self.cam_id}: no stage {stage_name!r} any more, skipped")
+            except Exception as exc:
+                notes.append(f"{self.cam_id}/{stage_name}: {exc}")
+        controls = state.get("controls") or {}
+        if controls:
+            try:
+                self.source.set_controls(controls)
+            except Exception as exc:
+                notes.append(f"{self.cam_id}: controls not restored ({exc})")
+        return notes
+
 
 class Application:
-    def __init__(self, cfg: AppConfig) -> None:
+    def __init__(
+        self,
+        cfg: AppConfig,
+        state_path: Path | str | None = None,
+        restore: bool = True,
+    ) -> None:
         self.cfg = cfg
         self.writer = SessionWriter(cfg.storage, cfg.storage_root)
         self.cameras: dict[str, CameraRuntime] = {
             c.cam_id: CameraRuntime(c, self.writer) for c in cfg.cameras
         }
         self.started_at = time.time()
+        self.restore = restore
+        self.state = StateStore(Path(state_path), self._state_snapshot) if state_path else None
+        self.restore_notes: list[str] = []
+
+    # -- state -----------------------------------------------------------
+
+    def _state_snapshot(self) -> dict[str, Any]:
+        return {
+            "config": str(getattr(self.cfg, "source_path", "") or ""),
+            "cameras": {cid: cam.state_snapshot() for cid, cam in self.cameras.items()},
+        }
+
+    def mark_dirty(self) -> None:
+        """Call after any parameter or control change so autosave picks it up."""
+        if self.state:
+            self.state.mark_dirty()
+
+    def _restore_state(self) -> None:
+        if not (self.state and self.restore):
+            return
+        data = self.state.load()
+        for cam_id, cam_state in (data.get("cameras") or {}).items():
+            cam = self.cameras.get(cam_id)
+            if cam is None:
+                self.restore_notes.append(f"saved state names camera {cam_id!r}, not in config")
+                continue
+            self.restore_notes.extend(cam.apply_state(cam_state))
+        for note in self.restore_notes:
+            log.warning("restore: %s", note)
 
     def start(self) -> None:
         failures: list[str] = []
@@ -189,9 +275,17 @@ class Application:
                 log.exception("%s: failed to start", cam.cam_id)
         if failures and len(failures) == len(self.cameras):
             raise RuntimeError("no cameras started:\n  " + "\n  ".join(failures))
+        # Restore only after the cameras are open: sensor controls need a live
+        # device, and a pipeline parameter is meaningless before its stage
+        # exists.
+        self._restore_state()
+        if self.state:
+            self.state.start_autosave()
+
         self.writer.write_session_manifest(
             {
                 "started": self.started_at,
+                "restore_notes": self.restore_notes,
                 "config": self.cfg.model_dump(),
                 "cameras": {cid: c.status() for cid, c in self.cameras.items()},
                 "start_failures": failures,
@@ -199,6 +293,10 @@ class Application:
         )
 
     def stop(self) -> None:
+        # Save before closing the cameras: a snapshot taken after teardown
+        # would read controls off a closed device.
+        if self.state:
+            self.state.stop(final_save=True)
         for cam in self.cameras.values():
             try:
                 cam.stop()
@@ -215,5 +313,6 @@ class Application:
         return {
             "uptime_s": round(time.time() - self.started_at, 1),
             "session_dir": str(self.writer.session_dir),
+            "state_file": str(self.state.path) if self.state else None,
             "cameras": [c.status() for c in self.cameras.values()],
         }

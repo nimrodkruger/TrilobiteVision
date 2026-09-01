@@ -91,6 +91,10 @@
         font-size:11px; font-variant-numeric:tabular-nums; text-align:right; }
   .row input[type=number]:focus { outline:1px solid var(--accent); border-color:var(--accent); }
   .row input[type=number].bad { border-color:var(--err); color:var(--err); }
+  /* A control the sensor is currently driving itself. Still editable -- typing
+     in it takes manual control -- but visibly not yours right now. */
+  .row.auto input[type=number] { color:var(--warn); border-style:dashed; }
+  .row.auto > label::after { content:" (auto)"; color:var(--warn); }
   .row input[type=checkbox] { accent-color:var(--accent); justify-self:start;
                               width:15px; height:15px; }
   .empty { color:var(--muted); font-size:11px; padding:4px 0; }
@@ -118,6 +122,36 @@
 "use strict";
 const $ = (s, r = document) => r.querySelector(s);
 const SUBAPS = ["top_right", "centre", "bottom_left"];
+
+/* Sensor control rows, per camera, so the status poll can write live values
+   back into them. Under auto-exposure the box must track what the sensor
+   actually chose -- that number is the whole reason to run AE at all: you
+   watch where it settles, then switch to manual and it stays there. */
+const SENSOR_ROWS = {};
+const AUTO_DRIVEN = ["ExposureTime", "AnalogueGain"];
+
+function syncSensorRows(camId, effective, live) {
+  const rows = SENSOR_ROWS[camId];
+  if (!rows) return;
+  const ae = live.AeEnable ?? effective.AeEnable ?? false;
+  if (rows.AeEnable && rows.AeEnable.sync) rows.AeEnable.sync(ae);
+  for (const name of AUTO_DRIVEN) {
+    const row = rows[name];
+    if (!row) continue;
+    row.classList.toggle("auto", !!ae);
+    const focused = row.contains(document.activeElement);
+    if (effective[name] !== undefined && !focused) {
+      // An authoritative value from a control response -- notably the exposure
+      // that was pinned when AE was switched off. Takes precedence over the
+      // status poll, which may still be carrying the previous frame.
+      row.sync(effective[name]);
+    } else if (ae && live[name] !== undefined && !focused) {
+      // While AE runs, mirror what the sensor actually chose. Skipped when the
+      // field has focus: overwriting it would fight the user mid-edit.
+      row.sync(live[name]);
+    }
+  }
+}
 
 function log(msg, cls = "") { const e = $("#log"); e.textContent = msg || " "; e.className = cls; }
 function note(camId, msg, cls = "") {
@@ -311,15 +345,23 @@ async function buildSensorPanel(camId) {
   }
   const commit = async (key, v) => {
     try {
-      await jsend(`/api/controls/${camId}`, { controls: { [key]: v } });
+      const r = await jsend(`/api/controls/${camId}`, { controls: { [key]: v } });
+      // The server echoes what the source settled on. Turning auto-exposure
+      // off pins the exposure AE had converged to, and setting an exposure by
+      // hand turns AE off -- both change controls the caller did not name, so
+      // push the whole effective set back into the rows.
+      syncSensorRows(camId, r.effective || {}, r.live || {});
       note(camId, `sensor ${key} = ${v}`, "ok");
-      return v;
+      return (r.effective || {})[key] ?? v;
     } catch (e) { note(camId, `sensor ${key}: ${e.message}`, "err"); throw e; }
   };
+  SENSOR_ROWS[camId] = {};
   for (const n of names) {
     const s = spec[n];
     const current = (data.requested || {})[n] ?? s.default ?? s.minimum ?? 0;
-    body.appendChild(makeRow(n, s, current, commit));
+    const row = makeRow(n, s, current, commit);
+    SENSOR_ROWS[camId][n] = row;
+    body.appendChild(row);
   }
   return makePanel("Sensor", "driver", body, false);
 }
@@ -495,13 +537,16 @@ let tick = 0;
 async function poll() {
   try {
     const s = await jget("/api/status");
-    $("#session").textContent = `${s.session_dir}   up ${s.uptime_s}s`;
+    $("#session").textContent =
+      `${s.session_dir}   up ${s.uptime_s}s` +
+      (s.state_file ? `   state: ${s.state_file.split(/[\\/]/).pop()}` : "");
     for (const c of s.cameras) {
       const el = document.querySelector(`[data-fps="${c.cam_id}"]`);
       if (el) {
         el.textContent = `${c.fps} fps  ${c.frames} frames` + (c.errors ? `  ${c.errors} ERR` : "");
         el.style.color = c.errors ? "var(--err)" : "";
       }
+      if (c.live) syncSensorRows(c.cam_id, {}, c.live);
     }
     // Sub-aperture indices shift as pitch changes; refresh captions at a low
     // rate rather than on every keystroke.

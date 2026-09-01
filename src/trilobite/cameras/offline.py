@@ -48,6 +48,7 @@ class SyntheticSource(CameraSource):
             "AeEnable": False,
         }
         self._brightness = 1.0
+        self._last_mean = 128.0
 
     def open(self) -> None:
         self._open = True
@@ -79,11 +80,14 @@ class SyntheticSource(CameraSource):
         if wait > 0:
             time.sleep(wait)
         self._last = time.monotonic()
+        self._run_ae()
         phase = (self._last - self._t0) * 0.4
         # Camera id shifts the phase so two synthetic cameras look different.
         phase += 0.3 * (abs(hash(self.cam_id)) % 7)
+        image = self._render(self._prev, phase)
+        self._last_mean = float(image.mean())
         return Frame.now(
-            self._render(self._prev, phase),
+            image,
             self.cam_id,
             self._next_seq(),
             space="mono8",
@@ -130,10 +134,61 @@ class SyntheticSource(CameraSource):
                 f"{self.cam_id}: control(s) not supported by this sensor: "
                 f"{', '.join(unknown)}. Available: {', '.join(sorted(spec))}"
             )
+        controls = self._resolve_ae(dict(controls))
         self._controls.update(controls)
+        self._requested.update(controls)
+        self._apply_brightness()
+
+    def _resolve_ae(self, controls: dict[str, Any]) -> dict[str, Any]:
+        """Mirror the real backend's auto-exposure transition rules.
+
+        Same logic as Picamera2Source._resolve_ae, deliberately duplicated
+        rather than shared: it encodes libcamera behaviour that this backend
+        only *simulates*, and a shared implementation would imply the two are
+        the same mechanism. Duplicating it is what makes the UI's AE handling
+        testable without the rig.
+        """
+        ae = controls.get("AeEnable")
+        if ae is False:
+            controls.setdefault("ExposureTime", int(self._controls.get("ExposureTime", 5000)))
+            controls.setdefault("AnalogueGain", float(self._controls.get("AnalogueGain", 1.0)))
+        elif ae is None and self.auto_exposure and (
+            "ExposureTime" in controls or "AnalogueGain" in controls
+        ):
+            controls["AeEnable"] = False
+        elif ae is True:
+            for key in ("ExposureTime", "AnalogueGain"):
+                controls.pop(key, None)
+        return controls
+
+    def _apply_brightness(self) -> None:
         exp = float(self._controls.get("ExposureTime", 5000))
         gain = float(self._controls.get("AnalogueGain", 1.0))
         self._brightness = min(4.0, (exp / 5000.0) * gain)
+
+    # Target mean level for the simulated auto-exposure, in DN. Deliberately
+    # not 128: the synthetic scene averages near mid-grey already, and a target
+    # equal to the resting value would make AE a no-op and hide any bug in the
+    # transition logic behind a control that never moves.
+    AE_TARGET_MEAN = 150.0
+
+    def _run_ae(self) -> None:
+        """Simulated auto-exposure: converge the exposure toward a target mean.
+
+        Exists so the UI's auto-exposure behaviour -- the live readback, and
+        the value being pinned when AE is switched off -- can be exercised
+        end to end on a desktop with no camera attached.
+        """
+        if not self._controls.get("AeEnable"):
+            return
+        measured = max(self._last_mean, 1.0)
+        err = self.AE_TARGET_MEAN / measured
+        exp = float(self._controls.get("ExposureTime", 5000))
+        # First-order convergence, damped, with a per-step limit so it settles
+        # over several frames the way a real AE loop does.
+        exp *= float(np.clip(1.0 + 0.3 * (err - 1.0), 0.7, 1.4))
+        self._controls["ExposureTime"] = int(np.clip(exp, 30, 100000))
+        self._apply_brightness()
 
     def get_controls(self) -> dict[str, Any]:
         return dict(self._controls)

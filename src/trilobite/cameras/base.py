@@ -38,6 +38,9 @@ class CameraSource(ABC):
         self.cam_id = cfg.cam_id
         self._seq = 0
         self._open = False
+        # Everything ever asked for via set_controls, plus whatever the config
+        # requested at open time. This is what gets persisted.
+        self._requested: dict[str, Any] = dict(cfg.controls)
 
     # -- lifecycle ------------------------------------------------------
 
@@ -85,6 +88,21 @@ class CameraSource(ABC):
     def set_controls(self, controls: dict[str, Any]) -> None:
         """Apply driver-level controls (exposure, gain, ...). Optional."""
         log.debug("%s: set_controls ignored by %s", self.cam_id, type(self).__name__)
+
+    @property
+    def auto_exposure(self) -> bool:
+        """Whether auto-exposure is currently on. Backends that have no AE
+        report False rather than raising."""
+        return bool(self._requested.get("AeEnable", False))
+
+    def requested_controls(self) -> dict[str, Any]:
+        """The controls this source has been asked for, for saving state.
+
+        Requested, not measured: restoring a session should reinstate the
+        decisions you made, not the particular exposure auto-exposure happened
+        to land on in the last frame before shutdown.
+        """
+        return dict(self._requested)
 
     def control_spec(self) -> dict[str, dict[str, Any]]:
         """Advertised driver controls as {name: {min, max, default, type}}.
