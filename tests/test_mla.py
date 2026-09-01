@@ -11,7 +11,7 @@ import math
 import numpy as np
 import pytest
 
-from trilobite.optics.mla import MLAGeometry
+from trilobite.optics.mla import MLAGeometry, _bilinear
 
 
 def geom(**kw):
@@ -193,3 +193,62 @@ def test_highlight_mask_outlines_only_the_named_lenslets():
     # Border pixels marked, interior clean.
     assert mask[int(cy - half) + 1, int(cx)]
     assert not mask[int(cy), int(cx)]
+
+
+# -- resolution ------------------------------------------------------------
+#
+# The preview is half the sensor's width, and the parameters are aligned by eye
+# against the preview while calibration crops from the sensor frame. That
+# factor of two is silent when it is wrong -- every crop lands between
+# micro-images and detection simply never works -- so it is pinned here.
+
+
+def test_rescaling_keeps_lenslet_centres_on_the_same_physical_point():
+    g = geom(width=728, height=544, pitch=50.0, offset_x=7.25, offset_y=-3.5, rotation_deg=3.0)
+    big = g.rescaled(1456, 1088)
+    assert big.pitch == pytest.approx(100.0)
+    assert big.rotation_deg == pytest.approx(3.0)
+    for i, j in ((0, 0), (3, -2), (-5, 4)):
+        x, y = g.centre_of(i, j)
+        bx, by = big.centre_of(i, j)
+        # Pixel-area convention: preview pixel x maps to (x + 1/2)*s - 1/2.
+        assert bx == pytest.approx((x + 0.5) * 2.0 - 0.5)
+        assert by == pytest.approx((y + 0.5) * 2.0 - 0.5)
+
+
+def test_rescaling_is_its_own_inverse():
+    g = geom(width=728, height=544, pitch=50.0, offset_x=11.0, offset_y=6.5, rotation_deg=-2.0)
+    back = g.rescaled(1456, 1088).rescaled(728, 544)
+    assert back == g
+
+
+def test_anisotropic_rescale_is_refused():
+    with pytest.raises(ValueError, match="anisotropic"):
+        geom(width=728, height=544).rescaled(1456, 600)
+
+
+def test_tile_to_frame_inverts_a_plain_crop():
+    g = geom(width=400, height=400, pitch=40.0)
+    x0, y0 = g.crop_origin(2, -1)
+    pts = np.array([[0.0, 0.0], [5.5, 7.25]])
+    out = g.tile_to_frame(2, -1, pts)
+    assert out[0] == pytest.approx([x0, y0])
+    assert out[1] == pytest.approx([x0 + 5.5, y0 + 7.25])
+
+
+def test_tile_to_frame_inverts_a_derotated_crop():
+    """Sample the de-rotated tile at a known pixel, map that pixel back, and
+    the value at the mapped frame position must be the same -- which is the
+    statement that corners measured either way land in the same place."""
+    g = geom(width=300, height=300, pitch=60.0, rotation_deg=12.0)
+    rng = np.random.default_rng(0)
+    img = rng.integers(0, 255, size=(300, 300), dtype=np.uint8)
+    tile = g.crop_derotated(img, 1, 1)
+    side = tile.shape[0]
+    for (r, c) in ((0, 0), (side // 2, side // 3), (side - 1, side - 1)):
+        fx, fy = g.tile_to_frame(1, 1, np.array([[c, r]]), derotate=True)[0]
+        assert 0 <= fx < 300 and 0 <= fy < 300
+        # The mapped position must be exactly where crop_derotated read from,
+        # so re-sampling the frame there reproduces the tile pixel.
+        got = _bilinear(img, np.array([fx], np.float32), np.array([fy], np.float32))[0]
+        assert int(got) == int(tile[r, c])

@@ -87,10 +87,52 @@ class AcceptanceSpec(BaseModel):
         description="Alternative movement gate: rotation since the last accept")
 
 
+class DetectionSpec(BaseModel):
+    """How the live detector runs. Not a property of the optics or the board."""
+
+    interval_s: float = Field(
+        0.4, ge=0.05, le=10.0, title="Min pass interval (s)",
+        description="Floor on the time between detection passes. A pass that "
+                    "takes longer than this simply runs less often -- it never "
+                    "queues, and it never touches the preview.",
+        json_schema_extra={"widget": "box"})
+    overlay: bool = Field(
+        True, title="Draw overlay",
+        description="Annotate the measured frame with tile verdicts and corner "
+                    "positions. Costs a few ms per pass; turn off if the Pi is "
+                    "struggling and the numbers are enough.")
+    # Both default off, and both defaults are measured rather than assumed.
+    # On the synthetic board, 117 tiles of 100 px:
+    #
+    #   flags            per tile   corner straightness
+    #   (none)            1.95 ms      0.0055 px
+    #   NORMALIZE_IMAGE   2.13 ms      0.0440 px      <- eight times worse
+    #   ACCURACY          4.86 ms      0.0040 px
+    #
+    # NORMALIZE_IMAGE costing precision is the surprise, and it is why it is
+    # not on by default despite sounding like an unambiguous good. It earns its
+    # place only when a micro-image is too unevenly lit for the pattern to be
+    # found at all -- which is a real possibility with vignetted lenslets, and
+    # exactly why this is a switch and not a decision made here.
+    normalize_illumination: bool = Field(
+        False, title="Normalise illumination",
+        description="CALIB_CB_NORMALIZE_IMAGE. Turn on only if vignetting stops "
+                    "tiles being found: it costs about eight times the corner "
+                    "precision on evenly-lit tiles. Finding the pattern beats "
+                    "locating it well, but not when it was already being found.")
+    high_accuracy: bool = Field(
+        False, title="High accuracy",
+        description="CALIB_CB_ACCURACY: an extra sub-pixel refinement, about 2.5x "
+                    "the cost per tile for a small gain. Off for live viewing, "
+                    "where pass rate is what you are watching; the recording "
+                    "stage will want it on.")
+
+
 class CalibrationSettings(BaseModel):
     board: BoardSpec = Field(default_factory=BoardSpec)
     optics: NominalOptics = Field(default_factory=NominalOptics)
     acceptance: AcceptanceSpec = Field(default_factory=AcceptanceSpec)
+    detection: DetectionSpec = Field(default_factory=DetectionSpec)
 
 
 class DerivedOptics(BaseModel):
@@ -217,15 +259,49 @@ class Check(BaseModel):
     message: str
 
 
-def readiness_report(cameras: list[Any]) -> dict[str, Any]:
+def _full_resolution(cam: Any) -> tuple[int, int]:
+    """(width, height) of the frame detection will actually run on."""
+    try:
+        info = cam.source.describe()
+        w, h = info.full_resolution
+        if w and h:
+            return int(w), int(h)
+    except Exception:
+        pass
+    return (1456, 1088)
+
+
+def _cv2_check() -> Check:
+    """Is the corner detector's one hard dependency actually here?
+
+    Blocking, and checked here rather than at the point of use, because the
+    failure otherwise arrives as a traceback inside a worker thread half a
+    second after the button is pressed -- at which point it reads as "detection
+    is broken" rather than "OpenCV is not installed".
+    """
+    try:
+        import cv2  # noqa: PLC0415
+    except ImportError:
+        return Check(
+            id="opencv", ok=False, blocking=True,
+            message="OpenCV (cv2) not importable. Pi: 'sudo apt install -y "
+                    "python3-opencv' with a --system-site-packages venv. "
+                    "Desktop: pip install -e '.[desktop]'.",
+        )
+    return Check(id="opencv", ok=True, blocking=True, message=f"OpenCV {cv2.__version__}")
+
+
+def readiness_report(
+    cameras: list[Any], settings: CalibrationSettings | None = None
+) -> dict[str, Any]:
     """Can a calibration session start?
 
     Split into blocking and advisory deliberately. Refusing to start because a
     slider happens to sit at its default value would be wrong -- 20 px is a
-    legal pitch. Refusing because the tiles are being resampled would not be:
-    that silently degrades every corner the session records.
+    legal pitch. Refusing because OpenCV is absent would not be: there is
+    nothing to run.
     """
-    checks: list[Check] = []
+    checks: list[Check] = [_cv2_check()]
 
     for cam in cameras:
         cid = cam.cam_id
@@ -307,6 +383,35 @@ def readiness_report(cameras: list[Any]) -> dict[str, Any]:
                 f"cap it at {safe_cir:.3f} regardless of rotation."
             ),
         ))
+
+        # Can the board even fit inside a micro-image? This is the check that
+        # would otherwise cost an afternoon: every tile detects nothing, the
+        # detector looks broken, and the actual answer is that a 9x6 board at
+        # 21 px per square needs 210 px of tile and the tile is 100 px wide.
+        #
+        # Everything here is in FULL-RESOLUTION pixels, because that is where
+        # detection runs -- see MLAGridOverlay.geometry_for.
+        if settings is not None:
+            full_w, full_h = _full_resolution(cam)
+            ref = getattr(stage, "reference_shape", None) or (full_w, full_h)
+            factor = (full_w / ref[0]) if ref[0] else 1.0
+            tile_px = float(p.pitch_px) * factor * scale
+            derived = DerivedOptics.compute(settings.optics, settings.board, tile_px)
+            need_w = (settings.board.cols + 1) * derived.square_px
+            need_h = (settings.board.rows + 1) * derived.square_px
+            fits = derived.square_px > 0 and max(need_w, need_h) <= tile_px
+            checks.append(Check(
+                id=f"{cid}.board_fits", ok=fits, blocking=False,
+                message=(
+                    f"{cid}: board needs {need_w:.0f}x{need_h:.0f} px, tile is "
+                    f"{tile_px:.0f} px -- fits"
+                    if fits else
+                    f"{cid}: board needs {need_w:.0f}x{need_h:.0f} px at the nominal "
+                    f"working distance but a micro-image is only {tile_px:.0f} px "
+                    f"across. No tile can contain the whole pattern. Use a smaller "
+                    f"board, smaller squares, or a nearer working distance."
+                ),
+            ))
 
     if not cameras:
         checks.append(Check(

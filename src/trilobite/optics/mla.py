@@ -121,6 +121,54 @@ class MLAGeometry:
         (ux, uy), (vx, vy) = self.basis
         return (gx + i * ux + j * vx, gy + i * uy + j * vy)
 
+    # -- resolution -------------------------------------------------------
+
+    def rescaled(self, width: int, height: int) -> MLAGeometry:
+        """The same physical grid, expressed in a differently-sized frame.
+
+        The grid is aligned by eye against the **preview** (728 x 544 on this
+        rig) but the calibration crops come out of the **sensor** frame
+        (1456 x 1088). That is a factor of two applied silently to pitch and to
+        both offsets, and the symptom of getting it wrong is not an exception:
+        it is every crop landing between micro-images and detection simply
+        never working. So the conversion lives here, in one place, rather than
+        at each call site.
+
+        The arithmetic is exact, which is worth showing because it looks as
+        though it should not be. Under the pixel-area convention a preview
+        pixel at x_p covers sensor coordinates (x_p + 1/2)s - 1/2, with
+        s = W_s / W_p. Applying that to the origin:
+
+            (c_p + dx + 1/2)s - 1/2   where  c_p = (W_p - 1)/2
+          = (W_p/2 + dx)s - 1/2
+          = (W_s - 1)/2 + dx*s
+          = c_s + dx*s
+
+        so the offset simply scales, with no half-pixel remainder. Rotation is
+        scale-invariant and carries over unchanged.
+
+        Raises on a non-uniform scale: an anisotropic resample would make
+        `pitch` two different numbers, and this class has only one.
+        """
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError("cannot rescale a geometry with no reference size")
+        sx = width / self.width
+        sy = height / self.height
+        if abs(sx - sy) > 1e-6 * max(sx, sy):
+            raise ValueError(
+                f"anisotropic rescale {self.width}x{self.height} -> {width}x{height} "
+                f"(x{sx:.4f} vs x{sy:.4f}). The preview and full-resolution streams "
+                f"must share an aspect ratio, or pitch has no single value."
+            )
+        return MLAGeometry(
+            width=int(width),
+            height=int(height),
+            pitch=self.pitch * sx,
+            rotation_deg=self.rotation_deg,
+            offset_x=self.offset_x * sx,
+            offset_y=self.offset_y * sy,
+        )
+
     # -- wholeness and selection ------------------------------------------
 
     def is_whole(self, i: int, j: int, scale: float = 1.0, derotate: bool = True) -> bool:
@@ -338,10 +386,8 @@ class MLAGeometry:
         callers render that as a blank tile rather than raising, because a
         mid-adjustment pitch value routinely puts a corner lenslet off-frame.
         """
-        cx, cy = self.centre_of(i, j)
         side = self.crop_side(scale)
-        x0 = int(round(cx - side / 2.0))
-        y0 = int(round(cy - side / 2.0))
+        x0, y0 = self.crop_origin(i, j, scale)
         x1, y1 = x0 + side, y0 + side
         h, w = image.shape[:2]
         x0c, x1c = max(0, x0), min(w, x1)
@@ -349,6 +395,48 @@ class MLAGeometry:
         if x1c <= x0c or y1c <= y0c:
             return np.zeros((0, 0), dtype=image.dtype)
         return np.ascontiguousarray(image[y0c:y1c, x0c:x1c])
+
+    def crop_origin(self, i: int, j: int, scale: float = 1.0) -> tuple[int, int]:
+        """Top-left pixel of the axis-aligned crop for lenslet (i, j).
+
+        Exposed because anything that measures inside a tile has to put the
+        measurement back into frame coordinates, and doing that arithmetic at
+        the call site is how a crop convention and a measurement convention
+        drift half a pixel apart.
+        """
+        cx, cy = self.centre_of(i, j)
+        side = self.crop_side(scale)
+        return int(round(cx - side / 2.0)), int(round(cy - side / 2.0))
+
+    def tile_to_frame(
+        self,
+        i: int,
+        j: int,
+        points: np.ndarray,
+        scale: float = 1.0,
+        derotate: bool = False,
+    ) -> np.ndarray:
+        """Map (x, y) points measured in a tile back into frame coordinates.
+
+        The inverse of whichever extraction produced the tile, so corners
+        recorded from a de-rotated tile and corners recorded from a plain crop
+        land in the same place. That equivalence is the reason de-rotation is
+        allowed at all (calibration-spec §2.6): what the fit consumes is frame
+        coordinates, and both routes deliver them.
+        """
+        pts = np.asarray(points, dtype=np.float64).reshape(-1, 2)
+        side = self.crop_side(scale)
+        if not derotate or abs(self.rotation_deg) < 1e-9:
+            x0, y0 = self.crop_origin(i, j, scale)
+            return pts + np.array([x0, y0], dtype=np.float64)
+        cx, cy = self.centre_of(i, j)
+        t = math.radians(self.rotation_deg)
+        ct, st = math.cos(t), math.sin(t)
+        o = pts - (side - 1) / 2.0
+        out = np.empty_like(o)
+        out[:, 0] = cx + o[:, 0] * ct - o[:, 1] * st
+        out[:, 1] = cy + o[:, 0] * st + o[:, 1] * ct
+        return out
 
     def crop_derotated(self, image: np.ndarray, i: int, j: int, scale: float = 1.0) -> np.ndarray:
         """Sub-aperture tile resampled into the lenslet's own axes.

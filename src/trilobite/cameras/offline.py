@@ -13,6 +13,7 @@ does not need a photon.
 from __future__ import annotations
 
 import logging
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,75 @@ class SyntheticSource(CameraSource):
         self._open = False
 
     def _render(self, size: tuple[int, int], phase: float) -> np.ndarray:
+        if self.cfg.synthetic_pattern == "plenoptic_board":
+            return self._render_board(size, phase)
+        return self._render_gratings(size, phase)
+
+    def _render_board(self, size: tuple[int, int], phase: float) -> np.ndarray:
+        """A lenslet array whose every micro-image holds a whole checkerboard.
+
+        Not a physical simulation of a plenoptic camera -- it is a *target* for
+        the corner detector, built so that a correct detector finds one
+        complete pattern per tile and an incorrectly scaled or offset one finds
+        none. That distinction is the entire value of it: with the real rig,
+        "no corners" could mean the crop is wrong, the board is the wrong size,
+        the grid is misaligned, or the lens cap is on.
+
+        The construction, in the lattice coordinates of the array:
+
+          * each micro-image is inverted and demagnified, so a board drawn in
+            the tile's own local coordinates is the right shape to find;
+          * the square size is pitch / (cols + 2), which leaves a one-square
+            border of flat tone -- findChessboardCornersSB needs quiet space
+            around the pattern, and a real board has a white margin anyway;
+          * the whole array drifts slowly with `phase`, so nothing under test
+            can accidentally depend on a static image.
+
+        `pitch` here is quoted at FULL resolution, so a request for a smaller
+        preview scales it -- the same relationship the real rig has between its
+        `main` and `lores` streams.
+        """
+        w, h = size
+        full_w = float(self._full[0])
+        scale = w / full_w if full_w else 1.0
+        pitch = max(4.0, float(self.cfg.synthetic_pitch_px) * scale)
+        cols, rows = (int(v) for v in self.cfg.synthetic_board)
+        square = pitch / (cols + 2)
+
+        t = math.radians(float(self.cfg.synthetic_rotation_deg))
+        ct, st = math.cos(t), math.sin(t)
+        gx, gy = (w - 1) / 2.0, (h - 1) / 2.0
+        # A slow Lissajous drift of a few pixels: enough to move the corners,
+        # small enough that the same tiles stay whole.
+        gx += 3.0 * math.sin(phase * 0.7)
+        gy += 3.0 * math.cos(phase * 0.5)
+
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        dx, dy = xx - gx, yy - gy
+        a = (dx * ct + dy * st) / pitch
+        b = (-dx * st + dy * ct) / pitch
+        # Position within the micro-image, in pixels, measured from its centre.
+        u = (a - np.round(a)) * pitch
+        v = (b - np.round(b)) * pitch
+
+        half_w = (cols + 1) * square / 2.0
+        half_h = (rows + 1) * square / 2.0
+        inside = (np.abs(u) <= half_w) & (np.abs(v) <= half_h)
+        ia = np.floor((u + half_w) / square)
+        ib = np.floor((v + half_h) / square)
+        dark = ((ia + ib) % 2) == 0
+
+        img = np.full((h, w), 190.0, dtype=np.float32)     # board margin
+        img[inside & dark] = 25.0
+        img[inside & ~dark] = 235.0
+        # Vignette each micro-image so the tiles read as micro-images rather
+        # than as one continuous scene.
+        r = np.sqrt(u * u + v * v) / (pitch / 2.0)
+        img *= np.clip(1.15 - 0.35 * r**4, 0.0, 1.0)
+        img += self._rng.normal(0.0, 1.5, size=img.shape).astype(np.float32)
+        return np.clip(img * self._brightness, 0, 255).astype(np.uint8)
+
+    def _render_gratings(self, size: tuple[int, int], phase: float) -> np.ndarray:
         w, h = size
         yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
         # Two gratings at different orientations, drifting at different rates.

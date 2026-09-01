@@ -97,17 +97,29 @@ exercise is pointless. This needs a capture path that pulls `main` at
 
 ### 4.2 Units — a required fix first
 
-The MLA parameters are currently expressed in **preview pixels** (728 × 544),
-because that is the image the alignment overlay draws on. Calibration crops
-from the **sensor** frame (1456 × 1088). A factor of two, silently applied to
-pitch and offsets, would put every crop in the wrong place and the failure
-would look like "detection just doesn't work".
+The MLA parameters are expressed in **preview pixels** (728 × 544), because
+that is the image the alignment overlay draws on. Calibration crops from the
+**sensor** frame (1456 × 1088). A factor of two, silently applied to pitch and
+offsets, puts every crop in the wrong place, and the failure looks like
+"detection just doesn't work".
 
-Fix before building any of this: add `reference_width`/`reference_height` to
-the MLA parameters, recorded when they are set, and have `MLAGeometry` scale
-itself to whatever frame it is applied to. The geometry then has one
-unambiguous meaning and the scaling happens in one place instead of at every
-call site.
+Built as:
+
+* `MLAParams.reference_width` / `reference_height` — the frame size the numbers
+  were measured against, learned from the first preview frame and carried in
+  the saved state. Hidden in the UI: it is a unit, not a knob.
+* `MLAGeometry.rescaled(w, h)` — the conversion, in one place, and exact: under
+  the pixel-area convention a preview pixel at `x` maps to `(x + ½)s − ½`, and
+  applying that to the origin gives `c_s + Δx·s` with no half-pixel remainder,
+  so the offsets simply scale and the rotation carries over untouched.
+* `MLAGridOverlay.geometry_for(w, h)` — what every non-preview caller uses.
+* `note_frame_size()` — if the configured preview resolution changes after an
+  alignment, the parameters are **rescaled to follow it** and the change is
+  logged. Keeping the numbers and quietly meaning something else would look
+  like the alignment drifting on its own.
+
+Pinned by `test_preview_scale_geometry_on_a_full_frame_finds_almost_nothing`,
+which is this bug written as an assertion.
 
 ### 4.3 Rate
 
@@ -123,14 +135,65 @@ preview, and dropped detection passes are harmless.
 ### 4.4 Per tile
 
 1. Crop the micro-image from the frozen MLA geometry.
-2. `findChessboardCornersSB` at the configured board size.
-3. `cornerSubPix` refinement.
-4. Record corner positions **in full-frame sensor coordinates**, with the tile
-   index and the corner IDs.
+2. Skip it if its standard deviation is below ~3 DN — there is no pattern in a
+   flat tile, and the skip is *reported*, not hidden, because "too dark to hold
+   a pattern" and "pattern not found" are different faults.
+3. `findChessboardCornersSB` at the configured board size.
+4. Map corner positions back to **full-frame sensor coordinates**
+   (`MLAGeometry.tile_to_frame`), with the tile index.
 
 Storing sensor coordinates rather than tile-local ones means the record does
 not depend on the crop convention, so a later change to `crop_scale` does not
-invalidate the data.
+invalidate the data. It is also what makes de-rotated and plain crops
+interchangeable — `test_derotated_and_plain_crops_agree_on_corner_positions`
+holds them to under half a pixel of each other.
+
+**No `cornerSubPix`.** An earlier draft of this section had one. SB with
+`CALIB_CB_ACCURACY` already runs a sub-pixel stage, and `cornerSubPix` needs a
+search window that, at a 20 px square, is either too small to help or large
+enough to reach into the neighbouring square. Measured on the synthetic board,
+117 tiles of 100 px:
+
+| flags | per tile | corner straightness |
+|---|---|---|
+| none | 1.95 ms | 0.0055 px |
+| `NORMALIZE_IMAGE` | 2.13 ms | 0.0440 px |
+| `ACCURACY` | 4.86 ms | 0.0040 px |
+
+`NORMALIZE_IMAGE` costing eight times the precision is the surprising one, and
+it is why neither flag is on by default. Both are switches in the Detection
+panel: normalisation earns its place only when vignetting stops a tile being
+found at all, and accuracy when recording rather than watching.
+
+### 4.5 What exists now — detection without recording
+
+The current build stops deliberately short of a session. **Start detection**
+runs the loop above and writes nothing: no poses, no frames, no accumulators.
+The response says `recording: false` rather than leaving it to be inferred.
+
+The reason is that a rig which records unusable corners for twenty minutes and
+reveals it at the fit is much worse than one that shows, live, that eleven
+tiles find the pattern and a hundred and sixteen do not. This stage answers
+that question and only that question.
+
+What it shows, per camera:
+
+* the annotated frame — the *same* frame the numbers came from, tiles boxed by
+  verdict and corners drawn where they were measured, downscaled to preview
+  width and polled at ~3 Hz;
+* the coverage lattice — one cell per lattice position, which the image cannot
+  substitute for: a dead column at one edge of the array is obvious as a column
+  of cells and invisible as a few missing boxes in a busy picture. Four states,
+  and the fourth is the useful one: *cross*, *found*, *nothing found*, and
+  *not a whole tile* (off the sensor, not a fault);
+* tiles found, qualifying crosses, pass duration, and whether the pose would be
+  accepted.
+
+Off-rig, `config/desktop-plenoptic.yaml` renders a synthetic lenslet array with
+a complete checkerboard in every micro-image, so the whole path is exercisable
+with no camera. Without it "the detector runs" and "the detector works" look
+identical, since every failure mode — wrong crop scale, wrong offset, wrong
+board size — produces the same symptom: no corners.
 
 ---
 
@@ -261,17 +324,23 @@ they are accepted, so the manifest can be regenerated from what is on disk.
 
 ---
 
-## 9. Changes required in the existing code
+## 9. Changes in the existing code
 
-| area | change |
-|---|---|
-| `optics/mla.py` | reference resolution on the geometry; scale to the target frame (§4.2) |
-| `cameras/base.py` | a way to pull a full-res frame for detection without disturbing the preview cadence |
-| `app.py` | detection worker per camera; calibration session object |
-| `web/server.py` | `/api/calibration/*` — start, stop, settings, coverage, last detection |
-| `web/static` | the second dashboard, mode switch |
-| new | `calibration/detect.py`, `calibration/session.py` |
-| `pyproject.toml` | opencv is currently apt-only on the Pi; add it as a desktop extra so the detector is testable off-rig |
+| area | change | state |
+|---|---|---|
+| `optics/mla.py` | reference resolution; `rescaled`, `crop_origin`, `tile_to_frame` (§4.2) | done |
+| `cameras/base.py` | `read_full_mono()` — full-res frame for detection, ISP output, no mode switch, no disturbance to the preview cadence | done |
+| `app.py` | detection worker per camera, start/stop/status; storage watch thread | done |
+| `web/server.py` | `/api/calibration/{settings,readiness,detection,start,stop}`, `/calibration/detection/{cam}.jpg`, `/api/storage*` | done |
+| `web/static` | second dashboard, mode switch, coverage lattice, storage panel | done |
+| `calibration/detect.py` | detector, acceptance, overlay, worker | done |
+| `pyproject.toml` | opencv as a `desktop` extra so the detector is testable off-rig | done |
+| `cameras/offline.py` | `plenoptic_board` synthetic pattern, so all of the above is testable with no camera | done |
+| `calibration/session.py` | pose recording, duplicate suppression, coverage accumulation | **not built** |
+
+Nothing in §7 (what is saved) or §8 (session end) exists yet, and §6.1's
+"never detected" state cannot exist until something accumulates across passes.
+The coverage lattice today is per-frame only.
 
 ---
 
@@ -299,6 +368,21 @@ they are accepted, so the manifest can be regenerated from what is on disk.
    My inclination is **(b)**: it makes the detector a solved problem and moves
    the difficulty to a printing job you do once. But it is your target to make,
    so it is your call.
+
+   **The detector as built assumes (a) or (b)** — it asks
+   `findChessboardCornersSB` for the exact `cols × rows` pattern in each tile,
+   which succeeds only on a board that fits whole inside one micro-image. That
+   is not a decision made on your behalf: it is the only thing that can be
+   built before the target exists, and it is also the thing to test the rig
+   with first. Choosing (c) later replaces `CornerDetector.detect_tile` and
+   nothing else — the geometry, the worker, the acceptance rule and the display
+   are all indifferent to how a tile's corners were found.
+
+   The `board_fits` readiness check exists for this: it multiplies the board
+   size by the predicted square size and says, before you start, whether the
+   pattern can physically fit in a micro-image. Without it, choosing (c)'s
+   large board by accident produces exactly the same symptom as every other
+   mistake — no corners — and costs an afternoon.
 
 2. **`min corners` default.** 6 is a guess. It should be set from how many the
    detector actually returns reliably at your square size — worth measuring in

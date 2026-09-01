@@ -69,6 +69,15 @@ class StageAdd(BaseModel):
     index: int | None = None
 
 
+class StorageTarget(BaseModel):
+    path: str
+    # Mount points get the data subdirectory appended; an explicit directory
+    # chosen by hand does not. Defaulting to True is right because the common
+    # case is picking a device off the list, and writing session folders into
+    # the root of someone's USB stick is rude.
+    append_subdir: bool = True
+
+
 def _subaperture_tile(cam: CameraRuntime, view: str) -> np.ndarray | None:
     """Crop the named sub-aperture out of the current preview frame.
 
@@ -81,7 +90,10 @@ def _subaperture_tile(cam: CameraRuntime, view: str) -> np.ndarray | None:
     if stage is None or frame is None:
         return None
     h, w = frame.data.shape[:2]
-    geom = stage.geometry(w, h)
+    # geometry_for, not geometry: identical for the preview (which is the
+    # reference resolution) but correct if this is ever handed a different
+    # frame size. One conversion rule, used everywhere.
+    geom = stage.geometry_for(w, h)
     scale = float(stage.params.crop_scale)
     derot = bool(getattr(stage.params, "derotate_views", True))
     idx = geom.named_indices(scale, derotate=derot).get(view)
@@ -232,13 +244,14 @@ def create_app(application: Application) -> FastAPI:
         if stage is None or frame is None:
             return {"available": False, "enabled": False, "views": {}}
         h, w = frame.data.shape[:2]
-        geom = stage.geometry(w, h)
+        geom = stage.geometry_for(w, h)
         scale = float(stage.params.crop_scale)
         named = geom.named_indices(scale)
         return {
             "available": True,
             "enabled": bool(stage.params.enabled),
             "stage": stage.name,
+            "reference_shape": list(stage.reference_shape or (w, h)),
             "origin": [round(v, 2) for v in geom.origin],
             "centre_pixel": [round(v, 2) for v in geom.centre_pixel],
             "extent": list(geom.index_extent(scale)),
@@ -373,13 +386,13 @@ def create_app(application: Application) -> FastAPI:
 
     @api.post("/api/calibration/start")
     def calibration_start() -> dict[str, Any]:
-        """Not implemented yet -- deliberately.
+        """Begin live corner detection. **Records nothing.**
 
-        The dashboard, its settings and the readiness gate are in place; corner
-        detection and the session recorder are not. Returning 501 with a plain
-        explanation is better than a button that appears to work: the UI shows
-        this message verbatim, so there is no ambiguity about whether the click
-        registered.
+        This is the detection half of a calibration session with the recording
+        half deliberately absent: it answers whether the detector finds the
+        board in the micro-images, and how many, and where. Poses are not
+        stored, no files are written, and `recording: false` in the response
+        says so rather than leaving it to be inferred.
         """
         readiness = application.calibration_readiness()
         if not readiness["ready"]:
@@ -387,14 +400,88 @@ def create_app(application: Application) -> FastAPI:
                 "error": "preconditions not met",
                 "blocking": readiness["blocking_failures"],
             })
-        raise HTTPException(501, {
-            "error": "detection not implemented yet",
-            "detail": (
-                "Settings and preconditions are wired up; corner detection and "
-                "the session recorder are the next piece. See "
-                "docs/calibration-ui-spec.md sections 4 and 5."
-            ),
-        })
+        try:
+            return application.detection_start()
+        except Exception as exc:
+            log.exception("detection failed to start")
+            raise HTTPException(500, f"{type(exc).__name__}: {exc}") from None
+
+    @api.post("/api/calibration/stop")
+    def calibration_stop() -> dict[str, Any]:
+        return application.detection_stop()
+
+    @api.get("/api/calibration/detection")
+    def calibration_detection() -> dict[str, Any]:
+        """Latest pass per camera: per-tile verdicts and the acceptance result.
+
+        Corner *coordinates* are not in here. At 127 tiles times a dozen
+        corners times two cameras twice a second that is a megabyte a minute of
+        numbers no one reads, and the annotated image below already shows where
+        they landed. When recording is built it will keep them; the dashboard
+        never needs them.
+        """
+        return application.detection_status()
+
+    @api.get("/calibration/detection/{cam_id}.jpg")
+    def calibration_detection_image(cam_id: str) -> Response:
+        """The annotated frame from the most recent pass.
+
+        Polled, not streamed -- and at 1-2 Hz there is nothing to stream. It is
+        also the frame the numbers were measured on, so the picture and the
+        counts can never be one pass out of step with each other.
+        """
+        _cam(cam_id)
+        overlay = application.detection_overlay(cam_id)
+        if overlay is None:
+            raise HTTPException(204, "no detection pass yet")
+        return Response(
+            encode_jpeg(overlay, quality=quality),
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    # -- storage devices ----------------------------------------------------
+    #
+    # Hot-pluggable by design: a device that appears after startup must show up
+    # here, and one that is pulled must stop being written to. See
+    # storage/devices.py for why that needs polling rather than a config field.
+
+    @api.get("/api/storage")
+    def storage() -> dict[str, Any]:
+        return application.storage_state()
+
+    @api.post("/api/storage/target")
+    def storage_target(body: StorageTarget) -> dict[str, Any]:
+        """Send subsequent captures to a different filesystem.
+
+        A new session directory is created on the target; nothing already
+        written is moved or deleted. `path` is either a device mount point
+        (the usual case -- the data subdirectory is appended) or an explicit
+        directory, for anyone who wants to choose it exactly.
+        """
+        from ..storage.devices import DATA_SUBDIR  # noqa: PLC0415
+
+        target = Path(body.path).expanduser()
+        if body.append_subdir and target.name != DATA_SUBDIR:
+            target = target / DATA_SUBDIR
+        try:
+            application.writer.retarget(target)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        except OSError as exc:
+            raise HTTPException(500, f"{type(exc).__name__}: {exc}") from None
+        return application.storage_state()
+
+    @api.post("/api/storage/release")
+    def storage_release() -> dict[str, Any]:
+        """Return output to the internal default so a device can be unplugged.
+
+        There is no eject here on purpose -- unmounting someone's filesystem is
+        not this application's business. The safe sequence is: release, check
+        that the panel says the output is internal again, then pull the disk.
+        """
+        application.writer.release()
+        return application.storage_state()
 
     # -- capture ----------------------------------------------------------
 

@@ -197,6 +197,36 @@ class Picamera2Source(CameraSource):
         self._last_meta = meta
         return Frame.now(luma, self.cam_id, self._next_seq(), space="mono8", **meta)
 
+    def read_full_mono(self) -> Frame | None:
+        """Full-resolution luma from the `main` stream, for corner detection.
+
+        Pulls from the same request pool as the preview, so it costs one extra
+        buffer copy and no sensor reconfiguration -- which is the only reason
+        this can run in a loop at all. A mode switch per detection pass would
+        stall the preview for hundreds of milliseconds each time.
+
+        `main` is configured without an explicit format, so on a Pi 5 it comes
+        back as XBGR8888: four channels, all carrying the same luma for a mono
+        sensor. Slicing one plane is a 1.5 MB copy; a colour conversion would
+        be several times that for an identical result.
+        """
+        if not self._open:
+            return None
+        with self._lock:
+            request = self._picam.capture_request()
+            try:
+                data = request.make_array("main")
+                meta = dict(request.get_metadata())
+            finally:
+                request.release()
+        if data.ndim == 3:
+            data = data[..., 0]
+        meta["stream"] = "main"
+        meta["mono_sensor"] = self._mono
+        return Frame.now(
+            np.ascontiguousarray(data), self.cam_id, self._next_seq(), space="mono8", **meta
+        )
+
     def capture_full(self, raw: bool = True) -> Frame:
         if not self._open:
             raise RuntimeError(f"{self.cam_id}: camera not open")

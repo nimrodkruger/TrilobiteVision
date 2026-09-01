@@ -20,9 +20,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Desktop-only: everything needed to run the synthetic/replay backends on
-# Windows with no Pi attached.
-desktop = ["numpy>=1.24", "pillow>=10.0"]
+# Desktop-only: everything needed to run the synthetic/replay backends, and the
+# calibration corner detector, on a machine with no Pi attached.
+#
+# opencv-python-headless, not opencv-python: the GUI build drags in Qt and a
+# display stack nothing here uses. On the **Pi this extra must not be
+# installed** -- cv2 comes from apt as python3-opencv, built against the same
+# numpy that picamera2's buffers use. A pip wheel alongside it gives two cv2
+# modules and an import order that silently decides which one you get.
+desktop = ["numpy>=1.24", "pillow>=10.0", "opencv-python-headless>=4.9"]
 dev = ["pytest>=8.0", "ruff>=0.4"]
 
 [project.scripts]

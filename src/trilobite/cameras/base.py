@@ -24,6 +24,8 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
+import numpy as np
+
 from ..config import CameraConfig
 from ..types import CameraInfo, Frame
 
@@ -78,6 +80,36 @@ class CameraSource(ABC):
         reconstruction need. raw=False gives the ISP output, which is only
         useful for looking at.
         """
+
+    def read_full_mono(self) -> Frame | None:
+        """A full-resolution single-channel frame, cheap enough to poll.
+
+        Sits between the two methods above, and exists for one caller: the
+        calibration corner detector. That job needs full sensor resolution --
+        the preview is half-scale, so corners found on it carry half the
+        precision -- but it does **not** need raw sensor data. Corner detection
+        is a geometric measurement on an intensity image, and the ISP's
+        companding, which is what disqualifies the processed path for
+        radiometry, moves no corner.
+
+        Distinct from capture_full(raw=True), which may have to decode a
+        compressed raw format and is far too slow to run in a loop, and from
+        read_preview, which is the wrong size. The base implementation takes
+        the ISP output and reduces it to two dimensions; backends with a
+        cheaper route override.
+
+        Returns None when the source has no frame available.
+        """
+        frame = self.capture_full(raw=False)
+        if frame is None:
+            return None
+        data = frame.data
+        if data.ndim == 3:
+            # A mono sensor through the ISP arrives as XBGR/RGB with every
+            # channel carrying the same luma. Take one plane rather than
+            # paying for a colour conversion.
+            return frame.derive(np.ascontiguousarray(data[..., 0]), space="mono8")
+        return frame
 
     # -- introspection and control --------------------------------------
 

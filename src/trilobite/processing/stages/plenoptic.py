@@ -42,6 +42,8 @@ overlay and the crops cannot disagree.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 from pydantic import Field
 
@@ -49,6 +51,8 @@ from ...optics.mla import UI_SUBAPERTURES, MLAGeometry
 from ...types import Frame
 from ..base import Stage, StageParams
 from ..registry import register
+
+log = logging.getLogger(__name__)
 
 
 class MLAParams(StageParams):
@@ -77,6 +81,20 @@ class MLAParams(StageParams):
             "the MLA is rotated relative to the sensor, so tile content is not "
             "rotated and resampling would only blur it. See the module docstring."
         ),
+    )
+    # The frame size these numbers were measured against. Learned from the
+    # first frame and thereafter carried in the saved state, because "pitch =
+    # 100 px" is meaningless on its own: the same physical grid is 100 px on the
+    # 728-wide preview you aligned it against and 200 px on the 1456-wide sensor
+    # frame that calibration crops from. Hidden in the UI -- it is a unit, not a
+    # knob.
+    reference_width: int = Field(
+        0, ge=0, description="Frame width these parameters were set against (0 = learn it)",
+        json_schema_extra={"widget": "hidden"},
+    )
+    reference_height: int = Field(
+        0, ge=0, description="Frame height these parameters were set against (0 = learn it)",
+        json_schema_extra={"widget": "hidden"},
     )
 
 
@@ -117,6 +135,11 @@ class MLAGridOverlay(Stage):
         self._mask = None
 
     def geometry(self, width: int, height: int) -> MLAGeometry:
+        """Geometry with the parameters taken **verbatim**, at this frame size.
+
+        Correct only when (width, height) is the reference resolution -- the
+        preview. Anything reading a different-sized frame wants geometry_for().
+        """
         p = self.params
         return MLAGeometry(
             width=width,
@@ -126,6 +149,68 @@ class MLAGridOverlay(Stage):
             offset_x=float(p.offset_x),
             offset_y=float(p.offset_y),
         )
+
+    # -- resolution ------------------------------------------------------
+
+    @property
+    def reference_shape(self) -> tuple[int, int] | None:
+        """(width, height) the parameters are expressed in, if known yet."""
+        w = int(self.params.reference_width)
+        h = int(self.params.reference_height)
+        return (w, h) if w > 0 and h > 0 else None
+
+    def note_frame_size(self, width: int, height: int) -> None:
+        """Record, or follow, the resolution the parameters are measured in.
+
+        Called once per preview frame. Three cases:
+
+          * no reference yet -- adopt this frame's size. First run, or a state
+            file written before this field existed.
+          * reference matches -- nothing to do, the common case.
+          * reference differs -- the preview resolution was changed in the
+            config since the grid was aligned. **Rescale the parameters** so
+            the grid stays on the same physical lenslets, and say so. The
+            alternative, keeping the numbers and quietly meaning something
+            else, would look like the alignment spontaneously drifting.
+        """
+        ref = self.reference_shape
+        if ref == (width, height):
+            return
+        if ref is None:
+            self.params.reference_width = int(width)
+            self.params.reference_height = int(height)
+            return
+        try:
+            g = self.geometry(*ref).rescaled(width, height)
+        except ValueError as exc:
+            log.warning("%s: cannot follow a resolution change: %s", self.name, exc)
+            self.params.reference_width = int(width)
+            self.params.reference_height = int(height)
+            return
+        log.warning(
+            "%s: preview resolution changed %dx%d -> %dx%d; rescaling the grid "
+            "(pitch %.3f -> %.3f px) so it stays on the same lenslets",
+            self.name, ref[0], ref[1], width, height, self.params.pitch_px, g.pitch,
+        )
+        self.params.pitch_px = g.pitch
+        self.params.offset_x = g.offset_x
+        self.params.offset_y = g.offset_y
+        self.params.reference_width = int(width)
+        self.params.reference_height = int(height)
+        self.reset()
+
+    def geometry_for(self, width: int, height: int) -> MLAGeometry:
+        """Geometry converted to whatever frame size the caller is holding.
+
+        This is the entry point for anything that is not the preview -- above
+        all the calibration detector, which crops from the full-resolution
+        sensor frame while these parameters were tuned on the half-scale
+        preview. See MLAGeometry.rescaled for why the conversion is exact.
+        """
+        ref = self.reference_shape or (width, height)
+        if ref == (width, height):
+            return self.geometry(width, height)
+        return self.geometry(*ref).rescaled(width, height)
 
     def _masks(self, h: int, w: int) -> tuple[np.ndarray, np.ndarray]:
         """(grid mask, highlight mask), cached on the parameters and frame size.
@@ -158,6 +243,9 @@ class MLAGridOverlay(Stage):
     def apply(self, frame: Frame) -> Frame:
         d = frame.data
         h, w = d.shape[:2]
+        # The preview is the frame these parameters are measured against, so
+        # this is where the reference resolution is established.
+        self.note_frame_size(w, h)
         grid, hi = self._masks(h, w)
         out = d.copy()
 
@@ -178,6 +266,7 @@ class MLAGridOverlay(Stage):
             mla_origin_px=list(geom.origin),
             mla_index_extent=list(geom.index_extent(float(self.params.crop_scale))),
             mla_views={k: list(v) for k, v in named.items()},
+            mla_reference_shape=list(self.reference_shape or (w, h)),
         )
 
 

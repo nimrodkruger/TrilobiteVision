@@ -112,14 +112,19 @@ src/trilobite/
     pipeline.py            ordered runner, live reconfiguration, timing
     stages/basic.py        passthrough, levels, crop, downsample, stats
     stages/plenoptic.py    MLA grid overlay; lenslet_extract stub
+  optics/mla.py            lenslet geometry, shared by the overlay and the crops
+  calibration/
+    settings.py            board, nominal optics, acceptance, readiness checks
+    detect.py              live per-tile corner detection (needs cv2)
   sinks/jpeg.py            JPEG encode (simplejpeg → cv2 → PIL)
-  storage/writer.py        session dirs, .npy + JSON sidecar
+  storage/writer.py        session dirs, .npy + JSON sidecar, live retargeting
+  storage/devices.py       which filesystems can hold a session, right now
   web/server.py            FastAPI: stream, params, controls, capture
   web/static/index.html    UI generated from the stage schemas
 scripts/probe_cameras.py   run this first, on the Pi
 scripts/install_pi.sh      apt + config.txt + venv, idempotent
 systemd/trilobite.service     run as a service
-tests/test_pipeline.py     runs anywhere, no camera needed
+tests/                     all of it runs anywhere, no camera needed
 ```
 
 ---
@@ -231,11 +236,47 @@ manual runs fail with a confusing "device busy".
 | POST | `/api/controls/{cam}` | sensor controls: `ExposureTime`, `AnalogueGain`, ... |
 | POST | `/api/capture/{cam}?raw=true` | full-res capture with sidecar |
 | POST | `/api/capture-all?raw=true` | trigger every camera |
+| GET/PUT | `/api/calibration/settings` | board, nominal optics, acceptance, detection |
+| GET | `/api/calibration/readiness` | preconditions, split blocking vs advisory |
+| POST | `/api/calibration/start`, `/stop` | live corner detection — **records nothing** |
+| GET | `/api/calibration/detection` | latest pass per camera: per-tile verdicts |
+| GET | `/calibration/detection/{cam}.jpg` | that pass, annotated |
+| GET | `/api/storage` | filesystems on offer, and where output is going |
+| POST | `/api/storage/target` | move output to a device, while running |
+| POST | `/api/storage/release` | back to internal, so a device can be unplugged |
 
 Sensor controls and pipeline parameters are deliberately separate endpoints.
 One changes what the sensor does, the other changes what happens to the
 numbers afterwards; conflating them makes it impossible to tell whether a
 change was optical or computational.
+
+---
+
+## Output storage
+
+The SD card is the wrong place for a capture session — slow, and sustained
+writes wear it out — and the right USB SSD is usually not plugged in when the
+application starts. So the output directory is movable **while the rig is
+running**, from the Storage panel on the imaging page.
+
+Three properties, and the third is the one that matters:
+
+* **Devices are polled.** Something plugged in five minutes after startup
+  appears in the list without a reload. Listing never writes a probe file —
+  read-only mounts are read out of `/proc/mounts`, not discovered by trying.
+* **Choosing a device creates a new session directory on it**, under
+  `trilobite-data/`. Nothing already written is moved, mirrored or deleted, and
+  a note records where the earlier part of the afternoon went.
+* **Pulling the disk is survivable.** A watcher notices within two seconds and
+  falls back to the configured root, and a write that fails mid-capture
+  recovers and completes rather than losing the frame. This matters more than
+  it sounds: unplugging a USB stick leaves the mount point behind as an
+  ordinary empty directory, so writes keep *succeeding* — onto the SD card,
+  under a path that says otherwise.
+
+There is no eject button, deliberately: unmounting someone's filesystem is not
+this application's business. The sequence is **Release**, check that the panel
+says the output is internal again, then pull the disk.
 
 ---
 
@@ -292,7 +333,10 @@ are set in `config/pi.yaml` on purpose. Frames taken under auto-exposure are
 not comparable to each other.
 
 **Put the data on an SSD.** Continuous capture to the SD card is slow and
-wears it out. Change `storage.root` to a mounted USB SSD or an NVMe HAT.
+wears it out. Change `storage.root` to a mounted USB SSD or an NVMe HAT, or
+pick the device at runtime from the Storage panel (see **Output storage**).
+`storage.root` remains the fallback the rig returns to when a chosen device
+goes away, so it must be somewhere that is always mounted.
 
 **Release the cameras on exit.** libcamera does not always recover from a
 process killed while holding a sensor; the fix is a reboot. SIGINT and SIGTERM
@@ -308,8 +352,16 @@ are handled, so use Ctrl-C rather than `kill -9`.
 3. Exposure and gain sweeps via `/api/controls`, watching
    `stat_saturated_fraction` from the `stats` stage.
 4. Mount the MLA. Use `mla_grid_overlay` to align it physically.
-5. Video recording — a `Recorder` consuming a `FrameQueue`, writing raw frames.
+5. Calibration. Switch to the Calibration dashboard, set the board, and press
+   **Start detection** — it finds corners per micro-image and records nothing,
+   which is the question to answer before building the recorder. Rehearse it
+   with `config/desktop-plenoptic.yaml`, which renders a synthetic lenslet
+   array with a whole checkerboard in every micro-image; the board must be set
+   to 4 × 3 inner corners, 7 mm, to match it.
+6. Pose recording (`calibration/session.py`) — see
+   `docs/calibration-ui-spec.md` §7 and §9.
+7. Video recording — a `Recorder` consuming a `FrameQueue`, writing raw frames.
    Do not reach for H.264 on the Pi 5; store lossless and compress off-device.
-6. Hardware sync between the two sensors.
-7. `lenslet_extract`. Read its docstring first — there is a design decision
+8. Hardware sync between the two sensors.
+9. `lenslet_extract`. Read its docstring first — there is a design decision
    about the `Frame` type that needs making before writing any of it.

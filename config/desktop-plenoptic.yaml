@@ -1,0 +1,65 @@
+# Desktop configuration for calibration work: two synthetic cameras rendering a
+# lenslet array whose every micro-image contains a complete checkerboard.
+#
+# This is the config to develop the calibration dashboard against. It exists
+# because the difference between "the corner detector runs" and "the corner
+# detector works" is invisible on the drifting-grating pattern, and every one
+# of its failure modes -- wrong crop scale, wrong offset, wrong board size --
+# looks identical from the outside: no corners.
+#
+# The board settings in the dashboard MUST match `synthetic_board` below
+# (4 x 3 inner corners) or detection will correctly find nothing.
+#
+#   trilobite --config config/desktop-plenoptic.yaml
+#
+# Then: enable the `mla` stage, leave pitch at 50 (the preview is half scale,
+# so 50 preview px is the 100 sensor px the source renders), switch to
+# Calibration, set the board to 4 x 3, and press Start detection.
+
+log_level: INFO
+
+server:
+  host: 127.0.0.1
+  port: 8000
+  preview_fps: 15
+  jpeg_quality: 80
+
+storage:
+  root: ./trilobite-data
+  still_format: npy
+
+cameras:
+  - cam_id: left
+    label: Left camera
+    backend: synthetic
+    full_resolution: [1456, 1088]
+    preview_resolution: [728, 544]
+    fps: 20
+    synthetic_pattern: plenoptic_board
+    synthetic_pitch_px: 100          # full-resolution pixels
+    synthetic_rotation_deg: 0.0
+    synthetic_board: [4, 3]
+    pipeline:
+      - {type: stats,  name: stats}
+      - {type: levels, name: display, params: {gain: 1.0, gamma: 1.0}}
+      # pitch_px is in PREVIEW pixels -- half of synthetic_pitch_px. The stage
+      # records that reference and the detector scales it to the sensor frame.
+      - {type: mla_grid_overlay, name: mla, params: {enabled: true, pitch_px: 50}}
+
+  - cam_id: right
+    label: Right camera
+    backend: synthetic
+    full_resolution: [1456, 1088]
+    preview_resolution: [728, 544]
+    fps: 20
+    synthetic_pattern: plenoptic_board
+    synthetic_pitch_px: 100
+    # A couple of degrees on one head only, so the rotation path is exercised
+    # every time this config is used rather than only when someone remembers to.
+    synthetic_rotation_deg: 2.0
+    synthetic_board: [4, 3]
+    pipeline:
+      - {type: stats,  name: stats}
+      - {type: levels, name: display, params: {gain: 1.0, gamma: 1.0}}
+      - {type: mla_grid_overlay, name: mla,
+         params: {enabled: true, pitch_px: 50, rotation_deg: 2.0, crop_scale: 0.9}}

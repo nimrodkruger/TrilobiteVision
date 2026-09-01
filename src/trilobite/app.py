@@ -238,9 +238,15 @@ class Application:
         # everything else so the board and acceptance settings survive a
         # restart mid-way through a calibration afternoon.
         self.calibration = CalibrationSettings()
+        # Live detection: one worker per camera, started on demand, holding
+        # only the latest pass. Never writes anything.
+        self.detection: dict[str, Any] = {}
+        self.detection_settings: CalibrationSettings | None = None
         self.restore = restore
         self.state = StateStore(Path(state_path), self._state_snapshot) if state_path else None
         self.restore_notes: list[str] = []
+        self._storage_stop = threading.Event()
+        self._storage_thread: threading.Thread | None = None
 
     # -- state -----------------------------------------------------------
 
@@ -254,7 +260,7 @@ class Application:
     # -- calibration ------------------------------------------------------
 
     def calibration_readiness(self) -> dict[str, Any]:
-        return readiness_report(list(self.cameras.values()))
+        return readiness_report(list(self.cameras.values()), self.calibration)
 
     def calibration_derived(self) -> dict[str, Any]:
         """Nominal optics -> the numbers that decide whether the board is right.
@@ -271,6 +277,104 @@ class Application:
         return DerivedOptics.compute(
             self.calibration.optics, self.calibration.board, pitch
         ).model_dump()
+
+    # -- live detection ----------------------------------------------------
+    #
+    # No recording. The workers hold the latest pass per camera and nothing
+    # else: this stage answers "does the detector see the board in the
+    # micro-images", which has to be true before recording poses is worth
+    # building. See calibration/detect.py.
+
+    @property
+    def detection_running(self) -> bool:
+        return any(w.running for w in self.detection.values())
+
+    def detection_start(self) -> dict[str, Any]:
+        """Start a detection worker per camera. Raises on a blocked precondition."""
+        readiness = self.calibration_readiness()
+        if not readiness["ready"]:
+            raise RuntimeError("; ".join(readiness["blocking_failures"]))
+        self.detection_stop()
+        # The settings are frozen at start: the board a pass was measured
+        # against must not change under it mid-pass, and a detector rebuilt on
+        # every settings edit would produce results that cannot be compared.
+        self.detection_settings = self.calibration.model_copy(deep=True)
+        spec = self.detection_settings.detection
+        from .calibration.detect import DetectionWorker  # noqa: PLC0415 - needs cv2
+
+        for cam_id, cam in self.cameras.items():
+            worker = DetectionWorker(
+                cam,
+                self.detection_settings.board,
+                self.detection_settings.acceptance,
+                min_interval=float(spec.interval_s),
+                annotate_overlay=bool(spec.overlay),
+                normalize=bool(spec.normalize_illumination),
+                accuracy=bool(spec.high_accuracy),
+            )
+            worker.start()
+            self.detection[cam_id] = worker
+        log.info("detection started on %s", ", ".join(self.detection))
+        return self.detection_status()
+
+    def detection_stop(self) -> dict[str, Any]:
+        for worker in self.detection.values():
+            worker.stop()
+        self.detection.clear()
+        return self.detection_status()
+
+    def detection_status(self) -> dict[str, Any]:
+        cams: dict[str, Any] = {}
+        for cam_id, worker in self.detection.items():
+            latest = worker.latest()
+            cams[cam_id] = {
+                "running": worker.running,
+                "passes": worker.passes,
+                "result": latest.as_dict() if latest else None,
+            }
+        return {
+            "running": self.detection_running,
+            "recording": False,   # stated explicitly: this stage never writes
+            "settings": (
+                self.detection_settings.model_dump() if self.detection_settings else None
+            ),
+            "cameras": cams,
+        }
+
+    def detection_overlay(self, cam_id: str):
+        """The annotated frame from the latest pass, or None."""
+        worker = self.detection.get(cam_id)
+        if worker is None:
+            return None
+        latest = worker.latest()
+        return None if latest is None else latest.overlay
+
+    # -- storage -----------------------------------------------------------
+
+    def storage_state(self) -> dict[str, Any]:
+        """Devices on offer, and where output is currently going."""
+        from .storage.devices import DATA_SUBDIR, list_devices  # noqa: PLC0415
+
+        state = self.writer.state()
+        active_mount = state["mount"]
+        return {
+            "active": state,
+            "subdir": DATA_SUBDIR,
+            "devices": [
+                {**d.as_dict(), "active": d.mount == active_mount}
+                for d in list_devices([self.cfg.storage_root])
+            ],
+        }
+
+    def _storage_watch(self) -> None:
+        """Notice a pulled disk within a couple of seconds, not at the next
+        capture. Polling, because there is no portable mount-change signal and
+        inotify does not fire on /proc/mounts the way you would hope."""
+        while not self._storage_stop.wait(2.0):
+            try:
+                self.writer.check_and_recover()
+            except Exception:
+                log.exception("storage watch failed")
 
     def mark_dirty(self) -> None:
         """Call after any parameter or control change so autosave picks it up."""
@@ -314,6 +418,12 @@ class Application:
         if self.state:
             self.state.start_autosave()
 
+        self._storage_stop.clear()
+        self._storage_thread = threading.Thread(
+            target=self._storage_watch, name="storage-watch", daemon=True
+        )
+        self._storage_thread.start()
+
         self.writer.write_session_manifest(
             {
                 "started": self.started_at,
@@ -325,6 +435,13 @@ class Application:
         )
 
     def stop(self) -> None:
+        # Detection first: its workers pull frames from the cameras, so
+        # stopping them after the sources close would raise on the way out.
+        self.detection_stop()
+        self._storage_stop.set()
+        if self._storage_thread:
+            self._storage_thread.join(timeout=3.0)
+            self._storage_thread = None
         # Save before closing the cameras: a snapshot taken after teardown
         # would read controls off a closed device.
         if self.state:
@@ -345,6 +462,8 @@ class Application:
         return {
             "uptime_s": round(time.time() - self.started_at, 1),
             "session_dir": str(self.writer.session_dir),
+            "storage": self.writer.state(),
+            "detection_running": self.detection_running,
             "state_file": str(self.state.path) if self.state else None,
             "cameras": [c.status() for c in self.cameras.values()],
         }

@@ -72,6 +72,21 @@ class CameraConfig(BaseModel):
     # replay backend only: directory of images to loop over.
     source_dir: str | None = None
 
+    # synthetic backend only. "gratings" is the drifting sinusoid used for
+    # checking that a processing stage does what it claims. "plenoptic_board"
+    # renders a lenslet array whose every micro-image contains a complete
+    # checkerboard, which is what makes the calibration corner detector
+    # exercisable end to end with no camera attached -- worth having, because
+    # the detector's failure modes (wrong crop, wrong scale, wrong board size)
+    # all look identical from the outside.
+    synthetic_pattern: Literal["gratings", "plenoptic_board"] = "gratings"
+    # Micro-image pitch of the simulated array, in FULL-RESOLUTION pixels.
+    synthetic_pitch_px: float = 100.0
+    synthetic_rotation_deg: float = 0.0
+    # Inner corners per micro-image. The calibration board settings must be set
+    # to match these, or detection will correctly find nothing.
+    synthetic_board: tuple[int, int] = (4, 3)
+
     pipeline: list[StageConfig] = Field(default_factory=list)
 
 

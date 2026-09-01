@@ -158,6 +158,46 @@
   .frozen { font-size:11px; color:var(--muted); font-family:ui-monospace,monospace;
             line-height:1.6; }
 
+  /* --- storage devices --------------------------------------------------- */
+  .dev { border:1px solid var(--line); border-radius:7px; background:var(--bg);
+         padding:7px 9px; margin:6px 0; display:grid; gap:5px; }
+  .dev.active { border-color:var(--accent); }
+  .dev .top { display:flex; align-items:baseline; gap:8px; }
+  .dev .name { font-weight:650; font-size:12px; }
+  .dev .tag { font-size:9px; text-transform:uppercase; letter-spacing:.05em;
+              border:1px solid var(--line); border-radius:4px; padding:1px 4px;
+              color:var(--muted); }
+  .dev .tag.rm { color:var(--warn); border-color:var(--warn); }
+  .dev .tag.on { color:var(--accent); border-color:var(--accent); }
+  .dev .path { font-family:ui-monospace,monospace; font-size:10px; color:var(--muted);
+               overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .dev .bar { height:5px; border-radius:3px; background:var(--panel2); overflow:hidden; }
+  .dev .bar > i { display:block; height:100%; background:var(--accent); }
+  .dev .bar > i.full { background:var(--err); }
+  .dev .foot { display:flex; align-items:center; gap:8px; }
+  .dev .foot .cap { font-size:10px; color:var(--muted); font-variant-numeric:tabular-nums;
+                    margin-right:auto; }
+  .dev button { padding:3px 9px; font-size:11px; }
+  .notes { font-family:ui-monospace,monospace; font-size:10px; color:var(--muted);
+           line-height:1.6; max-height:80px; overflow-y:auto; }
+
+  /* --- detection coverage -------------------------------------------------
+     One cell per lattice position, laid out as the array is. Capped in size:
+     it is a glance, not a picture, and at full column width it would push the
+     live views off the screen -- which are the thing you aim the board with. */
+  .cov { display:grid; gap:1px; margin:5px 0; max-width:230px; }
+  .cov i { display:block; aspect-ratio:1; border-radius:1px; background:#1a1d26; }
+  .cov i.miss  { background:#4a2330; }   /* examined, found nothing */
+  .cov i.found { background:var(--ok); }
+  .cov i.cross { background:var(--accent); }
+  .covkey { font-size:9px; color:var(--muted); display:flex; gap:9px; align-items:center; }
+  .covkey i { width:8px; height:8px; border-radius:2px; display:inline-block;
+              vertical-align:-1px; margin-right:3px; }
+  .detstat { font-family:ui-monospace,monospace; font-size:11px; color:var(--muted);
+             font-variant-numeric:tabular-nums; }
+  .detstat b { color:var(--ok); font-weight:650; }
+  .detstat.idle b { color:var(--muted); }
+
   footer { padding:6px 16px; border-top:1px solid var(--line); background:var(--panel);
            color:var(--muted); font-family:ui-monospace,monospace; font-size:11px;
            white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -448,6 +488,11 @@ async function buildPipelinePanels(camId, host) {
       }
     };
     for (const [key, spec] of Object.entries(props)) {
+      // widget:"hidden" is for parameters that are units rather than knobs --
+      // the MLA reference resolution, which records which frame size pitch and
+      // the offsets were measured against. Editable by hand it would only ever
+      // be wrong.
+      if (spec.widget === "hidden") continue;
       body.appendChild(makeRow(key, spec, st.values[key], commit));
     }
     const panel = makePanel(st.name, st.type, body, false);
@@ -475,8 +520,111 @@ async function refreshSubaps(camId) {
   }
 }
 
+/* ---------------------------------------------------------------------------
+   STORAGE
+
+   The output directory is movable while the rig is running, because the SD
+   card is the wrong place for a session and the right disk is often not
+   plugged in when the application starts. Two consequences visible here:
+
+     * the device list is re-read on a timer, so something plugged in five
+       minutes ago appears without a reload;
+     * there is a Release button and no Eject button. Unmounting someone's
+       filesystem is not this application's business; what it can do is stop
+       writing to the device, which is the part that has to happen before the
+       disk comes out.
+--------------------------------------------------------------------------- */
+const gb = n => `${(n / 1e9).toFixed(1)} GB`;
+
+function renderStorage(s) {
+  const host = $("#storage-body");
+  if (!host || !s) return;
+  const a = s.active;
+  const el = document.createElement("div");
+
+  const head = document.createElement("div");
+  head.className = "dev active";
+  head.innerHTML = `
+    <div class="top"><span class="name">Writing to</span>
+      <span class="tag ${a.removable ? "rm" : ""}">${a.removable ? "external" : "internal"}</span>
+      ${a.present ? "" : `<span class="tag rm">MISSING</span>`}</div>
+    <div class="path"></div>
+    <div class="foot"><span class="cap">${gb(a.free_bytes)} free of ${gb(a.total_bytes)}</span>
+      <button class="ghost" id="storage-release" ${a.removable ? "" : "disabled"}>Release</button>
+    </div>`;
+  head.querySelector(".path").textContent = a.session_dir;
+  el.appendChild(head);
+
+  for (const d of s.devices) {
+    const row = document.createElement("div");
+    row.className = "dev" + (d.active ? " active" : "");
+    const pct = Math.round(d.used_fraction * 100);
+    row.innerHTML = `
+      <div class="top"><span class="name"></span>
+        ${d.removable ? `<span class="tag rm">removable</span>` : ""}
+        ${d.active ? `<span class="tag on">in use</span>` : ""}
+        <span class="tag">${d.fstype}</span></div>
+      <div class="path"></div>
+      <div class="bar"><i class="${pct > 92 ? "full" : ""}" style="width:${pct}%"></i></div>
+      <div class="foot"><span class="cap">${gb(d.free_bytes)} free · ${pct}% used</span>
+        <button data-use="${d.mount}" ${d.active || !d.writable ? "disabled" : ""}>
+          ${d.writable ? "Use" : "read-only"}</button></div>`;
+    row.querySelector(".name").textContent = d.label;
+    row.querySelector(".path").textContent = `${d.mount}  →  ${d.target}`;
+    el.appendChild(row);
+  }
+
+  if (a.notes && a.notes.length) {
+    const n = document.createElement("div");
+    n.className = "notes";
+    n.textContent = a.notes.slice(-6).join("\n");
+    el.appendChild(n);
+  }
+
+  host.innerHTML = "";
+  host.appendChild(el);
+}
+
+async function refreshStorage() {
+  try { renderStorage(await jget("/api/storage")); } catch { /* transient */ }
+}
+
+function buildStorageCard() {
+  const card = document.createElement("section");
+  card.className = "cam";
+  card.innerHTML = `
+    <div class="viewport">
+      <h2><span class="ttl">Storage</span>
+        <span class="sub">output device</span>
+        <span class="stat" id="storage-stat">&mdash;</span></h2>
+    </div>
+    <div class="controls"><div class="panel"><div class="body" id="storage-body">
+      <div class="empty">reading devices…</div>
+    </div></div></div>`;
+
+  card.addEventListener("click", async ev => {
+    const use = ev.target.closest("[data-use]");
+    const rel = ev.target.closest("#storage-release");
+    if (!use && !rel) return;
+    ev.target.disabled = true;
+    try {
+      const s = use
+        ? await jsend("/api/storage/target", { path: use.dataset.use })
+        : await jsend("/api/storage/release");
+      renderStorage(s);
+      log(`output → ${s.active.session_dir}`, "ok");
+    } catch (e) {
+      log(`storage: ${e.message}`, "err");
+      refreshStorage();
+    }
+  });
+  return card;
+}
+
 async function buildLive() {
+  const gen = ++BUILD;
   const cams = await jget("/api/cameras");
+  if (gen !== BUILD) return;
   const root = $("#cams");
   root.innerHTML = "";
 
@@ -514,9 +662,14 @@ async function buildLive() {
     root.appendChild(card);
 
     controls.appendChild(await buildSensorPanel(cam.cam_id));
+    if (gen !== BUILD) return;
     await buildPipelinePanels(cam.cam_id, controls);
+    if (gen !== BUILD) return;
     refreshSubaps(cam.cam_id);
   }
+
+  root.appendChild(buildStorageCard());
+  refreshStorage();
 
   root.addEventListener("click", async ev => {
     const btn = ev.target.closest("[data-save]");
@@ -550,6 +703,13 @@ async function buildLive() {
    =========================================================================== */
 
 let MODE = "live";
+/* Building a mode is asynchronous -- it awaits the schema for every stage of
+   every camera -- and a mode switch part-way through would otherwise let the
+   abandoned build finish and append its panels into the new layout. That is
+   how the storage card ended up in the calibration rail. Every build carries
+   the generation it started in and stops if it is no longer current. */
+let BUILD = 0;
+let DETECTING = false;   // declared here so renderReadiness can consult it
 let CAL = null;          // settings object, mirrored from the server
 let CAL_SCHEMA = null;
 let readinessTimer = null;
@@ -624,7 +784,7 @@ function renderReadiness(r) {
   const btn = $("#cal-start");
   const why = $("#cal-why");
   if (btn) {
-    btn.disabled = !r.ready;
+    btn.disabled = !r.ready || DETECTING;
     why.textContent = r.ready
       ? (r.warnings.length ? `${r.warnings.length} advisory warning(s)` : "preconditions met")
       : `blocked: ${r.blocking_failures.length} precondition(s)`;
@@ -633,8 +793,10 @@ function renderReadiness(r) {
 }
 
 async function buildCalibration() {
+  const gen = ++BUILD;
   const cams = await jget("/api/cameras");
   const cfg = await jget("/api/calibration/settings");
+  if (gen !== BUILD) return;
   CAL = cfg.settings; CAL_SCHEMA = cfg.schema;
 
   const root = $("#cams");
@@ -650,11 +812,14 @@ async function buildCalibration() {
   rail.appendChild(calGroup("Acceptance", "acceptance",
     ["min_corners_per_tile", "min_cross_tiles", "target_per_tile",
      "move_fraction", "move_rotation_deg"]));
+  rail.appendChild(calGroup("Detection", "detection",
+    ["interval_s", "overlay", "normalize_illumination", "high_accuracy"]));
 
   // Exposure and gain only. No pipeline, no MLA -- alignment is finished
   // before entering, and its parameters are frozen (shown below, read-only).
   for (const cam of cams) {
     const panel = await buildSensorPanel(cam.cam_id);
+    if (gen !== BUILD) return;
     panel.querySelector(".hdr strong").textContent = `Sensor — ${cam.label || cam.cam_id}`;
     rail.appendChild(panel);
   }
@@ -681,8 +846,10 @@ async function buildCalibration() {
       <div class="calviews" id="cal-views" style="margin-top:8px"></div>
     </div>
     <div class="startbar">
-      <button id="cal-start">Start calibration</button>
+      <button id="cal-start">Start detection</button>
+      <button class="ghost" id="cal-stop" disabled>Stop</button>
       <span class="why" id="cal-why"></span>
+      <span class="why" style="margin-left:auto">no images are recorded at this stage</span>
     </div>`;
 
   const views = stage.querySelector("#cal-views");
@@ -691,8 +858,18 @@ async function buildCalibration() {
     v.className = "calview";
     v.innerHTML = `<h3><span class="t"></span>
                      <span class="stat" data-fps="${cam.cam_id}">&mdash;</span></h3>
-                   <img src="/stream/${cam.cam_id}.mjpg" alt="preview">
-                   <div class="actions"><span class="note" data-note="${cam.cam_id}"></span></div>`;
+                   <img data-detimg="${cam.cam_id}" src="/stream/${cam.cam_id}.mjpg" alt="preview">
+                   <div class="actions" style="display:block">
+                     <div class="detstat idle" data-detstat="${cam.cam_id}">detection idle</div>
+                     <div class="cov" data-cov="${cam.cam_id}"></div>
+                     <div class="covkey">
+                       <span><i style="background:var(--accent)"></i>cross</span>
+                       <span><i style="background:var(--ok)"></i>found</span>
+                       <span><i style="background:#4a2330"></i>nothing</span>
+                       <span><i style="background:#1a1d26"></i>off sensor</span>
+                     </div>
+                     <span class="note" data-note="${cam.cam_id}"></span>
+                   </div>`;
     v.querySelector(".t").textContent = cam.label || cam.cam_id;
     views.appendChild(v);
   }
@@ -707,11 +884,22 @@ async function buildCalibration() {
   for (const cam of cams) {
     try {
       const stages = await jget(`/api/pipeline/${cam.cam_id}`);
+      if (gen !== BUILD) return;
       const mla = stages.find(s => s.type === "mla_grid_overlay");
       const line = document.createElement("div");
+      // Pitch is quoted twice on purpose. It is set in preview pixels, which
+      // is what you aligned against, but detection runs on the sensor frame,
+      // and that factor of two is the one number in this whole dashboard that
+      // is worth being able to check at a glance.
+      const rw = mla && mla.values.reference_width;
+      const full = cam.info && cam.info.full_resolution;
+      const k = rw && full ? full[0] / rw : 1;
       line.textContent = mla
-        ? `${cam.cam_id}: pitch ${mla.values.pitch_px} px, rot ${mla.values.rotation_deg}°, ` +
+        ? `${cam.cam_id}: pitch ${mla.values.pitch_px} px @${rw || "?"}w ` +
+          `(= ${(mla.values.pitch_px * k).toFixed(1)} px on the sensor), ` +
+          `rot ${mla.values.rotation_deg}°, ` +
           `offset (${mla.values.offset_x}, ${mla.values.offset_y}), ` +
+          `crop ×${mla.values.crop_scale}, ` +
           `derotate ${mla.values.derotate_views ? "ON" : "off"}`
         : `${cam.cam_id}: no MLA stage`;
       frozen.appendChild(line);
@@ -724,19 +912,134 @@ async function buildCalibration() {
     const btn = ev.currentTarget;
     btn.disabled = true;
     try {
-      await jsend("/api/calibration/start");
-      log("calibration started", "ok");
+      applyDetectionState(await jsend("/api/calibration/start"));
+      log("detection running — corner finding only, nothing is being saved", "ok");
     } catch (e) {
-      // Expected for now: the endpoint returns 501 with an explanation, and
-      // showing it verbatim removes any doubt about whether the click landed.
-      log(e.message, "warn");
-    } finally {
+      log(e.message, "err");
       btn.disabled = false;
     }
   };
+  $("#cal-stop").onclick = async ev => {
+    ev.currentTarget.disabled = true;
+    try { applyDetectionState(await jsend("/api/calibration/stop")); log("detection stopped"); }
+    catch (e) { log(e.message, "err"); }
+  };
+
+  // A reload mid-session must not lie about whether detection is running.
+  try { applyDetectionState(await jget("/api/calibration/detection")); } catch { /* transient */ }
 
   await refreshReadiness();
   readinessTimer = setInterval(refreshReadiness, 2000);
+}
+
+/* ---------------------------------------------------------------------------
+   Detection display.
+
+   Two things are shown and they answer different questions. The annotated
+   image answers "is it finding the pattern where I think the pattern is" --
+   it is the frame the numbers were measured on, with the corners drawn at
+   their measured positions. The coverage lattice answers "which part of the
+   array is failing", which the image cannot: a dead column at one edge is
+   obvious as a column of grey cells and invisible as a few missing boxes in a
+   busy picture.
+--------------------------------------------------------------------------- */
+
+function applyDetectionState(state) {
+  DETECTING = !!(state && state.running);
+  const start = $("#cal-start"), stop = $("#cal-stop");
+  if (start) start.disabled = DETECTING;
+  if (stop) stop.disabled = !DETECTING;
+
+  for (const img of document.querySelectorAll("[data-detimg]")) {
+    const cam = img.dataset.detimg;
+    if (DETECTING) {
+      // Drop the MJPEG stream. Not only for the connection budget: the
+      // annotated frame IS the live view while detecting, and showing an
+      // unannotated stream beside a set of counts derived from a different
+      // frame invites reading the two together.
+      if (img.dataset.mode !== "det") { img.dataset.mode = "det"; img.removeAttribute("src"); }
+    } else if (img.dataset.mode !== "stream") {
+      img.dataset.mode = "stream";
+      img.dataset.busy = "0";
+      img.src = `/stream/${cam}.mjpg`;
+    }
+  }
+  if (state) renderDetection(state);
+}
+
+function renderDetection(state) {
+  for (const [camId, d] of Object.entries((state && state.cameras) || {})) {
+    const line = document.querySelector(`[data-detstat="${camId}"]`);
+    const cov = document.querySelector(`[data-cov="${camId}"]`);
+    const r = d.result;
+    if (line) {
+      if (!r) {
+        line.className = "detstat idle";
+        line.textContent = d.running ? "waiting for the first pass…" : "detection idle";
+      } else if (r.error) {
+        line.className = "detstat"; line.style.color = "var(--err)";
+        line.textContent = r.error;
+      } else {
+        line.className = "detstat" + (r.accepted ? "" : " idle");
+        line.style.color = "";
+        line.innerHTML =
+          `<b>${r.tiles_found}</b>/${r.tiles_examined} tiles · ` +
+          `<b>${r.cross_centres.length}</b> cross · ${r.pass_ms} ms · ` +
+          (r.accepted ? "POSE WOULD BE ACCEPTED" : "no qualifying cross");
+      }
+    }
+    if (cov && r && r.tiles && r.tiles.length) renderCoverage(cov, r);
+  }
+}
+
+function renderCoverage(host, r) {
+  const is = r.tiles.map(t => t.i), js = r.tiles.map(t => t.j);
+  const i0 = Math.min(...is), i1 = Math.max(...is);
+  const j0 = Math.min(...js), j1 = Math.max(...js);
+  const cols = i1 - i0 + 1, rows = j1 - j0 + 1;
+  const crosses = new Set(r.cross_centres.map(c => `${c[0]},${c[1]}`));
+
+  // Rebuild only when the lattice extent changes; otherwise recolour in place.
+  if (host.dataset.dims !== `${cols}x${rows}`) {
+    host.dataset.dims = `${cols}x${rows}`;
+    host.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+    host.innerHTML = "";
+    for (let n = 0; n < cols * rows; n++) host.appendChild(document.createElement("i"));
+  }
+  const cells = host.children;
+  // Unset means "not a whole tile" -- a lattice position whose crop runs off
+  // the sensor. Distinguishing that from "examined and found nothing" is the
+  // point of the display: the second is a fault to chase, the first is just
+  // the edge of the array.
+  for (const c of cells) c.className = "";
+  for (const t of r.tiles) {
+    const idx = (t.j - j0) * cols + (t.i - i0);
+    const cell = cells[idx];
+    if (!cell) continue;
+    cell.className = crosses.has(`${t.i},${t.j}`) ? "cross" : (t.found ? "found" : "miss");
+    cell.title = `(${t.i}, ${t.j})  ` +
+      (t.found ? `${t.n} corners` : (t.skipped ? "too flat to hold a pattern" : "no pattern"));
+  }
+}
+
+/* Detection images are polled, like the sub-aperture tiles and for the same
+   reason -- and at 1-2 Hz there is nothing worth streaming anyway. */
+const DET_HZ = 3;
+function pollDetection() {
+  const next = () => setTimeout(pollDetection, 1000 / DET_HZ);
+  if (MODE !== "cal" || !DETECTING) return next();
+  for (const img of document.querySelectorAll('[data-detimg][data-mode="det"]')) {
+    if (img.dataset.busy === "1") continue;
+    img.dataset.busy = "1";
+    const done = () => { img.dataset.busy = "0"; };
+    img.onload = done;
+    img.onerror = done;    // 204 before the first pass completes
+    img.src = `/calibration/detection/${img.dataset.detimg}.jpg?t=${Date.now()}`;
+  }
+  jget("/api/calibration/detection")
+    .then(s => { DETECTING = !!s.running; renderDetection(s); })
+    .catch(() => {});
+  next();
 }
 
 async function refreshReadiness() {
@@ -841,9 +1144,15 @@ let tick = 0;
 async function poll() {
   try {
     const s = await jget("/api/status");
-    $("#session").textContent =
-      `${s.session_dir}   up ${s.uptime_s}s` +
-      (s.state_file ? `   state: ${s.state_file.split(/[\\/]/).pop()}` : "");
+    const st = s.storage || {};
+    const el = $("#session");
+    el.textContent =
+      `${s.session_dir}` +
+      (st.free_gb !== undefined ? `   ${st.free_gb} GB free` : "") +
+      `   up ${s.uptime_s}s` +
+      (s.detection_running ? "   ● detecting" : "") +
+      (st.present === false ? "   ⚠ OUTPUT DEVICE MISSING" : "");
+    el.style.color = st.present === false ? "var(--err)" : "";
     for (const c of s.cameras) {
       const el = document.querySelector(`[data-fps="${c.cam_id}"]`);
       if (el) {
@@ -854,12 +1163,16 @@ async function poll() {
     }
     // Sub-aperture indices shift as pitch changes; refresh captions at a low
     // rate rather than on every keystroke.
-    if (MODE === "live" && ++tick % 3 === 0) s.cameras.forEach(c => refreshSubaps(c.cam_id));
+    tick++;
+    if (MODE === "live" && tick % 3 === 0) s.cameras.forEach(c => refreshSubaps(c.cam_id));
+    // Devices appear and disappear on their own schedule, so the panel is
+    // re-read on a timer rather than only when something is clicked.
+    if (MODE === "live" && tick % 5 === 0) refreshStorage();
   } catch (e) { /* transient; the streams themselves show a stall */ }
   setTimeout(poll, 1000);
 }
 
-buildLive().then(() => { poll(); pollTiles(); })
+buildLive().then(() => { poll(); pollTiles(); pollDetection(); })
           .catch(e => log("startup: " + e.message, "err"));
 </script>
 </body>
