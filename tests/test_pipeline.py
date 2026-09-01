@@ -291,3 +291,158 @@ def test_corrupt_state_file_is_ignored(tmp_path):
     bad = tmp_path / "x.state.json"
     bad.write_text("{not json")
     assert StateStore(bad, dict).load() == {}
+
+
+# --- calibration settings and readiness --------------------------------------
+
+
+def test_derived_optics_match_the_hand_derivation():
+    """Spec eq. (3) with F=50, d_L=55, b=1.2 -> the worked example in §1.3."""
+    from trilobite.calibration.settings import BoardSpec, DerivedOptics, NominalOptics
+
+    d = DerivedOptics.compute(
+        NominalOptics(focal_length_mm=50.0, lens_to_mla_mm=55.0,
+                      mla_to_sensor_mm=1.2, working_distance_mm=2000.0),
+        BoardSpec(square_mm=20.0), pitch_px=100.0,
+    )
+    assert abs(d.f_px - 3478.3) < 0.5
+    assert abs(d.D_mm - 550.0) < 0.5
+    assert abs(d.kappa_px - (-8.0645)) < 0.001
+    assert abs(d.alpha - 1.24) < 1e-4
+    assert abs(d.baseline_mm - 2.782) < 0.01
+    assert d.square_verdict == "too_big"          # 48 px at 2 m
+
+
+def test_derived_optics_invert_back_to_the_physical_parameters():
+    """Eq. (4). The fit's three scalars must recover F, d_L, b, or the check
+    against the datasheet in §6 is not available."""
+    from trilobite.calibration.settings import (
+        BoardSpec,
+        DerivedOptics,
+        NominalOptics,
+        invert_derived,
+    )
+
+    optics = NominalOptics(focal_length_mm=35.0, lens_to_mla_mm=41.5,
+                           mla_to_sensor_mm=0.9, working_distance_mm=1500.0)
+    d = DerivedOptics.compute(optics, BoardSpec(), pitch_px=100.0)
+    back = invert_derived(d.f_px, d.kappa_px, d.D_mm)
+    assert abs(back["focal_length_mm"] - 35.0) < 0.05
+    assert abs(back["lens_to_mla_mm"] - 41.5) < 0.05
+    assert abs(back["mla_to_sensor_mm"] - 0.9) < 0.005
+
+
+def test_square_size_advice_is_actionable():
+    from trilobite.calibration.settings import BoardSpec, DerivedOptics, NominalOptics
+
+    optics = NominalOptics(working_distance_mm=2000.0)
+    too_big = DerivedOptics.compute(optics, BoardSpec(square_mm=20.0), 100.0)
+    assert too_big.square_verdict == "too_big"
+    # The advice must actually land in the band when followed.
+    lo = float(too_big.note.split("use ")[1].split("-")[0])
+    fixed = DerivedOptics.compute(optics, BoardSpec(square_mm=lo * 1.2), 100.0)
+    assert fixed.square_verdict == "ok", (lo, fixed.square_px)
+
+
+def test_working_distance_at_the_centre_plane_is_flagged_not_infinite():
+    """Z = D is where the sub-camera projection centre sits: the model is
+    singular there and must say so rather than emit a huge number."""
+    from trilobite.calibration.settings import BoardSpec, DerivedOptics, NominalOptics
+
+    d = DerivedOptics.compute(
+        NominalOptics(focal_length_mm=50.0, lens_to_mla_mm=55.0,
+                      mla_to_sensor_mm=1.2, working_distance_mm=550.0),
+        BoardSpec(), 100.0,
+    )
+    assert d.square_verdict == "singular"
+    assert "singular" in d.note
+
+
+def _cal_app(tmp_path, enabled=True, derotate=False, pitch=100.0):
+    from trilobite.app import Application
+    from trilobite.config import AppConfig, StageConfig, StorageConfig
+
+    cfg = AppConfig(
+        cameras=[CameraConfig(
+            cam_id="left", backend="synthetic", fps=1000, preview_resolution=(64, 48),
+            pipeline=[StageConfig(type="mla_grid_overlay", name="mla", params={
+                "enabled": enabled, "pitch_px": pitch, "derotate_views": derotate,
+            })],
+        )],
+        storage=StorageConfig(root=str(tmp_path / "d")),
+    )
+    return Application(cfg)
+
+
+def test_readiness_blocks_on_disabled_mla(tmp_path):
+    app = _cal_app(tmp_path, enabled=False)
+    app.start()
+    try:
+        r = app.calibration_readiness()
+        assert r["ready"] is False
+        assert any("disabled" in m for m in r["blocking_failures"])
+    finally:
+        app.stop()
+
+
+def test_readiness_blocks_on_derotation(tmp_path):
+    """Resampled tiles would blur the corners the whole session depends on."""
+    app = _cal_app(tmp_path, derotate=True)
+    app.start()
+    try:
+        r = app.calibration_readiness()
+        assert r["ready"] is False
+        assert any("derotate" in m for m in r["blocking_failures"])
+    finally:
+        app.stop()
+
+
+def test_default_grid_warns_but_does_not_block(tmp_path):
+    """20 px is a legal pitch, so an untouched-looking grid is advice, not a
+    refusal -- blocking on it would be wrong for a rig that genuinely wants it."""
+    app = _cal_app(tmp_path, pitch=20.0)
+    app.start()
+    try:
+        r = app.calibration_readiness()
+        assert r["ready"] is True
+        assert any("alignment" in w for w in r["warnings"])
+    finally:
+        app.stop()
+
+
+def test_readiness_passes_when_aligned(tmp_path):
+    app = _cal_app(tmp_path)
+    app.start()
+    try:
+        assert app.calibration_readiness()["ready"] is True
+    finally:
+        app.stop()
+
+
+def test_calibration_settings_persist(tmp_path):
+    from trilobite.app import Application
+    from trilobite.config import AppConfig, StageConfig, StorageConfig
+
+    def cfg():
+        return AppConfig(
+            cameras=[CameraConfig(cam_id="left", backend="synthetic", fps=1000,
+                                  preview_resolution=(32, 24),
+                                  pipeline=[StageConfig(type="levels", name="display")])],
+            storage=StorageConfig(root=str(tmp_path / "d")),
+        )
+
+    state = tmp_path / "s.state.json"
+    a = Application(cfg(), state_path=state)
+    a.start()
+    a.calibration.board.square_mm = 12.5
+    a.calibration.acceptance.target_per_tile = 4
+    a.mark_dirty()
+    a.stop()
+
+    b = Application(cfg(), state_path=state)
+    b.start()
+    try:
+        assert b.calibration.board.square_mm == 12.5
+        assert b.calibration.acceptance.target_per_tile == 4
+    finally:
+        b.stop()

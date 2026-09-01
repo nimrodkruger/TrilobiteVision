@@ -1,27 +1,28 @@
 """Plenoptic-specific stages.
 
-A note on `derotate_views`, because it encodes a physical assumption you should
-make deliberately rather than inherit.
+`derotate_views` defaults to **off**, and that is a physical statement about
+this rig, not a display preference.
 
-An apparent rotation of the lenslet grid relative to the sensor rows has two
-possible causes, and they call for opposite handling:
+An apparent rotation of the lenslet grid has two possible causes:
 
-  * **The sensor is rotated relative to the optical assembly.** Then the sensor
-    samples a rotated version of everything, and each microlens image is
-    rotated by the same angle as the lattice. De-rotating the tile is correct
-    and restores the true field.
+  * **Sensor rotated relative to the optical assembly** -- the sensor samples a
+    rotated version of everything, so each micro-image is rotated by the same
+    angle as the lattice, and de-rotating restores the true field.
 
-  * **The MLA is rotated relative to the sensor, with the main objective
-    square to the sensor.** Then only the *lattice of centres* is rotated. Each
-    lenslet is a rotationally symmetric element re-imaging an intermediate
-    image that has not moved, so the tile content is NOT rotated. De-rotating
-    it introduces a rotation that was never there.
+  * **MLA rotated relative to the sensor**, main objective square to it. Only
+    the *lattice of centres* rotates. Each lenslet is a rotationally symmetric
+    element re-imaging an intermediate image that has not moved, so the tile
+    content is NOT rotated. De-rotating introduces a rotation that was never
+    there and resamples the data for nothing.
 
-Both look identical in the grid overlay. Default is on, because it also makes
-the tiles directly comparable to each other, which is what you want while
-aligning. If your rotation comes from the MLA mount rather than the sensor
-mount, turn it off before extracting anything you intend to measure. The
-saved sidecar records the flag either way.
+**This rig is the second case** (confirmed for TrilobiteVision), so the default
+is off: the tiles are plain crops, unresampled, and the rotation lives entirely
+in the lattice matrix. See docs/calibration-spec.md section 1 -- there is no
+rotation term anywhere in the projection model, for exactly this reason.
+
+Turn it on only to eyeball tiles side by side during alignment, and never for
+anything you intend to measure: bilinear resampling of a 100 px tile softens
+the corners that the calibration depends on.
 
 The grid overlay is an alignment aid, not a measurement -- it draws on the
 preview only. Its parameters (pitch, rotation, offset) are the same numbers the
@@ -64,8 +65,12 @@ class MLAParams(StageParams):
         1.0, gt=0.1, le=4.0, description="Sub-aperture crop side, as a multiple of pitch"
     )
     derotate_views: bool = Field(
-        True,
-        description="Resample sub-aperture tiles into the lattice axes (see docstring)",
+        False,
+        description=(
+            "Resample sub-aperture tiles into the lattice axes. Off for this rig: "
+            "the MLA is rotated relative to the sensor, so tile content is not "
+            "rotated and resampling would only blur it. See the module docstring."
+        ),
     )
 
 

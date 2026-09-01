@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .bus import LatestFrame
+from .calibration import CalibrationSettings, DerivedOptics, readiness_report
 from .cameras.base import CameraSource
 from .cameras.registry import build_camera
 from .config import AppConfig, CameraConfig
@@ -233,6 +234,10 @@ class Application:
             c.cam_id: CameraRuntime(c, self.writer) for c in cfg.cameras
         }
         self.started_at = time.time()
+        # Declared before a session, frozen once one starts. Persisted with
+        # everything else so the board and acceptance settings survive a
+        # restart mid-way through a calibration afternoon.
+        self.calibration = CalibrationSettings()
         self.restore = restore
         self.state = StateStore(Path(state_path), self._state_snapshot) if state_path else None
         self.restore_notes: list[str] = []
@@ -243,7 +248,29 @@ class Application:
         return {
             "config": str(getattr(self.cfg, "source_path", "") or ""),
             "cameras": {cid: cam.state_snapshot() for cid, cam in self.cameras.items()},
+            "calibration": self.calibration.model_dump(),
         }
+
+    # -- calibration ------------------------------------------------------
+
+    def calibration_readiness(self) -> dict[str, Any]:
+        return readiness_report(list(self.cameras.values()))
+
+    def calibration_derived(self) -> dict[str, Any]:
+        """Nominal optics -> the numbers that decide whether the board is right.
+
+        Uses the first camera's grid pitch, since the two heads share a design
+        and the figure is an aid to choosing a target, not a measurement.
+        """
+        pitch = 100.0
+        for cam in self.cameras.values():
+            stage = cam.mla_stage()
+            if stage is not None:
+                pitch = float(stage.params.pitch_px)
+                break
+        return DerivedOptics.compute(
+            self.calibration.optics, self.calibration.board, pitch
+        ).model_dump()
 
     def mark_dirty(self) -> None:
         """Call after any parameter or control change so autosave picks it up."""
@@ -254,6 +281,11 @@ class Application:
         if not (self.state and self.restore):
             return
         data = self.state.load()
+        if "calibration" in data:
+            try:
+                self.calibration = CalibrationSettings.model_validate(data["calibration"])
+            except Exception as exc:
+                self.restore_notes.append(f"calibration settings not restored ({exc})")
         for cam_id, cam_state in (data.get("cameras") or {}).items():
             cam = self.cameras.get(cam_id)
             if cam is None:

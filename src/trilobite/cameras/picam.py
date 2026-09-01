@@ -64,11 +64,27 @@ class Picamera2Source(CameraSource):
             ) from exc
 
         available = Picamera2.global_camera_info()
+        if not available:
+            # Zero cameras is a different failure from "index too high", and it
+            # has a different first suspect. libcamera opens the media devices
+            # exclusively while enumerating, so another process holding them
+            # makes the cameras disappear entirely rather than fail to acquire
+            # -- which reads as absent hardware and sends you to the cables
+            # when the real cause is a stale process.
+            raise RuntimeError(
+                f"{self.cam_id}: libcamera reports no cameras at all. Most likely "
+                f"another process is holding them (a previous run, or the "
+                f"trilobite service) -- check with "
+                f"\"pgrep -af 'trilobite|rpicam'\". Otherwise the overlays may be "
+                f"missing from /boot/firmware/config.txt, or a ribbon is loose. "
+                f"Run 'bash scripts/diagnose_cameras.sh' for a full diagnosis."
+            )
         if self.cfg.index >= len(available):
             raise RuntimeError(
-                f"camera index {self.cfg.index} requested but libcamera reports "
-                f"{len(available)} camera(s): {available}. Check "
-                f"/boot/firmware/config.txt and 'rpicam-hello --list-cameras'."
+                f"{self.cam_id}: camera index {self.cfg.index} requested but "
+                f"libcamera reports {len(available)}: {available}. Check the "
+                f"'index' values in the config against "
+                f"'python scripts/probe_cameras.py'."
             )
         self._info = available[self.cfg.index]
 

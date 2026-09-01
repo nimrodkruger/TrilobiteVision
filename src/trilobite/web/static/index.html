@@ -99,6 +99,65 @@
                               width:15px; height:15px; }
   .empty { color:var(--muted); font-size:11px; padding:4px 0; }
 
+  /* --- mode switch ------------------------------------------------------ */
+  .modes { display:flex; gap:0; border:1px solid var(--line); border-radius:7px;
+           overflow:hidden; }
+  .modes button { background:transparent; color:var(--muted); border:0;
+                  border-radius:0; padding:5px 13px; font-weight:600; }
+  .modes button.on { background:var(--accent); color:#08101f; }
+
+  /* --- calibration dashboard -------------------------------------------- */
+  main.cal { grid-template-columns:352px 1fr; align-items:stretch; }
+  .rail { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+          overflow-y:auto; padding:10px; display:flex; flex-direction:column;
+          gap:10px; min-height:0; scrollbar-width:thin; }
+  .stage { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+           padding:12px; overflow-y:auto; min-height:0; display:flex;
+           flex-direction:column; gap:12px; scrollbar-width:thin; }
+
+  .derived { display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr));
+             gap:8px; }
+  .kpi { background:var(--panel2); border:1px solid var(--line); border-radius:8px;
+         padding:8px 10px; }
+  .kpi .k { font-size:10px; color:var(--muted); text-transform:uppercase;
+            letter-spacing:.04em; }
+  .kpi .v { font-size:17px; font-variant-numeric:tabular-nums; margin-top:2px; }
+  .kpi .u { font-size:10px; color:var(--muted); margin-left:3px; }
+  .kpi.ok  .v { color:var(--ok); }
+  .kpi.warn .v { color:var(--warn); }
+  .kpi.err  .v { color:var(--err); }
+  .verdict { font-size:11px; color:var(--muted); line-height:1.5; }
+  .verdict.warn { color:var(--warn); } .verdict.err { color:var(--err); }
+
+  .checks { display:flex; flex-direction:column; gap:4px; }
+  .chk { display:flex; gap:8px; align-items:baseline; font-size:11px;
+         font-family:ui-monospace,monospace; }
+  .chk .mark { width:14px; flex:none; }
+  .chk.pass .mark { color:var(--ok); }
+  .chk.warn .mark { color:var(--warn); }
+  .chk.fail .mark { color:var(--err); }
+  .chk.pass { color:var(--muted); }
+  .chk.warn { color:var(--warn); }
+  .chk.fail { color:var(--err); }
+
+  .calviews { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .calview { background:var(--panel2); border:1px solid var(--line); border-radius:8px;
+             overflow:hidden; }
+  .calview h3 { margin:0; padding:6px 10px; font-size:12px; font-weight:650;
+                border-bottom:1px solid var(--line); display:flex; gap:8px; }
+  .calview h3 .stat { margin-left:auto; color:var(--muted); font-size:10px;
+                      font-weight:400; font-variant-numeric:tabular-nums; }
+  .calview img { display:block; width:100%; height:30vh; object-fit:contain;
+                 background:#000; }
+
+  .sectitle { font-size:11px; text-transform:uppercase; letter-spacing:.05em;
+              color:var(--muted); font-weight:650; }
+  .startbar { display:flex; gap:9px; align-items:center; flex-wrap:wrap;
+              border-top:1px solid var(--line); padding-top:10px; }
+  .startbar .why { font-size:11px; color:var(--muted); font-family:ui-monospace,monospace; }
+  .frozen { font-size:11px; color:var(--muted); font-family:ui-monospace,monospace;
+            line-height:1.6; }
+
   footer { padding:6px 16px; border-top:1px solid var(--line); background:var(--panel);
            color:var(--muted); font-family:ui-monospace,monospace; font-size:11px;
            white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
@@ -111,8 +170,14 @@
   <h1>TrilobiteVision</h1>
   <span class="meta" id="session">&mdash;</span>
   <span class="spacer"></span>
-  <button id="all-raw">Save raw — both</button>
-  <button class="ghost" id="all-view">Save view — both</button>
+  <span class="modes">
+    <button id="mode-live" class="on">Imaging</button>
+    <button id="mode-cal">Calibration</button>
+  </span>
+  <span id="live-actions">
+    <button id="all-raw">Save raw — both</button>
+    <button class="ghost" id="all-view">Save view — both</button>
+  </span>
 </header>
 
 <main id="cams"></main>
@@ -410,7 +475,7 @@ async function refreshSubaps(camId) {
   }
 }
 
-async function build() {
+async function buildLive() {
   const cams = await jget("/api/cameras");
   const root = $("#cams");
   root.innerHTML = "";
@@ -470,6 +535,244 @@ async function build() {
   });
 }
 
+
+/* ===========================================================================
+   CALIBRATION DASHBOARD
+
+   A separate mode, not a panel bolted onto the imaging view. Alignment and
+   calibration are different jobs with different instruments: during alignment
+   you stare at the image, during a calibration session you stare at coverage.
+   Sharing one screen would mean every control on it is wrong half the time.
+
+   Switching is free and reversible in both directions -- nothing is running
+   yet, and once detection exists the switch will confirm before abandoning an
+   open session rather than becoming a one-way door.
+   =========================================================================== */
+
+let MODE = "live";
+let CAL = null;          // settings object, mirrored from the server
+let CAL_SCHEMA = null;
+let readinessTimer = null;
+
+/* Field limits and help text come from the pydantic schema, same as the
+   pipeline panels: the server owns validation, the page owns layout. */
+function resolveGroup(schema, key) {
+  const ref = schema?.properties?.[key]?.$ref || schema?.properties?.[key]?.allOf?.[0]?.$ref;
+  if (!ref) return {};
+  const name = ref.split("/").pop();
+  return schema.$defs?.[name]?.properties || {};
+}
+
+function calGroup(title, groupKey, fields) {
+  const body = document.createElement("div");
+  const props = resolveGroup(CAL_SCHEMA, groupKey);
+  for (const f of fields) {
+    const spec = props[f] || {};
+    const commit = async (key, v) => {
+      const next = JSON.parse(JSON.stringify(CAL));
+      next[groupKey][key] = v;
+      try {
+        const r = await jsend("/api/calibration/settings", next, "PUT");
+        CAL = r.settings;
+        renderDerived(r.derived);
+        log(`${groupKey}.${key} = ${r.settings[groupKey][key]}`, "ok");
+        return r.settings[groupKey][key];
+      } catch (e) {
+        log(`${groupKey}.${key}: ${e.message}`, "err");
+        throw e;
+      }
+    };
+    body.appendChild(makeRow(f, spec, CAL[groupKey][f], commit));
+  }
+  return makePanel(title, groupKey, body, false);
+}
+
+function kpi(label, value, unit, cls = "") {
+  return `<div class="kpi ${cls}"><div class="k">${label}</div>` +
+         `<div class="v">${value}<span class="u">${unit || ""}</span></div></div>`;
+}
+
+function renderDerived(d) {
+  const host = $("#cal-derived");
+  if (!host || !d) return;
+  const vclass = { ok: "ok", too_small: "warn", too_big: "warn", singular: "err" }[d.square_verdict];
+  host.innerHTML =
+    kpi("focal length", d.f_px, "px") +
+    kpi("centre plane D", d.D_mm, "mm") +
+    kpi("κ", d.kappa_px, "") +
+    kpi("baseline", d.baseline_mm, "mm") +
+    kpi("square on sensor", d.square_px, "px", vclass);
+  const note = $("#cal-verdict");
+  note.textContent = d.note || "";
+  note.className = "verdict " + (d.square_verdict === "ok" ? "" :
+                                 d.square_verdict === "singular" ? "err" : "warn");
+}
+
+function renderReadiness(r) {
+  const host = $("#cal-checks");
+  if (!host) return;
+  host.innerHTML = "";
+  for (const c of r.checks) {
+    const cls = c.ok ? "pass" : (c.blocking ? "fail" : "warn");
+    const mark = c.ok ? "✓" : (c.blocking ? "✕" : "!");
+    const row = document.createElement("div");
+    row.className = "chk " + cls;
+    row.innerHTML = `<span class="mark">${mark}</span><span></span>`;
+    row.lastChild.textContent = c.message;
+    host.appendChild(row);
+  }
+  const btn = $("#cal-start");
+  const why = $("#cal-why");
+  if (btn) {
+    btn.disabled = !r.ready;
+    why.textContent = r.ready
+      ? (r.warnings.length ? `${r.warnings.length} advisory warning(s)` : "preconditions met")
+      : `blocked: ${r.blocking_failures.length} precondition(s)`;
+    why.style.color = r.ready ? "" : "var(--err)";
+  }
+}
+
+async function buildCalibration() {
+  const cams = await jget("/api/cameras");
+  const cfg = await jget("/api/calibration/settings");
+  CAL = cfg.settings; CAL_SCHEMA = cfg.schema;
+
+  const root = $("#cams");
+  root.className = "cal";
+  root.innerHTML = "";
+
+  // ---- left rail: everything you set before a session -----------------
+  const rail = document.createElement("div");
+  rail.className = "rail";
+  rail.appendChild(calGroup("Board", "board", ["cols", "rows", "square_mm"]));
+  rail.appendChild(calGroup("Optics (nominal)", "optics",
+    ["focal_length_mm", "lens_to_mla_mm", "mla_to_sensor_mm", "working_distance_mm"]));
+  rail.appendChild(calGroup("Acceptance", "acceptance",
+    ["min_corners_per_tile", "min_cross_tiles", "target_per_tile",
+     "move_fraction", "move_rotation_deg"]));
+
+  // Exposure and gain only. No pipeline, no MLA -- alignment is finished
+  // before entering, and its parameters are frozen (shown below, read-only).
+  for (const cam of cams) {
+    const panel = await buildSensorPanel(cam.cam_id);
+    panel.querySelector(".hdr strong").textContent = `Sensor — ${cam.label || cam.cam_id}`;
+    rail.appendChild(panel);
+  }
+
+  // ---- right: derived numbers, checks, live views, start --------------
+  const stage = document.createElement("div");
+  stage.className = "stage";
+  stage.innerHTML = `
+    <div>
+      <div class="sectitle">What the nominal optics imply</div>
+      <div class="derived" id="cal-derived" style="margin-top:8px"></div>
+      <div class="verdict" id="cal-verdict" style="margin-top:8px"></div>
+    </div>
+    <div>
+      <div class="sectitle">Preconditions</div>
+      <div class="checks" id="cal-checks" style="margin-top:8px"></div>
+    </div>
+    <div>
+      <div class="sectitle">Frozen alignment</div>
+      <div class="frozen" id="cal-frozen" style="margin-top:6px"></div>
+    </div>
+    <div>
+      <div class="sectitle">Live</div>
+      <div class="calviews" id="cal-views" style="margin-top:8px"></div>
+    </div>
+    <div class="startbar">
+      <button id="cal-start">Start calibration</button>
+      <span class="why" id="cal-why"></span>
+    </div>`;
+
+  const views = stage.querySelector("#cal-views");
+  for (const cam of cams) {
+    const v = document.createElement("div");
+    v.className = "calview";
+    v.innerHTML = `<h3><span class="t"></span>
+                     <span class="stat" data-fps="${cam.cam_id}">&mdash;</span></h3>
+                   <img src="/stream/${cam.cam_id}.mjpg" alt="preview">
+                   <div class="actions"><span class="note" data-note="${cam.cam_id}"></span></div>`;
+    v.querySelector(".t").textContent = cam.label || cam.cam_id;
+    views.appendChild(v);
+  }
+
+  root.append(rail, stage);
+
+  // The MLA parameters are what crop the micro-images, so they are shown but
+  // not editable here: changing them mid-session would silently invalidate
+  // every corner already recorded.
+  const frozen = $("#cal-frozen");
+  frozen.innerHTML = "";
+  for (const cam of cams) {
+    try {
+      const stages = await jget(`/api/pipeline/${cam.cam_id}`);
+      const mla = stages.find(s => s.type === "mla_grid_overlay");
+      const line = document.createElement("div");
+      line.textContent = mla
+        ? `${cam.cam_id}: pitch ${mla.values.pitch_px} px, rot ${mla.values.rotation_deg}°, ` +
+          `offset (${mla.values.offset_x}, ${mla.values.offset_y}), ` +
+          `derotate ${mla.values.derotate_views ? "ON" : "off"}`
+        : `${cam.cam_id}: no MLA stage`;
+      frozen.appendChild(line);
+    } catch { /* readiness will report it */ }
+  }
+
+  renderDerived(cfg.derived);
+
+  $("#cal-start").onclick = async ev => {
+    const btn = ev.currentTarget;
+    btn.disabled = true;
+    try {
+      await jsend("/api/calibration/start");
+      log("calibration started", "ok");
+    } catch (e) {
+      // Expected for now: the endpoint returns 501 with an explanation, and
+      // showing it verbatim removes any doubt about whether the click landed.
+      log(e.message, "warn");
+    } finally {
+      btn.disabled = false;
+    }
+  };
+
+  await refreshReadiness();
+  readinessTimer = setInterval(refreshReadiness, 2000);
+}
+
+async function refreshReadiness() {
+  if (MODE !== "cal") return;
+  try { renderReadiness(await jget("/api/calibration/readiness")); } catch { /* transient */ }
+}
+
+async function setMode(mode) {
+  if (mode === MODE) return;
+  MODE = mode;
+  if (readinessTimer) { clearInterval(readinessTimer); readinessTimer = null; }
+
+  // Replacing <main> drops the <img> elements, which closes their MJPEG
+  // connections. That matters: the browser's ~6-connection budget is the
+  // constraint the whole streaming design is built around, and leaking a
+  // stream per mode switch would exhaust it after three switches.
+  for (const k of Object.keys(SENSOR_ROWS)) delete SENSOR_ROWS[k];
+  const root = $("#cams");
+  root.className = "";
+  root.innerHTML = "";
+
+  $("#mode-live").classList.toggle("on", mode === "live");
+  $("#mode-cal").classList.toggle("on", mode === "cal");
+  $("#live-actions").hidden = mode !== "live";
+
+  try {
+    if (mode === "cal") { await buildCalibration(); log("calibration mode"); }
+    else { await buildLive(); log("imaging mode"); }
+  } catch (e) {
+    log(`${mode} mode failed to build: ${e.message}`, "err");
+  }
+}
+
+$("#mode-live").onclick = () => setMode("live");
+$("#mode-cal").onclick = () => setMode("cal");
+
 async function saveAll(kind, btn) {
   // Feedback lands in three places on purpose: the button itself (so the
   // click is visibly acknowledged even before the write finishes), each
@@ -518,6 +821,7 @@ $("#all-view").onclick = ev => saveAll("view", ev.currentTarget);
    short request that completes and gives its connection back. */
 const TILE_HZ = 4;
 function pollTiles() {
+  if (MODE !== "live") { setTimeout(pollTiles, 1000 / TILE_HZ); return; }
   for (const img of document.querySelectorAll("[data-tile]")) {
     // Skip while a previous load is still in flight, so a slow encode cannot
     // build a backlog of requests.
@@ -550,12 +854,13 @@ async function poll() {
     }
     // Sub-aperture indices shift as pitch changes; refresh captions at a low
     // rate rather than on every keystroke.
-    if (++tick % 3 === 0) s.cameras.forEach(c => refreshSubaps(c.cam_id));
+    if (MODE === "live" && ++tick % 3 === 0) s.cameras.forEach(c => refreshSubaps(c.cam_id));
   } catch (e) { /* transient; the streams themselves show a stall */ }
   setTimeout(poll, 1000);
 }
 
-build().then(() => { poll(); pollTiles(); }).catch(e => log("startup: " + e.message, "err"));
+buildLive().then(() => { poll(); pollTiles(); })
+          .catch(e => log("startup: " + e.message, "err"));
 </script>
 </body>
 </html>

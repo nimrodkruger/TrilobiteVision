@@ -39,6 +39,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
 
 from ..app import Application, CameraRuntime
+from ..calibration import CalibrationSettings
 from ..config import StageConfig
 from ..optics.mla import UI_SUBAPERTURES
 from ..processing.registry import catalogue
@@ -330,6 +331,70 @@ def create_app(application: Application) -> FastAPI:
             "effective": cam.source.requested_controls(),
             "live": cam.live_controls(),
         }
+
+    # -- calibration -------------------------------------------------------
+    #
+    # The dashboard is a client-side mode, but its settings are server state:
+    # they are frozen into the session record when a run starts, and they must
+    # survive a browser reload mid-afternoon. Keeping them here also means the
+    # readiness checks run against the live pipeline rather than against what
+    # the page last happened to hear about it.
+
+    @api.get("/api/calibration/settings")
+    def get_calibration_settings() -> dict[str, Any]:
+        return {
+            "settings": application.calibration.model_dump(),
+            "schema": CalibrationSettings.model_json_schema(),
+            "derived": application.calibration_derived(),
+        }
+
+    @api.put("/api/calibration/settings")
+    def put_calibration_settings(body: dict[str, Any]) -> dict[str, Any]:
+        """Whole-object update. Returns the stored settings and what they imply.
+
+        Whole-object rather than per-field because the derived optics depend on
+        several at once: a partial update would report a square size computed
+        from a mix of old and new values, which is worse than no number.
+        """
+        try:
+            application.calibration = CalibrationSettings.model_validate(body)
+        except ValidationError as exc:
+            raise HTTPException(422, json.loads(exc.json())) from None
+        application.mark_dirty()
+        return {
+            "settings": application.calibration.model_dump(),
+            "derived": application.calibration_derived(),
+        }
+
+    @api.get("/api/calibration/readiness")
+    def calibration_readiness() -> dict[str, Any]:
+        """Preconditions, split into blocking and advisory."""
+        return application.calibration_readiness()
+
+    @api.post("/api/calibration/start")
+    def calibration_start() -> dict[str, Any]:
+        """Not implemented yet -- deliberately.
+
+        The dashboard, its settings and the readiness gate are in place; corner
+        detection and the session recorder are not. Returning 501 with a plain
+        explanation is better than a button that appears to work: the UI shows
+        this message verbatim, so there is no ambiguity about whether the click
+        registered.
+        """
+        readiness = application.calibration_readiness()
+        if not readiness["ready"]:
+            raise HTTPException(409, {
+                "error": "preconditions not met",
+                "blocking": readiness["blocking_failures"],
+            })
+        raise HTTPException(501, {
+            "error": "detection not implemented yet",
+            "detail": (
+                "Settings and preconditions are wired up; corner detection and "
+                "the session recorder are the next piece. See "
+                "docs/calibration-ui-spec.md sections 4 and 5."
+            ),
+        })
 
     # -- capture ----------------------------------------------------------
 
