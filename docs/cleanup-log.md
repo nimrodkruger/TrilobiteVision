@@ -1,6 +1,6 @@
 # Cleanup log
 
-Removals, and how to undo them. Newest first.
+Removals and behavioural changes, and how to undo them. Newest first.
 
 Everything here is recoverable from git, because nothing is removed that was
 not already committed. The general rollback is:
@@ -12,7 +12,54 @@ git checkout .              # everything back to HEAD
 
 ---
 
-## 2026-09-01 — leftovers from the flyeye rename, and unused code
+## 2026-09-01 (b) — after the first run on the rig
+
+Two field failures: starting calibration took the Pi down, and an external disk
+was never offered. Both turned out to be missing bounds rather than broken
+logic, so the changes are additive and each one can be turned off in the UI.
+
+### Detection can no longer ask for unbounded work
+
+| change | where | revert by |
+|---|---|---|
+| `max_tiles` (320) — a blocking precondition, re-checked inside the worker | `calibration/settings.py`, `calibration/detect.py` | raise the limit in the Detection panel |
+| `concurrent_cameras` (1) — one shared semaphore, so cameras take turns | `app.py`, `calibration/detect.py` | set it to 2 |
+| `max_duty` (0.5) — a worker sleeps until its busy fraction is under this | `calibration/detect.py` | set it to 1.0 |
+| `nice(10)` on detection threads | `calibration/detect.py` | no switch; delete the two lines in `_run` |
+
+The old behaviour is `max_tiles=4000, concurrent_cameras=2, max_duty=1.0`,
+which reproduces exactly what ran on the rig.
+
+### Host health
+
+New `src/trilobite/health.py`, read-only: CPU temperature, load, free memory,
+and the decoded bits of `vcgencmd get_throttled`. Surfaced in `/api/status` and
+in the header. It has no effect on behaviour — remove the `"health"` key from
+`Application.status()` to drop it.
+
+`scripts/diagnose_host.sh` is new and standalone; nothing calls it.
+
+### Storage now sees unmounted disks
+
+The enumerator read only `/proc/mounts`, so a disk that nothing had mounted did
+not exist as far as it was concerned — which is the normal state of a USB drive
+on a headless Pi. It now merges `lsblk`, falls back to `blkid` when udev has
+not recorded a filesystem type, and offers a Mount action via `udisksctl`.
+
+`udisks2` and `ntfs-3g` added to `apt-packages.txt`. Without `udisks2` the disk
+is still listed; only the Mount button stops working.
+
+### Verification
+
+`ruff` clean; 99 tests pass (16 new). The storage path was exercised against a
+real loopback ext4 filesystem through the browser: discovered unmounted,
+mounted, selected, captured to, released, unmounted. The tile guard was
+exercised by setting a pitch that yields 6097 tiles and confirming the button
+refuses with that number in the message.
+
+---
+
+## 2026-09-01 (a) — leftovers from the flyeye rename, and unused code
 
 Not committed. The whole change set is in the working tree, so
 `git status` lists it and `git checkout .` reverses all of it at once.

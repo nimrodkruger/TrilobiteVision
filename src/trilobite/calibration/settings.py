@@ -114,6 +114,38 @@ class DetectionSpec(BaseModel):
     # place only when a micro-image is too unevenly lit for the pattern to be
     # found at all -- which is a real possibility with vignetted lenslets, and
     # exactly why this is a switch and not a decision made here.
+    # --- load limits ----------------------------------------------------
+    #
+    # These exist because the first run on the real rig took the Pi down. The
+    # cost of a pass is (tiles x cameras x ~5 ms) and *nothing* in the earlier
+    # version bounded any of those three factors: with the grid left near its
+    # default pitch the geometry yields ~900 whole tiles instead of ~130, two
+    # worker threads then ran that continuously and in parallel, and a Pi 5
+    # with two cameras at four-core saturation browns out or throttles.
+    #
+    # A detector that can be asked to do an unbounded amount of work is a
+    # defect regardless of what the hardware does about it, so the bound is
+    # here rather than in advice.
+    max_tiles: int = Field(
+        320, ge=1, le=4000, title="Max tiles per pass",
+        description="Refuse to start if the grid yields more whole tiles than "
+                    "this. A 14x10 array is ~130; several hundred means the "
+                    "pitch is wrong, not that the array is large.",
+        json_schema_extra={"widget": "box"})
+    max_duty: float = Field(
+        0.5, ge=0.05, le=1.0, title="Max CPU duty",
+        description="Fraction of the time a detection worker may be busy. "
+                    "After a pass lasting T it sleeps until the fraction is "
+                    "met, so a slow pass costs frequency rather than the whole "
+                    "core. 0.5 leaves half of one core per camera free.",
+        json_schema_extra={"widget": "box"})
+    concurrent_cameras: int = Field(
+        1, ge=1, le=4, title="Cameras detecting at once",
+        description="1 means the cameras take turns. Two full-frame detection "
+                    "passes running together doubles the peak current draw, "
+                    "which is what a marginal Pi 5 supply notices first.",
+        json_schema_extra={"widget": "box"})
+
     normalize_illumination: bool = Field(
         False, title="Normalise illumination",
         description="CALIB_CB_NORMALIZE_IMAGE. Turn on only if vignetting stops "
@@ -271,6 +303,29 @@ def _full_resolution(cam: Any) -> tuple[int, int]:
     return (1456, 1088)
 
 
+# Rough per-tile cost of findChessboardCornersSB on a 100 px micro-image on a
+# Pi 5. Measured at 1.9 ms on an x86 desktop; the Pi is about three times
+# slower. Used only to turn a tile count into a number of seconds a human can
+# judge, so being 50% out does not matter -- being absent did.
+MS_PER_TILE_PI = 6.0
+
+
+def _preview_resolution(cam: Any) -> tuple[int, int] | None:
+    """(width, height) of the stream the MLA parameters were set against.
+
+    Needed because the stage only learns its reference resolution from the
+    first preview frame, and readiness is asked before that frame exists --
+    at which point falling back to the *sensor* resolution silently divides the
+    pitch by two and reports thousands of tiles. The configured preview size is
+    known without waiting for anything.
+    """
+    try:
+        w, h = cam.source.describe().preview_resolution
+        return (int(w), int(h)) if w and h else None
+    except Exception:
+        return None
+
+
 def _cv2_check() -> Check:
     """Is the corner detector's one hard dependency actually here?
 
@@ -384,6 +439,63 @@ def readiness_report(
             ),
         ))
 
+        # How much work is one pass, actually? This is the check the first
+        # field run needed and did not have. Detection cost is linear in the
+        # number of whole tiles, and the number of whole tiles is quadratic in
+        # 1/pitch: at the default 20 px preview pitch a 1456 px sensor yields
+        # about 900 tiles rather than the ~130 a correctly aligned 100 px grid
+        # gives. Seven times the work, on a board that was already close to its
+        # thermal and power limits with two cameras running.
+        #
+        # Blocking, because the number is knowable before anything starts and
+        # the only thing that produces it is a wrong pitch.
+        full_w, full_h = _full_resolution(cam)
+        ref = (getattr(stage, "reference_shape", None)
+               or _preview_resolution(cam) or (full_w, full_h))
+        limit = int(settings.detection.max_tiles) if settings else 320
+        det_geom = None
+        scale_error = ""
+        try:
+            det_geom = stage.geometry(*ref).rescaled(full_w, full_h)
+            n_tiles = len(det_geom.whole_indices(scale, derotate=derot))
+        except (ValueError, ZeroDivisionError) as exc:
+            n_tiles, scale_error = 0, str(exc)
+
+        if scale_error:
+            message = (
+                f"{cid}: the preview ({ref[0]}x{ref[1]}) and the sensor frame "
+                f"({full_w}x{full_h}) do not share an aspect ratio, so the grid "
+                f"you aligned cannot be transferred to the frame detection runs "
+                f"on. Fix preview_resolution in the config. ({scale_error})"
+            )
+        elif n_tiles == 0:
+            message = (
+                f"{cid}: the grid yields no whole tiles at {det_geom.pitch:.0f} px "
+                f"on the sensor. Check pitch and offsets -- a pitch larger than "
+                f"the frame gives exactly this."
+            )
+        elif n_tiles > limit:
+            message = (
+                f"{cid}: {n_tiles} whole tiles exceeds the limit of {limit}. At "
+                f"~{MS_PER_TILE_PI:.0f} ms each that is "
+                f"{n_tiles * MS_PER_TILE_PI / 1000.0:.0f} s of solid CPU per pass "
+                f"per camera, which is what took the Pi down the first time. A "
+                f"pitch of {det_geom.pitch:.0f} px on the sensor gives this many "
+                f"micro-images; a real 100 px grid gives about 130. Fix the "
+                f"alignment, or raise the limit in Detection if the array really "
+                f"is this large."
+            )
+        else:
+            message = (
+                f"{cid}: {n_tiles} whole tiles at {det_geom.pitch:.0f} px on the "
+                f"sensor, about {n_tiles * MS_PER_TILE_PI / 1000.0:.1f} s per pass "
+                f"on a Pi"
+            )
+        checks.append(Check(
+            id=f"{cid}.tile_count", ok=0 < n_tiles <= limit, blocking=True,
+            message=message,
+        ))
+
         # Can the board even fit inside a micro-image? This is the check that
         # would otherwise cost an afternoon: every tile detects nothing, the
         # detector looks broken, and the actual answer is that a 9x6 board at
@@ -393,7 +505,8 @@ def readiness_report(
         # detection runs -- see MLAGridOverlay.geometry_for.
         if settings is not None:
             full_w, full_h = _full_resolution(cam)
-            ref = getattr(stage, "reference_shape", None) or (full_w, full_h)
+            ref = (getattr(stage, "reference_shape", None)
+               or _preview_resolution(cam) or (full_w, full_h))
             factor = (full_w / ref[0]) if ref[0] else 1.0
             tile_px = float(p.pitch_px) * factor * scale
             derived = DerivedOptics.compute(settings.optics, settings.board, tile_px)

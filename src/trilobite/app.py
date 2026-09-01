@@ -20,6 +20,7 @@ from .calibration import CalibrationSettings, DerivedOptics, readiness_report
 from .cameras.base import CameraSource
 from .cameras.registry import build_camera
 from .config import AppConfig, CameraConfig
+from .health import host_health
 from .processing.pipeline import Pipeline
 from .state import StateStore
 from .storage.writer import SessionWriter
@@ -302,6 +303,11 @@ class Application:
         spec = self.detection_settings.detection
         from .calibration.detect import DetectionWorker  # noqa: PLC0415 - needs cv2
 
+        # Shared across the cameras, so `concurrent_cameras` limits how many
+        # full-frame passes run at once rather than each camera limiting only
+        # itself. Two at a time doubles the peak current draw, and that is the
+        # load a marginal Pi 5 supply fails on first.
+        gate = threading.Semaphore(max(1, int(spec.concurrent_cameras)))
         for cam_id, cam in self.cameras.items():
             worker = DetectionWorker(
                 cam,
@@ -311,6 +317,9 @@ class Application:
                 annotate_overlay=bool(spec.overlay),
                 normalize=bool(spec.normalize_illumination),
                 accuracy=bool(spec.high_accuracy),
+                max_tiles=int(spec.max_tiles),
+                max_duty=float(spec.max_duty),
+                gate=gate,
             )
             worker.start()
             self.detection[cam_id] = worker
@@ -463,6 +472,7 @@ class Application:
             "uptime_s": round(time.time() - self.started_at, 1),
             "session_dir": str(self.writer.session_dir),
             "storage": self.writer.state(),
+            "health": host_health(),
             "detection_running": self.detection_running,
             "state_file": str(self.state.path) if self.state else None,
             "cameras": [c.status() for c in self.cameras.values()],

@@ -69,6 +69,11 @@ class StageAdd(BaseModel):
     index: int | None = None
 
 
+class StorageDeviceRef(BaseModel):
+    device: str            # /dev/sda1
+    mount: str | None = None
+
+
 class StorageTarget(BaseModel):
     path: str
     # Mount points get the data subdirectory appended; an explicit directory
@@ -471,6 +476,61 @@ def create_app(application: Application) -> FastAPI:
         except OSError as exc:
             raise HTTPException(500, f"{type(exc).__name__}: {exc}") from None
         return application.storage_state()
+
+    @api.post("/api/storage/mount")
+    def storage_mount(body: StorageDeviceRef) -> dict[str, Any]:
+        """Mount a plugged-in but unmounted disk.
+
+        A headless Pi runs no desktop session, so nothing auto-mounts removable
+        media: a USB SSD plugged into a running rig is visible to the kernel
+        and reachable by nothing. This is the button that closes that gap. It
+        shells out to udisksctl, which needs no sudo and picks the mount point.
+        """
+        from ..storage.devices import mount_device  # noqa: PLC0415
+
+        try:
+            mount = mount_device(body.device)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        except RuntimeError as exc:
+            # The tool's own words. "unknown filesystem type 'exfat'" tells you
+            # to install exfatprogs; anything vaguer wastes an afternoon.
+            raise HTTPException(422, str(exc)) from None
+        log.info("mounted %s at %s", body.device, mount)
+        return application.storage_state()
+
+    @api.post("/api/storage/unmount")
+    def storage_unmount(body: StorageDeviceRef) -> dict[str, Any]:
+        """Unmount so the disk can be pulled without corrupting it.
+
+        Refuses, loudly, if anything still holds the filesystem open -- which
+        includes this application, so release the output first. "Target is
+        busy" is information, not an obstacle to route around.
+        """
+        from ..storage.devices import unmount_device  # noqa: PLC0415
+
+        if Path(application.writer.root) == Path(body.mount or "\0"):
+            raise HTTPException(409, "captures are still going there -- press Release first")
+        try:
+            unmount_device(body.device)
+        except (ValueError, RuntimeError) as exc:
+            raise HTTPException(422, str(exc)) from None
+        return application.storage_state()
+
+    @api.get("/api/storage/diagnostics")
+    def storage_diagnostics() -> dict[str, Any]:
+        """Raw lsblk, /proc/mounts and udisks2 version, beside what the
+        enumerator made of them.
+
+        For the case that actually happens: "I plugged a disk in and nothing
+        appeared". The three together localise it in one round trip -- present
+        in lsblk but not in the list is an enumeration bug, absent from both is
+        a kernel or cable problem, present and unmountable is a missing
+        filesystem driver.
+        """
+        from ..storage.devices import diagnostics  # noqa: PLC0415
+
+        return diagnostics()
 
     @api.post("/api/storage/release")
     def storage_release() -> dict[str, Any]:

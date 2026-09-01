@@ -358,13 +358,22 @@ def test_working_distance_at_the_centre_plane_is_flagged_not_infinite():
     assert "singular" in d.note
 
 
-def _cal_app(tmp_path, enabled=True, derotate=False, pitch=100.0):
+def _cal_app(tmp_path, enabled=True, derotate=False, pitch=12.5):
+    """A one-camera app for the readiness checks.
+
+    The preview is 182 x 136 -- one eighth of the 1456 x 1088 sensor, so it
+    shares the sensor's aspect ratio. That matters now that readiness converts
+    the grid to the frame detection actually runs on: a preview of some
+    unrelated shape is not a valid configuration and the checks say so, which
+    would make every test here fail for the wrong reason. The default pitch of
+    12.5 preview px is therefore 100 px on the sensor -- a realistic grid.
+    """
     from trilobite.app import Application
     from trilobite.config import AppConfig, StageConfig, StorageConfig
 
     cfg = AppConfig(
         cameras=[CameraConfig(
-            cam_id="left", backend="synthetic", fps=1000, preview_resolution=(64, 48),
+            cam_id="left", backend="synthetic", fps=1000, preview_resolution=(182, 136),
             pipeline=[StageConfig(type="mla_grid_overlay", name="mla", params={
                 "enabled": enabled, "pitch_px": pitch, "derotate_views": derotate,
             })],

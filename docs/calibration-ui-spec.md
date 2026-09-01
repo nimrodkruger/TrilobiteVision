@@ -132,6 +132,36 @@ So: a detection worker thread per camera, pulling the latest full-res frame at
 its own rate, publishing results to a slot the UI polls. It never blocks the
 preview, and dropped detection passes are harmless.
 
+**What the first field run added.** Pressing Start on the rig took the Pi down.
+The arithmetic above is right and the estimate that follows from it was never
+enforced: cost is (tiles × cameras × ms), and nothing bounded any of the three
+factors. Two things compounded.
+
+*The tile count is quadratic in 1/pitch.* At a 100 px sensor pitch a 1456 px
+sensor holds ~130 whole micro-images. At the 20 px default it holds ~900, and
+at anything smaller, thousands. A grid left near its defaults therefore asks
+for seven to fifty times the work, and the only symptom before the machine
+stops answering is that it feels slow.
+
+*Two cameras detecting in parallel doubles the current draw.* A Pi 5 with two
+CSI cameras and four saturated cores is past what many nominally-5 V supplies
+deliver, and the failure is a hard reset with nothing in any log.
+
+Four bounds, all in the Detection panel:
+
+| control | default | what it prevents |
+|---|---|---|
+| `max_tiles` | 320 | a wrong pitch, refused **before** starting, with the tile count and the seconds-per-pass named. Re-checked inside the worker, because the MLA parameters are live objects. |
+| `concurrent_cameras` | 1 | the parallel current spike. Cameras take turns through a shared semaphore. |
+| `max_duty` | 0.5 | a pass that turns out to cost a second costing a second every two seconds, rather than a permanently pinned core. |
+| thread priority | `nice(10)` | a starved event loop. A rig that stops answering looks crashed; one that answers slowly looks busy. |
+
+None of these substitute for an adequate supply. `/api/status` now reports CPU
+temperature, load, free memory and the sticky under-voltage bit from
+`vcgencmd get_throttled`, and the header turns red on any of them — the sticky
+bit in particular survives the reset it caused, which is the only reason the
+question is answerable after the fact.
+
 ### 4.4 Per tile
 
 1. Crop the micro-image from the frozen MLA geometry.

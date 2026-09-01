@@ -172,3 +172,131 @@ def test_state_reports_where_output_is_going(writer):
     assert s["session_dir"].startswith(s["root"])
     assert s["removable"] is False
     assert s["total_bytes"] > 0
+
+
+# -- devices that are plugged in but not mounted ----------------------------
+#
+# The failure this covers: a USB SSD plugged into a headless Pi is visible to
+# the kernel and mounted by nothing, because no desktop session exists to
+# auto-mount it. A listing built only from /proc/mounts shows nothing, which is
+# what happened on the rig.
+
+LSBLK_HEADLESS_PI = {
+    "blockdevices": [
+        {"path": "/dev/mmcblk0", "name": "mmcblk0", "size": 31914983424, "fstype": None,
+         "label": None, "mountpoint": None, "rm": False, "type": "disk", "ro": False,
+         "model": None, "pkname": None,
+         "children": [
+             {"path": "/dev/mmcblk0p1", "name": "mmcblk0p1", "size": 536870912,
+              "fstype": "vfat", "label": "bootfs", "mountpoint": "/boot/firmware",
+              "rm": False, "type": "part", "ro": False, "model": None, "pkname": "mmcblk0"},
+             {"path": "/dev/mmcblk0p2", "name": "mmcblk0p2", "size": 31377096704,
+              "fstype": "ext4", "label": "rootfs", "mountpoint": "/", "rm": False,
+              "type": "part", "ro": False, "model": None, "pkname": "mmcblk0"},
+         ]},
+        {"path": "/dev/sda", "name": "sda", "size": 1000204886016, "fstype": None,
+         "label": None, "mountpoint": None, "rm": True, "type": "disk", "ro": False,
+         "model": "Samsung PSSD T7", "pkname": None,
+         "children": [
+             {"path": "/dev/sda1", "name": "sda1", "size": 1000202788352,
+              "fstype": "exfat", "label": "TRILOBITE", "mountpoint": None, "rm": None,
+              "type": "part", "ro": False, "model": None, "pkname": "sda"},
+         ]},
+    ]
+}
+
+
+@pytest.fixture
+def headless_pi(monkeypatch):
+    monkeypatch.setattr(devices, "_lsblk", lambda: _flatten(LSBLK_HEADLESS_PI))
+    monkeypatch.setattr(devices, "_read_proc_mounts", lambda: [
+        ("/dev/mmcblk0p2", "/", "ext4", "rw,relatime"),
+        ("/dev/mmcblk0p1", "/boot/firmware", "vfat", "rw,relatime"),
+        ("proc", "/proc", "proc", "rw"),
+    ])
+
+
+def _flatten(tree):
+    out = []
+
+    def walk(node, parent):
+        node = dict(node)
+        if not node.get("model") and parent:
+            node["model"] = parent.get("model")
+        if node.get("rm") is None and parent:
+            node["rm"] = parent.get("rm")
+        kids = node.pop("children", []) or []
+        out.append(node)
+        for k in kids:
+            walk(k, node)
+
+    for d in tree["blockdevices"]:
+        walk(d, None)
+    return out
+
+
+def test_an_unmounted_usb_disk_is_offered(headless_pi):
+    found = devices.list_devices()
+    stick = next((d for d in found if d.device == "/dev/sda1"), None)
+    assert stick is not None, "a plugged-in but unmounted disk must still be listed"
+    assert stick.mounted is False
+    assert stick.removable is True
+    assert stick.label == "TRILOBITE"
+    assert stick.model == "Samsung PSSD T7"
+    assert stick.size_bytes > 0
+
+
+def test_an_unmounted_device_is_identified_by_its_node_not_a_mount_point(headless_pi):
+    stick = next(d for d in devices.list_devices() if d.device == "/dev/sda1")
+    assert stick.id == "/dev/sda1"
+    assert stick.target == ""          # nowhere to write until it is mounted
+
+
+def test_system_partitions_are_never_offered_for_mounting(headless_pi):
+    ids = {d.id for d in devices.list_devices()}
+    assert "/dev/mmcblk0p1" not in ids, "the boot partition is not a capture target"
+
+
+def test_mounted_filesystems_still_come_first(headless_pi):
+    found = devices.list_devices()
+    assert found[0].mounted is True
+
+
+def test_mount_device_returns_where_it_landed(monkeypatch):
+    monkeypatch.setattr(
+        devices, "_run",
+        lambda cmd, timeout=10.0: (0, "Mounted /dev/sda1 at /media/flyeye/TRILOBITE.\n", ""),
+    )
+    assert devices.mount_device("/dev/sda1") == "/media/flyeye/TRILOBITE"
+
+
+def test_mount_failure_surfaces_the_tools_own_words(monkeypatch):
+    """"unknown filesystem type 'exfat'" tells you to install exfatprogs.
+    Anything vaguer costs an afternoon."""
+    monkeypatch.setattr(
+        devices, "_run",
+        lambda cmd, timeout=10.0: (
+            1, "", "Error mounting /dev/sda1: unknown filesystem type 'exfat'"),
+    )
+    with pytest.raises(RuntimeError, match="exfat"):
+        devices.mount_device("/dev/sda1")
+
+
+def test_a_missing_udisks_says_how_to_install_it(monkeypatch):
+    monkeypatch.setattr(
+        devices, "_run", lambda cmd, timeout=10.0: (127, "", "udisksctl: not found"))
+    with pytest.raises(RuntimeError, match="apt install"):
+        devices.mount_device("/dev/sda1")
+
+
+def test_mount_refuses_anything_that_is_not_a_block_device():
+    with pytest.raises(ValueError):
+        devices.mount_device("/media/stick")
+
+
+def test_diagnostics_reports_all_three_sources(monkeypatch):
+    monkeypatch.setattr(devices, "_run", lambda cmd, timeout=10.0: (0, "out", ""))
+    monkeypatch.setattr(devices, "_lsblk", lambda: [])
+    d = devices.diagnostics()
+    assert {"lsblk", "udisks2", "proc_mounts", "block_devices", "enumerated"} <= set(d)
+    assert d["udisks2"]["available"] is True

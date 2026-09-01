@@ -62,7 +62,16 @@ rsync                     # pulling image data off the Pi faster than scp
 # RECOMMENDED -- storage. Put image data on an SSD, not the SD card.
 # ---------------------------------------------------------------------------
 
+udisks2                   # REQUIRED for the Storage panel's Mount button.
+                          # A headless Pi runs no desktop session, so nothing
+                          # auto-mounts a USB disk you plug in: it is visible to
+                          # lsblk and reachable by nothing. udisksctl mounts it
+                          # as your own user, no sudo. Without this the disk is
+                          # still listed, but you mount it by hand over SSH.
 exfatprogs                # mount an exFAT USB SSD shared with Windows
+ntfs-3g                   # the same for an NTFS one. Without the driver a
+                          # perfectly good disk fails with "unknown filesystem
+                          # type", which reads as a broken disk.
 nvme-cli                  # if you fit an NVMe HAT
 gdisk                     # partitioning a new drive
 

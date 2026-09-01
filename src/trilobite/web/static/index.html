@@ -209,6 +209,9 @@
 <header>
   <h1>TrilobiteVision</h1>
   <span class="meta" id="session">&mdash;</span>
+  <span class="meta" id="health"></span>
+  <span class="meta" id="health-warn" hidden
+        style="color:var(--err);font-weight:650"></span>
   <span class="spacer"></span>
   <span class="modes">
     <button id="mode-live" class="on">Imaging</button>
@@ -559,19 +562,56 @@ function renderStorage(s) {
     const row = document.createElement("div");
     row.className = "dev" + (d.active ? " active" : "");
     const pct = Math.round(d.used_fraction * 100);
+    const tags =
+      (d.removable ? `<span class="tag rm">removable</span>` : "") +
+      (d.active ? `<span class="tag on">in use</span>` : "") +
+      (d.mounted ? "" : `<span class="tag rm">not mounted</span>`) +
+      `<span class="tag">${d.fstype}</span>`;
+
+    if (!d.mounted) {
+      // Plugged in and unreachable. Normal on a headless Pi, where no desktop
+      // session exists to auto-mount anything — and the single most likely
+      // reason a disk the user just plugged in is not on this list.
+      row.innerHTML = `
+        <div class="top"><span class="name"></span>${tags}</div>
+        <div class="path"></div>
+        <div class="foot"><span class="cap">${gb(d.total_bytes)} disk · nothing mounted it</span>
+          <button data-mount="${d.device}">Mount</button></div>`;
+      row.querySelector(".name").textContent = d.label;
+      row.querySelector(".path").textContent =
+        `${d.device}${d.model ? "  ·  " + d.model : ""}`;
+      el.appendChild(row);
+      continue;
+    }
+
     row.innerHTML = `
-      <div class="top"><span class="name"></span>
-        ${d.removable ? `<span class="tag rm">removable</span>` : ""}
-        ${d.active ? `<span class="tag on">in use</span>` : ""}
-        <span class="tag">${d.fstype}</span></div>
+      <div class="top"><span class="name"></span>${tags}</div>
       <div class="path"></div>
       <div class="bar"><i class="${pct > 92 ? "full" : ""}" style="width:${pct}%"></i></div>
       <div class="foot"><span class="cap">${gb(d.free_bytes)} free · ${pct}% used</span>
+        ${d.removable && d.device.startsWith("/dev/")
+          ? `<button class="ghost" data-unmount="${d.device}" data-devmount="${d.mount}"
+               ${d.active ? "disabled" : ""}>Unmount</button>` : ""}
         <button data-use="${d.mount}" ${d.active || !d.writable ? "disabled" : ""}>
           ${d.writable ? "Use" : "read-only"}</button></div>`;
     row.querySelector(".name").textContent = d.label;
     row.querySelector(".path").textContent = `${d.mount}  →  ${d.target}`;
     el.appendChild(row);
+  }
+
+  // Only when there is genuinely nothing but the system's own disks. A device
+  // that is unmounted still counts as found — it has a Mount button, and
+  // telling the user to go and check lsblk for a disk already on the screen is
+  // worse than saying nothing.
+  if (!s.devices.some(d => d.removable || !d.mounted)) {
+    const hint = document.createElement("div");
+    hint.className = "notes";
+    hint.textContent =
+      "No removable disk found. If one is plugged in: check it appears in " +
+      "'lsblk' on the Pi, and that its filesystem type has a driver installed " +
+      "(exFAT needs exfatprogs, NTFS needs ntfs-3g). GET /api/storage/diagnostics " +
+      "returns the raw lsblk and /proc/mounts output.";
+    el.appendChild(hint);
   }
 
   if (a.notes && a.notes.length) {
@@ -605,16 +645,28 @@ function buildStorageCard() {
   card.addEventListener("click", async ev => {
     const use = ev.target.closest("[data-use]");
     const rel = ev.target.closest("#storage-release");
-    if (!use && !rel) return;
+    const mnt = ev.target.closest("[data-mount]");
+    const umt = ev.target.closest("[data-unmount]");
+    if (!use && !rel && !mnt && !umt) return;
     ev.target.disabled = true;
+    const was = ev.target.textContent;
+    if (mnt || umt) ev.target.textContent = "…";
     try {
-      const s = use
-        ? await jsend("/api/storage/target", { path: use.dataset.use })
-        : await jsend("/api/storage/release");
+      let s;
+      if (use) s = await jsend("/api/storage/target", { path: use.dataset.use });
+      else if (rel) s = await jsend("/api/storage/release");
+      else if (mnt) s = await jsend("/api/storage/mount", { device: mnt.dataset.mount });
+      else s = await jsend("/api/storage/unmount",
+                           { device: umt.dataset.unmount, mount: umt.dataset.devmount });
       renderStorage(s);
-      log(`output → ${s.active.session_dir}`, "ok");
+      log(use || rel ? `output → ${s.active.session_dir}`
+                     : `${mnt ? "mounted" : "unmounted"} ok`, "ok");
     } catch (e) {
+      // Mount failures explain themselves precisely — "unknown filesystem type
+      // 'exfat'", "target is busy", a polkit refusal — so the message is shown
+      // whole rather than summarised.
       log(`storage: ${e.message}`, "err");
+      ev.target.textContent = was;
       refreshStorage();
     }
   });
@@ -813,7 +865,8 @@ async function buildCalibration() {
     ["min_corners_per_tile", "min_cross_tiles", "target_per_tile",
      "move_fraction", "move_rotation_deg"]));
   rail.appendChild(calGroup("Detection", "detection",
-    ["interval_s", "overlay", "normalize_illumination", "high_accuracy"]));
+    ["interval_s", "max_tiles", "max_duty", "concurrent_cameras",
+     "overlay", "normalize_illumination", "high_accuracy"]));
 
   // Exposure and gain only. No pipeline, no MLA -- alignment is finished
   // before entering, and its parameters are frozen (shown below, read-only).
@@ -1153,6 +1206,24 @@ async function poll() {
       (s.detection_running ? "   ● detecting" : "") +
       (st.present === false ? "   ⚠ OUTPUT DEVICE MISSING" : "");
     el.style.color = st.present === false ? "var(--err)" : "";
+
+    // Host health. Under-voltage in particular is sticky since boot and is the
+    // one thing here that no amount of software tuning fixes — it needs a
+    // bigger supply. It belongs where it cannot be missed.
+    const h = s.health || {};
+    const hb = $("#health");
+    if (hb) {
+      const bits = [];
+      if (h.cpu_temp_c != null) bits.push(`${h.cpu_temp_c.toFixed(0)}°C`);
+      if (h.load) bits.push(`load ${h.load[0]}`);
+      if (h.mem_available_mb != null) bits.push(`${Math.round(h.mem_available_mb)} MB free`);
+      hb.textContent = bits.join("  ");
+      hb.title = (h.problems && h.problems.length) ? h.problems.join("\n") : "host is healthy";
+      hb.style.color = (h.problems && h.problems.length) ? "var(--err)" : "";
+      const warn = $("#health-warn");
+      warn.textContent = (h.problems && h.problems.length) ? `⚠ ${h.problems[0]}` : "";
+      warn.hidden = !(h.problems && h.problems.length);
+    }
     for (const c of s.cameras) {
       const el = document.querySelector(`[data-fps="${c.cam_id}"]`);
       if (el) {

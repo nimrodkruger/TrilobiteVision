@@ -209,3 +209,154 @@ def test_detection_result_json_carries_no_corner_arrays():
     payload = r.as_dict()
     assert payload["tiles_found"] == len(r.found_tiles)
     assert all("corners" not in t for t in payload["tiles"])
+
+
+# -- load limits ------------------------------------------------------------
+#
+# Added after the first run on the real rig took the Pi down. The cost of a
+# pass is tiles x cameras x ~5 ms, and nothing bounded any of the three.
+
+
+def _load_app(tmp_path, pitch_preview, **detection):
+    from trilobite.app import Application
+    from trilobite.config import AppConfig, StageConfig, StorageConfig
+
+    cfg = AppConfig(
+        cameras=[CameraConfig(
+            cam_id="left", backend="synthetic", fps=1000,
+            full_resolution=(1456, 1088), preview_resolution=(182, 136),
+            pipeline=[StageConfig(type="mla_grid_overlay", name="mla",
+                                  params={"enabled": True, "pitch_px": pitch_preview})],
+        )],
+        storage=StorageConfig(root=str(tmp_path / "d")),
+    )
+    app = Application(cfg)
+    for k, v in detection.items():
+        setattr(app.calibration.detection, k, v)
+    return app
+
+
+def _check(report, suffix):
+    return next(c for c in report["checks"] if c["id"].endswith(suffix))
+
+
+def test_a_grid_that_would_saturate_the_cpu_is_refused_before_it_starts(tmp_path):
+    """The actual field failure: with the pitch left near its default the
+    geometry yields hundreds of tiles instead of ~130, and two workers then run
+    that continuously. The number is knowable before anything starts."""
+    app = _load_app(tmp_path, pitch_preview=2.5)      # 20 px on the sensor
+    app.start()
+    try:
+        r = app.calibration_readiness()
+        c = _check(r, "tile_count")
+        assert c["blocking"] and not c["ok"]
+        assert "exceeds the limit" in c["message"]
+        assert r["ready"] is False
+        with pytest.raises(RuntimeError, match="exceeds the limit"):
+            app.detection_start()
+    finally:
+        app.stop()
+
+
+def test_a_realistic_grid_passes_and_reports_the_cost(tmp_path):
+    app = _load_app(tmp_path, pitch_preview=12.5)     # 100 px on the sensor
+    app.start()
+    try:
+        c = _check(app.calibration_readiness(), "tile_count")
+        assert c["ok"]
+        assert "100 px on the sensor" in c["message"]
+        assert "s per pass" in c["message"]
+    finally:
+        app.stop()
+
+
+def test_a_pitch_larger_than_the_sensor_is_refused_with_its_own_message(tmp_path):
+    app = _load_app(tmp_path, pitch_preview=380.0)
+    app.start()
+    try:
+        c = _check(app.calibration_readiness(), "tile_count")
+        assert not c["ok"]
+        assert "no whole tiles" in c["message"]
+    finally:
+        app.stop()
+
+
+def test_a_preview_of_the_wrong_shape_is_refused_by_name(tmp_path):
+    """A preview that does not share the sensor's aspect ratio cannot carry a
+    grid onto the sensor frame at all. Saying so beats reporting zero tiles."""
+    from trilobite.app import Application
+    from trilobite.config import AppConfig, StageConfig, StorageConfig
+
+    cfg = AppConfig(
+        cameras=[CameraConfig(
+            cam_id="left", backend="synthetic", fps=1000,
+            full_resolution=(1456, 1088), preview_resolution=(640, 480),
+            pipeline=[StageConfig(type="mla_grid_overlay", name="mla",
+                                  params={"enabled": True, "pitch_px": 44.0})],
+        )],
+        storage=StorageConfig(root=str(tmp_path / "d")),
+    )
+    app = Application(cfg)
+    app.start()
+    try:
+        c = _check(app.calibration_readiness(), "tile_count")
+        assert not c["ok"]
+        assert "aspect ratio" in c["message"]
+    finally:
+        app.stop()
+
+
+def test_the_runtime_cap_stops_a_pitch_changed_under_a_running_detector(tmp_path):
+    """The precondition runs once; the MLA parameters are live objects. The
+    worker re-checks, so the failure mode is a message rather than a machine
+    that stops answering."""
+    from trilobite.calibration.detect import DetectionWorker
+
+    app = _load_app(tmp_path, pitch_preview=12.5)
+    app.start()
+    try:
+        cam = app.camera("left")
+        worker = DetectionWorker(
+            cam, app.calibration.board, app.calibration.acceptance,
+            max_tiles=10, annotate_overlay=False,
+        )
+        with pytest.raises(RuntimeError, match="over the limit"):
+            worker._one_pass()
+    finally:
+        app.stop()
+
+
+def test_the_duty_cycle_is_clamped_to_something_sane():
+    from trilobite.calibration.detect import DetectionWorker
+
+    class FakeCam:
+        cam_id = "x"
+
+    assert DetectionWorker(FakeCam(), BoardSpec(), AcceptanceSpec(), max_duty=99).max_duty == 1.0
+    assert DetectionWorker(FakeCam(), BoardSpec(), AcceptanceSpec(), max_duty=0).max_duty == 0.05
+
+
+def test_cameras_share_one_gate_so_they_take_turns(tmp_path):
+    """Two full-frame passes at once double the peak current draw, and that is
+    the load a marginal Pi 5 supply fails on first."""
+    from trilobite.app import Application
+    from trilobite.config import AppConfig, StageConfig, StorageConfig
+
+    cams = [
+        CameraConfig(
+            cam_id=cid, backend="synthetic", fps=1000,
+            full_resolution=(1456, 1088), preview_resolution=(182, 136),
+            pipeline=[StageConfig(type="mla_grid_overlay", name="mla",
+                                  params={"enabled": True, "pitch_px": 12.5})],
+        )
+        for cid in ("left", "right")
+    ]
+    app = Application(AppConfig(cameras=cams, storage=StorageConfig(root=str(tmp_path / "d"))))
+    app.start()
+    try:
+        app.detection_start()
+        gates = {id(w.gate) for w in app.detection.values()}
+        assert len(gates) == 1, "both cameras must share one semaphore"
+    finally:
+        app.detection_stop()
+        app.stop()

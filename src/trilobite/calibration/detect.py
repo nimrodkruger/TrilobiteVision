@@ -36,7 +36,9 @@ ours -- a deliberate departure from calibration-ui-spec §4.4 step 3.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -191,6 +193,7 @@ class CornerDetector:
         seq: int,
         scale: float = 1.0,
         derotate: bool = False,
+        tiles: list[tuple[int, int]] | None = None,
     ) -> DetectionResult:
         t0 = time.perf_counter()
         h, w = image.shape[:2]
@@ -202,7 +205,7 @@ class CornerDetector:
             board=(self.board.cols, self.board.rows),
         )
 
-        for i, j in geom.whole_indices(scale, derotate=derotate):
+        for i, j in (tiles if tiles is not None else geom.whole_indices(scale, derotate=derotate)):
             tile = (
                 geom.crop_derotated(image, i, j, scale)
                 if derotate
@@ -335,6 +338,24 @@ class DetectionWorker:
 
     `latest()` returns the most recent completed pass, or None. There is no
     history, because nothing is being recorded.
+
+    **Three limits on how hard this is allowed to work**, added after the first
+    run on the real rig took the Pi down:
+
+      * a shared semaphore, so by default only one camera detects at a time.
+        Two full-frame passes in parallel double the peak current draw, and a
+        Pi 5 with two cameras is already the wrong side of a marginal supply.
+      * a duty cycle. After a pass lasting T the worker sleeps until it has
+        been idle for the configured fraction of the time, so a pass that
+        turns out to cost a second costs a second every two seconds rather
+        than a permanently pinned core.
+      * a lowered thread priority, so the capture threads and the web server
+        keep the CPU when it is contended. A starved event loop is what makes
+        a busy rig look hung rather than slow.
+
+    None of these make a wrong pitch cheap -- that is caught before the start,
+    by the tile-count precondition. They bound what a *correct* configuration
+    can cost.
     """
 
     def __init__(
@@ -346,13 +367,20 @@ class DetectionWorker:
         annotate_overlay: bool = True,
         normalize: bool = False,
         accuracy: bool = False,
+        max_tiles: int = 320,
+        max_duty: float = 0.5,
+        gate: threading.Semaphore | None = None,
     ) -> None:
         self.cam = cam
         self.min_interval = float(min_interval)
         self.annotate_overlay = annotate_overlay
         self.detector = CornerDetector(board, acceptance, normalize, accuracy)
+        self.max_tiles = int(max_tiles)
+        self.max_duty = min(max(float(max_duty), 0.05), 1.0)
+        self.gate = gate or threading.Semaphore(1)
         self.passes = 0
         self.started_at = time.time()
+        self.last_pass_ms = 0.0
         self._latest: DetectionResult | None = None
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -388,10 +416,25 @@ class DetectionWorker:
     # -- the loop ---------------------------------------------------------
 
     def _run(self) -> None:
+        # Detection is the least urgent thing this process does. Give the
+        # capture threads and the event loop the CPU when it is contended --
+        # a preview that stutters and an API that stops answering are how a
+        # busy rig comes to look like a crashed one.
+        with contextlib.suppress(AttributeError, OSError):
+            os.nice(10)
+
         while not self._stop.is_set():
             t0 = time.monotonic()
             try:
-                self._one_pass()
+                # Only one camera measures at a time by default. The semaphore
+                # rather than a single shared worker so that each camera keeps
+                # its own cadence, error state and result slot.
+                if not self.gate.acquire(timeout=5.0):
+                    continue
+                try:
+                    self._one_pass()
+                finally:
+                    self.gate.release()
             except Exception as exc:
                 log.exception("%s: detection pass failed", self.cam.cam_id)
                 self._publish(
@@ -406,7 +449,13 @@ class DetectionWorker:
                 self._stop.wait(1.0)
                 continue
             spent = time.monotonic() - t0
-            self._stop.wait(max(0.0, self.min_interval - spent))
+            self.last_pass_ms = spent * 1000.0
+            # Idle for long enough that the busy fraction stays under max_duty,
+            # and in any case for min_interval. At duty 0.5 a one-second pass
+            # is followed by a second of sleep, so the worst case is half a
+            # core per camera instead of all of it.
+            duty_sleep = spent * (1.0 / self.max_duty - 1.0)
+            self._stop.wait(max(0.0, self.min_interval - spent, duty_sleep))
 
     def _one_pass(self) -> None:
         stage = self.cam.mla_stage()
@@ -425,7 +474,21 @@ class DetectionWorker:
         scale = float(stage.params.crop_scale)
         derot = bool(getattr(stage.params, "derotate_views", False))
 
-        result = self.detector.run(image, geom, self.cam.cam_id, frame.seq, scale, derot)
+        # Second line of defence. The tile count is a precondition, checked
+        # before the run starts -- but the MLA parameters are live objects and
+        # nothing stops a pitch being changed underneath a running detector.
+        # Refusing here turns "the machine became unresponsive" into a message.
+        tiles = geom.whole_indices(scale, derotate=derot)
+        if len(tiles) > self.max_tiles:
+            raise RuntimeError(
+                f"grid now yields {len(tiles)} whole tiles, over the limit of "
+                f"{self.max_tiles}. The pitch changed while detection was "
+                f"running. Stopping rather than saturating the CPU."
+            )
+
+        result = self.detector.run(
+            image, geom, self.cam.cam_id, frame.seq, scale, derot, tiles=tiles
+        )
         if self.annotate_overlay:
             try:
                 result.overlay = annotate(image, result, geom, scale)

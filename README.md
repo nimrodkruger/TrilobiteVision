@@ -257,9 +257,18 @@ it out — and the right USB SSD is usually not plugged in when the application
 starts. The output directory is therefore movable while the rig is running,
 from the Storage panel in imaging mode.
 
+- **A plugged-in disk is not necessarily a mounted disk**, and this is the part
+  that catches people out. A headless Pi runs no desktop session, so nothing
+  auto-mounts removable media: a USB SSD plugged into a running rig is visible
+  to `lsblk` and reachable by nothing at all. Such a disk is listed here anyway,
+  marked *not mounted*, with a **Mount** button that shells out to `udisksctl`
+  (hence `udisks2` in `apt-packages.txt`). If the mount fails, the panel shows
+  the tool's own words — "unknown filesystem type 'exfat'" means install
+  `exfatprogs`.
 - **Devices are polled**, so something plugged in after startup appears without
   a reload. Listing never writes a probe file; read-only mounts are read out of
-  `/proc/mounts`.
+  `/proc/mounts`, and a filesystem `lsblk` cannot name is probed with `blkid`
+  rather than dropped.
 - **Choosing a device creates a new session directory on it**, under
   `trilobite-data/`. Nothing already written is moved, mirrored or deleted, and
   a note records where the earlier part of the session went.
@@ -269,11 +278,17 @@ from the Storage panel in imaging mode.
   mount point behind as an ordinary empty directory, so writes otherwise keep
   *succeeding* — onto the SD card, under a path that says otherwise.
 
-There is no eject button: unmounting a filesystem is not this application's
-business. Press **Release**, check the panel says the output is internal again,
-then pull the disk.
+To remove a disk: press **Release** so captures go back to `storage.root`, then
+**Unmount**. Unmount refuses while anything holds the filesystem open, which
+includes this application, so the order matters. `storage.root` is the fallback
+and must be somewhere always mounted.
 
-`storage.root` is the fallback, so it must be somewhere always mounted.
+If a disk you plugged in does not appear at all, `GET /api/storage/diagnostics`
+returns the raw `lsblk`, `/proc/mounts` and udisks2 version beside what the
+enumerator made of them, which localises it in one look: in `lsblk` but not in
+the list is a bug here, in neither is a kernel or cable problem, in both but
+unmountable is a missing filesystem driver. `bash scripts/diagnose_host.sh` on
+the Pi prints the same thing with more context.
 
 ---
 
@@ -282,7 +297,7 @@ then pull the disk.
 | method | path | purpose |
 |---|---|---|
 | GET | `/` | the dashboard |
-| GET | `/api/status` | uptime, per-camera fps and errors, storage state |
+| GET | `/api/status` | uptime, per-camera fps and errors, storage state, host health |
 | GET | `/api/cameras` | camera list and hardware description |
 | GET | `/api/stage-types` | every registered stage type and its schema |
 | GET | `/stream/{cam}.mjpg` | MJPEG preview (one per camera; see the budget above) |
@@ -304,9 +319,12 @@ then pull the disk.
 | POST | `/api/calibration/stop` | stop it |
 | GET | `/api/calibration/detection` | latest pass per camera, per-tile verdicts |
 | GET | `/calibration/detection/{cam}.jpg` | that pass, annotated |
-| GET | `/api/storage` | filesystems on offer, and where output is going |
+| GET | `/api/storage` | filesystems on offer, mounted or not, and where output is going |
 | POST | `/api/storage/target` | `{"path": "/media/stick"}` — move output there |
-| POST | `/api/storage/release` | back to `storage.root`, so a device can be unplugged |
+| POST | `/api/storage/mount` | `{"device": "/dev/sda1"}` — mount a plugged-in disk |
+| POST | `/api/storage/unmount` | `{"device": "/dev/sda1"}` — so it can be pulled safely |
+| POST | `/api/storage/release` | back to `storage.root` |
+| GET | `/api/storage/diagnostics` | raw `lsblk`, `/proc/mounts`, udisks2 — why is my disk missing |
 
 Sensor controls and pipeline parameters are separate endpoints on purpose. One
 changes what the sensor does, the other what happens to the numbers afterwards;
@@ -340,6 +358,7 @@ src/trilobite/
     pipeline.py            ordered runner, live reconfiguration, timing
     stages/basic.py        passthrough, levels, crop, downsample, stats
     stages/plenoptic.py    MLA grid overlay; lenslet_extract placeholder
+  health.py                CPU temperature, under-voltage, memory — is the host coping
   optics/mla.py            lenslet geometry, shared by the overlay and the crops
   calibration/
     settings.py            board, nominal optics, acceptance, readiness checks
@@ -355,6 +374,7 @@ scripts/
   probe_cameras.py         run this first on the Pi
   install_pi.sh            apt, config.txt, venv — idempotent
   diagnose_cameras.sh      when libcamera reports zero cameras
+  diagnose_host.sh         after a crash, or when a disk does not appear
   measure_derotation_cost.py   what tile de-rotation actually costs in precision
 systemd/trilobite.service  run as a service
 tests/                     all of it runs anywhere, no camera needed
@@ -450,6 +470,21 @@ browser.
 ---
 
 ## Things that will bite you
+
+**A Pi 5 with two cameras needs a real 5 V / 5 A supply.** The first
+calibration run on the rig took the board down. Sustained detection is the
+first workload here that can saturate all four cores, and the resulting current
+spike browns out a marginal supply — a hard reset, with nothing in any log. The
+header shows CPU temperature and load, and turns red if
+`vcgencmd get_throttled` reports under-voltage at any point since boot; that
+bit is sticky, so it survives the crash it caused. `bash
+scripts/diagnose_host.sh` reads it out with everything else worth knowing.
+
+Detection is bounded so it cannot be the software's fault either: cameras take
+turns by default, a duty-cycle cap keeps each worker under half a core, the
+threads run at lowered priority, and a grid that would yield more tiles than
+`max_tiles` is refused before it starts rather than discovered at runtime. All
+four are in the Detection panel.
 
 **The Pi 5 has no hardware video encoder.** VideoCore VII dropped H.264 and
 JPEG encode, so every preview frame is compressed on the CPU. Encode the small
