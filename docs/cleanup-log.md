@@ -12,6 +12,93 @@ git checkout .              # everything back to HEAD
 
 ---
 
+## 2026-09-02 (e) — quick-record, and the MATLAB reading path
+
+Still nothing detected on the rig after (d). Rather than keep debugging the
+on-board detector blind, two changes that make the question answerable and make
+progress possible without answering it first.
+
+### Quick-record in imaging mode
+
+A checkbox in the header; the space bar then saves a raw set from both cameras.
+No detection, no gate, no decision — every press is written. It produces exactly
+the files the automatic loop produces, minus the pose manifest.
+
+| change | file |
+|---|---|
+| `#quick-record` checkbox, `#quick-tally` counter | `web/static/index.html` |
+| `quickShot()`, `QUICK_N` / `QUICK_BUSY` / `QUICK_PENDING` | `web/static/index.html` |
+| the global keydown handler now branches on mode | `web/static/index.html` |
+
+Rollback: remove the label from `#live-actions` and the `MODE === "live"` branch
+from the keydown handler. Nothing server-side changed — it posts to the existing
+`/api/capture-all/raw`.
+
+Three things it had to get right, all found by testing rather than reasoning:
+
+* **A focused checkbox eats the space bar.** After clicking the box it holds
+  focus, the browser toggles it on space, and the keydown handler correctly
+  ignores keys aimed at form controls — so the first press turned the feature
+  back off. Every checkbox sharing a page with a space-bar shortcut now blurs
+  on change (`releaseSpace`), including `#cal-sound` and `#cal-peaks`, which had
+  the same latent bug.
+* **Auto-repeat.** A held space bar fires keydown about thirty times a second.
+  `ev.repeat` stops it.
+* **Presses were being dropped.** A raw pair took 0.6–2.2 s to write in testing,
+  which is inside the interval a person presses at, so roughly one press in four
+  was lost — silently, and indistinguishably from a press that worked. Now
+  queued one deep rather than dropped. The two-tone beep marks the completed
+  write, and the log line says to wait for it.
+
+### matlab/ — the offline path in MATLAB
+
+Base MATLAB only, no toolboxes, and it runs unmodified under Octave (which is
+what it was tested against).
+
+| file | what |
+|---|---|
+| `tv_read_npy.m` | a real `.npy` parser: v1/v2/v3 headers, big- and little-endian dtypes, C and Fortran ordering |
+| `tv_read_capture.m` | image + sidecar, with the MLA geometry **rescaled** to the frame in hand |
+| `tv_micro_images.m` | M×N cell of X×Y micro-images, de-rotated onto the lattice axes |
+| `tv_sub_apertures.m` | the permute to X×Y sub-aperture images of M×N |
+| `demo_read_capture.m` | the whole chain with figures, base graphics only |
+| `tv_selftest.m` | 19 assertions, headless |
+| `README.md` | the distinction, the traps, the coordinate convention |
+
+Two ordering traps, both silent, both real:
+
+* **C vs Fortran order.** NumPy writes the last axis fastest, MATLAB's `reshape`
+  fills the first dimension fastest. Reading the bytes straight into
+  `reshape(v, shape)` returns the transpose with no error.
+* **`meshgrid` argument order.** MATLAB's varies its first output along columns;
+  NumPy's `indexing='ij'` varies its first along rows. Writing the resampling
+  grid the NumPy way transposed every de-rotated tile while every dimension
+  still matched — invisible to any shape check. This was a live bug in the first
+  version, caught only by comparing against `MLAGeometry.crop_derotated` on the
+  same file: mean difference 83.7 of 255. `tv_selftest` now pins it with a
+  coordinate-ramp assertion that has a closed form, and that assertion was
+  mutation-tested (reinstating the bug fails it with a 69 px error).
+
+### Verification
+
+```
+pytest -q                       → 133 passed
+ruff check src/ tests/ scripts/ → clean
+tv_selftest, left  camera (0°, scale 1.0)  → 19 passed, 0 failed
+tv_selftest, right camera (2°, scale 0.9)  → 19 passed, 0 failed
+```
+
+Cross-language: the de-rotated centre tile from `tv_micro_images` versus
+`MLAGeometry.crop_derotated` on the same file — **max difference 0**, and the
+geometry agrees exactly (pitch 100.000000, rotation 2.0000, side 90, 129 whole
+lenslets, centre at (727.5, 543.5)).
+
+Quick-record was driven headless: armed, four spaced presses recorded four sets,
+a held key added none, an immediate second press queued rather than vanished,
+and disarming stopped it. No console errors.
+
+---
+
 ## 2026-09-02 (d) — "no board is being noticed", and an offline reader
 
 Reported from the rig: calibration starts, the preview runs, and nothing is

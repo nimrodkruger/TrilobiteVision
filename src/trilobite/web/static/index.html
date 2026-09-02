@@ -260,6 +260,11 @@
   <span id="live-actions">
     <button id="all-raw">Save raw — both</button>
     <button class="ghost" id="all-view">Save view — both</button>
+    <label class="meta" style="display:inline-flex;gap:5px;align-items:center"
+           title="Space saves a raw set from both cameras. No detection, no gate, no decision: every press is kept. Wait for the two-tone beep before moving the board.">
+      <input type="checkbox" id="quick-record"> quick-record — space
+    </label>
+    <span class="meta" id="quick-tally"></span>
   </span>
 </header>
 
@@ -985,7 +990,8 @@ async function buildCalibration() {
         <input type="checkbox" id="cal-sound" checked> sound
       </label>
       <label class="why" style="display:flex;gap:5px;align-items:center">
-        <input type="checkbox" id="cal-peaks"> show what the detector sees
+        <input type="checkbox" id="cal-peaks" onchange="this.blur()">
+        show what the detector sees
       </label>
       <span class="why">space = shoot now &nbsp; esc = discard last</span>
     </div>
@@ -1063,6 +1069,7 @@ async function buildCalibration() {
   $("#cal-sound").onchange = ev => {
     SOUND_ON = ev.target.checked;
     if (SOUND_ON) SOUNDS.armed();          // also unlocks audio on first click
+    ev.target.blur();                      // see releaseSpace()
   };
   $("#cal-start").onclick = async ev => {
     ev.currentTarget.disabled = true;
@@ -1087,8 +1094,21 @@ async function buildCalibration() {
    wants it and the operator may not have focus anywhere in particular.
    Space forces a shot; Escape discards the last one during the review pause. */
 document.addEventListener("keydown", async ev => {
-  if (MODE !== "cal" || !SESSION.running) return;
   if (ev.target && /^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName)) return;
+
+  // Imaging mode: quick-record, when it is armed. Checked before the
+  // calibration branch so the two never contend for the space bar -- they are
+  // in different modes and cannot both be live, but the guard is one line.
+  if (MODE === "live") {
+    const quick = $("#quick-record");
+    if (ev.code === "Space" && quick && quick.checked && !ev.repeat) {
+      ev.preventDefault();
+      quickShot();
+    }
+    return;
+  }
+
+  if (MODE !== "cal" || !SESSION.running) return;
   if (ev.code === "Space") {
     ev.preventDefault();
     try { applySession(await jsend("/api/calibration/force")); } catch { /* transient */ }
@@ -1335,6 +1355,101 @@ async function saveAll(kind, btn) {
 }
 $("#all-raw").onclick = ev => saveAll("raw", ev.currentTarget);
 $("#all-view").onclick = ev => saveAll("view", ev.currentTarget);
+
+/* Quick-record: the space bar saves a raw set from both cameras.
+ *
+ * The manual counterpart to the hands-free capture loop, and for the same
+ * ergonomic reason -- both hands are on the board -- but with the decision
+ * removed rather than automated. Nothing is detected, nothing is judged,
+ * nothing is rejected: every press is written. That is the point. Whether a
+ * pose was any good is a question for the desk, on the recorded frames, where
+ * getting it wrong costs a re-run of a script instead of a field session.
+ *
+ * Three things it has to get right, all learned from the calibration loop:
+ *
+ *   * **Audible.** The operator is looking at the board, not the screen. A
+ *     rising two-tone beep means written; the low buzz means it failed.
+ *   * **No auto-repeat.** A held space bar fires keydown ~30 times a second.
+ *     `ev.repeat` stops that, and IN_FLIGHT stops a second press landing while
+ *     a raw pair (~6 MB) is still being written.
+ *   * **A visible count.** Otherwise there is no way to know from the board
+ *     whether the last press did anything.
+ */
+let QUICK_N = 0;
+let QUICK_BUSY = false;
+let QUICK_PENDING = false;
+
+async function quickShot() {
+  if (QUICK_BUSY) {
+    // Queue it, do not drop it. A raw pair took 0.6-2.2 s to write in testing,
+    // which is inside the interval a person presses at, so dropping meant
+    // losing roughly one press in four -- silently, from where the operator is
+    // standing, and indistinguishable from a press that worked. At most one is
+    // held: the board has barely moved in a second, and an extra pose is
+    // harmless in a mode whose whole premise is keep everything and judge later.
+    QUICK_PENDING = true;
+    tone(300, 45, "sine", 0.08);
+    return;
+  }
+  QUICK_BUSY = true;
+  const tally = $("#quick-tally");
+  if (tally) { tally.textContent = "saving…"; tally.style.color = "var(--warn)"; }
+  try {
+    const r = await jsend("/api/capture-all/raw");
+    const failed = Object.values(r).some(v => v.error);
+    if (failed) {
+      SOUNDS.rejected();
+      log(Object.entries(r).map(([k, v]) => `${k}: ${v.error || "ok"}`).join("   |   "), "err");
+      if (tally) { tally.textContent = "save failed"; tally.style.color = "var(--err)"; }
+    } else {
+      QUICK_N += 1;
+      SOUNDS.captured();
+      for (const [cam, v] of Object.entries(r)) {
+        note(cam, `${v.file}  ${v.shape.join("×")} ${v.dtype}`, "ok");
+      }
+      log(`quick-record ${QUICK_N}: ` +
+          Object.entries(r).map(([k, v]) => `${k}: ${v.file}`).join("   |   "), "ok");
+      if (tally) {
+        tally.textContent = `${QUICK_N} set${QUICK_N === 1 ? "" : "s"} recorded`;
+        tally.style.color = "var(--ok)";
+      }
+    }
+  } catch (e) {
+    SOUNDS.rejected();
+    log(e.message, "err");
+    if (tally) { tally.textContent = e.message; tally.style.color = "var(--err)"; }
+  } finally {
+    QUICK_BUSY = false;
+    if (QUICK_PENDING) { QUICK_PENDING = false; quickShot(); }
+  }
+}
+
+/* A focused checkbox eats the space bar: the browser toggles it and the
+ * keydown handler correctly ignores keys aimed at form controls, so the first
+ * press after clicking the box turns the feature back OFF instead of firing.
+ * Every checkbox that shares a page with a space-bar shortcut has to give the
+ * focus back. Found by pressing space three times and recording nothing. */
+function releaseSpace(ev) { ev.target.blur(); }
+
+$("#quick-record").onchange = ev => {
+  releaseSpace(ev);
+  const tally = $("#quick-tally");
+  if (ev.target.checked) {
+    // Also unlocks the audio context: browsers refuse to make a sound until a
+    // user gesture, and the first gesture must not be the first shot.
+    SOUNDS.armed();
+    if (tally) {
+      tally.textContent = QUICK_N ? `${QUICK_N} sets recorded` : "press space";
+      tally.style.color = "var(--muted)";
+    }
+    log("quick-record armed — space saves a raw set from both cameras. " +
+        "Wait for the two-tone beep before moving the board: that is the write " +
+        "completing, and it is the only confirmation there is.", "ok");
+  } else if (tally) {
+    tally.textContent = QUICK_N ? `${QUICK_N} sets recorded` : "";
+    tally.style.color = "var(--muted)";
+  }
+};
 
 /* Sub-aperture tiles are POLLED, not streamed.
 

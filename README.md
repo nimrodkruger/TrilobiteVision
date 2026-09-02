@@ -327,6 +327,25 @@ the list is a bug here, in neither is a kernel or cable problem, in both but
 unmountable is a missing filesystem driver. `bash scripts/diagnose_host.sh` on
 the Pi prints the same thing with more context.
 
+### Quick-record
+
+The manual counterpart to the hands-free calibration loop, in imaging mode, for
+the same ergonomic reason — both hands are on the board — but with the decision
+removed rather than automated. Tick **quick-record** in the header and the
+space bar saves a raw set from both cameras. Nothing is detected, nothing is
+judged, nothing is rejected: every press is written, and whether a pose was any
+good is a question for the desk.
+
+A rising two-tone beep means the write completed; wait for it before moving the
+board, because it is the only confirmation there is. A press arriving while the
+previous set is still being written is queued rather than dropped, at most one
+deep. The header keeps a running count.
+
+This is the recommended path while the on-board detector is still being trusted:
+it produces exactly the same files the automatic loop does, minus the pose
+manifest, and every frame is analysable offline with `scripts/read_capture.py`
+or the MATLAB functions in `matlab/`.
+
 ### Reading a capture back
 
 Every capture is a `.npy` array plus a `.json` sidecar carrying the frame's
@@ -356,6 +375,26 @@ per-tile structure.
 Ten to twenty seconds of arithmetic on a laptop replaces a design that took the
 rig down. See §4.3 of `docs/calibration-ui-spec.md` for where each detector runs
 and why.
+
+### In MATLAB
+
+`matlab/` holds the same reading path for MATLAB, base install only — no
+toolboxes, and it runs unmodified under Octave:
+
+```matlab
+addpath('matlab');
+cap   = tv_read_capture('raw_left_000001.npy');   % pixels + all metadata
+tiles = tv_micro_images(cap);                     % M×N cell of X×Y, de-rotated
+subs  = tv_sub_apertures(tiles);                  % X×Y cell of M×N
+demo_read_capture                                 % the whole chain, with figures
+tv_selftest('raw_left_000001.npy')                % 19 assertions, headless
+```
+
+`tv_read_capture` rescales the recorded MLA geometry from the preview frame it
+was aligned on to the frame you are actually holding, which is the step that
+silently ruins everything if it is skipped. `matlab/README.md` has the details,
+including the micro-image / sub-aperture distinction and the two array-ordering
+traps between NumPy and MATLAB.
 
 ---
 
@@ -449,6 +488,13 @@ scripts/
   benchmark_detectors.py   what each detector costs, on your machine
   measure_derotation_cost.py   what tile de-rotation actually costs in precision
   read_capture.py          open a recorded .npy + .json off the Pi, and detect
+matlab/                    the same reading path in MATLAB, base install only
+  tv_read_npy.m            .npy -> MATLAB array, native class, right way round
+  tv_read_capture.m        image + metadata, MLA geometry rescaled to the frame
+  tv_micro_images.m        M×N cell of X×Y micro-images, de-rotated
+  tv_sub_apertures.m       the permute: X×Y sub-aperture images, each M×N
+  demo_read_capture.m      the whole chain, with figures
+  tv_selftest.m            19 assertions, headless
 systemd/trilobite.service  run as a service
 tests/                     all of it runs anywhere, no camera needed
 ```
