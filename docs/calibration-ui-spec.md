@@ -146,8 +146,36 @@ Discrimination, measured on the preview, median over whole micro-images:
 | board, 3° rotation | 32 | 33 000 |
 | board, heavy noise | 27 | 34 000 |
 | board, **defocused** | 45 | 5 900 |
-| grating scene, no board | 8 | 800 |
+| grating scene, no board | 0 | — |
 | lens cap | 0 | 0 |
+
+**Two gates, and the absolute one is not optional.** A peak must be a local
+maximum, must clear a fraction of the frame's own strongest response
+(`rel_threshold`, 0.15), *and* must clear an absolute floor. A purely relative
+threshold is scale-free, which sounds like a virtue and is a defect: it
+normalises whatever is in front of the lens up to "detected". Measured on the
+728×544 preview,
+
+| what | S |
+|---|---|
+| a board corner | 2·10⁴ – 5·10⁴ |
+| a busy but flat scene (the `gratings` target) | 5·10² – 2.5·10³ |
+| sensor noise, σ = 2.5 grey levels | ~3·10¹, 11 500 peaks per frame |
+
+so with only the relative gate a blank wall produced thousands of peaks and put
+roughly ten micro-images in a hundred over a count threshold of 20 — a detector
+reporting a board where there is none. It also made two discrimination tests
+fail about one run in three, which is how it was found.
+
+The floor is stated as a **minimum corner contrast in grey levels**, because
+that is a property of the board and the light rather than of this code. The
+bridge is measured and exact to three figures over the whole 8-bit range: an
+ideal step corner of contrast `C` gives
+
+    S = (1.061 · C)²
+
+so `min_contrast = 40` (the default) means `S > 1800`. A printed checkerboard
+under usable light gives 130+; noise and smooth gradients cannot reach it.
 
 A tile that sees the whole pattern reads about **(cols+2)×(rows+2)** — every
 grid vertex, not just the inner corners — so a 4×3 board reads ~30 and two

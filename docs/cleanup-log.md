@@ -12,6 +12,89 @@ git checkout .              # everything back to HEAD
 
 ---
 
+## 2026-09-02 (d) — "no board is being noticed", and an offline reader
+
+Reported from the rig: calibration starts, the preview runs, and nothing is
+ever detected. Three separate defects, and the first is the one that mattered.
+
+### 1. The presence stage shipped switched off
+
+`config/pi.yaml` carried `checkerboard_presence` with `enabled: false`. A
+disabled stage is a legal no-op, so there was no error anywhere: the page
+started, the preview ran, the capture loop sat in SEARCHING for ever, and
+nothing said why. `config/desktop-plenoptic.yaml` had it on, which is why it
+was never seen in development.
+
+| change | file | rollback |
+|---|---|---|
+| `enabled: true`, and `min_contrast: 40.0`, on both cameras | `config/pi.yaml` | set `enabled: false` again |
+| three new **blocking** readiness checks — `{cam}.presence` (stage missing), `{cam}.presence_enabled` (stage off), `{cam}.presence_bound` (stage not reading the MLA grid) | `calibration/settings.py` | delete the three checks |
+
+The checks are the real fix. A configuration that cannot detect anything now
+refuses to start the capture loop and names the reason, instead of running
+silently. Two tests cover them:
+`test_missing_presence_stage_blocks`, `test_disabled_presence_stage_blocks`.
+
+### 2. The detector had no absolute threshold
+
+`PresenceDetector` gated peaks only on `rel_threshold` × the frame's own
+maximum. That is scale-free, so it normalises whatever is in front of the lens
+up to "detected": sensor noise at σ = 2.5 grey levels produced 11 500 peaks per
+frame and put ~10 micro-images in 100 over a count threshold of 20.
+
+Added an absolute floor, quoted as a **minimum corner contrast in grey levels**
+because that is a statement about the board and the light, not about the code.
+The bridge is measured, exact to three figures over the 8-bit range: an ideal
+step corner of contrast `C` gives `S = (1.061·C)²`, so `min_contrast = 40`
+means `S > 1800`. A printed board gives 130+.
+
+| change | file | rollback |
+|---|---|---|
+| `SADDLE_PER_LEVEL`, `PresenceDetector.min_contrast`, `.floor`, the second gate in `saddle()` | `calibration/presence.py` | set `min_contrast=0.0` to get the old behaviour without editing code |
+| `PresenceMap.best_contrast` / `.contrast_floor`, and a `diagnose()` branch distinguishing "no structure at all" from "structure below the contrast floor" | `calibration/presence.py` | — |
+| `min_contrast` stage parameter, surfaced in the UI | `processing/stages/plenoptic.py` | — |
+
+### 3. A test that measured the wall clock
+
+`SyntheticSource` derived its scene phase from `time.monotonic()`, so the
+`gratings` negative case drifted between runs and its saddle count crossed the
+threshold at some phases and not others. Two discrimination tests failed about
+one run in three, and the flake looked like the detector.
+
+`synthetic_drift_px == 0` now means a **static scene** — the phase is pinned to
+zero — not merely a board that does not translate. Guarded by
+`test_the_scene_is_static_with_drift_off`.
+
+| change | file | rollback |
+|---|---|---|
+| `SyntheticSource._phase()`, used by `read_preview` and `capture_full` | `cameras/offline.py` | inline the old `(now - t0) * 0.4` expression |
+
+### Also added
+
+| what | why |
+|---|---|
+| `scripts/read_capture.py` | Reads a recorded `.npy` + `.json` pair from either camera, in view or raw mode, and does off-Pi what the rig deliberately does not: full-field `findChessboardCornersSB` over every micro-image. `--show --save --grid --corners --tile I,J --zoom --detect --board CxR --csv --json`. Verified on real recorded poses: 117/117 micro-images, 77 complete crosses, 15.99 px squares, 8892 corners exported. |
+| `/calibration/peaks/{cam}.jpg` and `presence.peaks_overlay()` | "0 of 117 micro-images see the board" is a number; what is needed when it is wrong is a picture. Peaks marked, per-tile counts written in each box. Distinguishes an alignment error from a too-coarse board from a lens cap at a glance. |
+| the diagnosis line under each preview | `PresenceMap.diagnose()` in words: best tile against the threshold, median, total peaks, and what the configured board *should* give. |
+
+### Verification
+
+```
+ruff check src/ tests/ scripts/   → clean
+pytest -q                         → 133 passed  (three consecutive runs, for the flake)
+```
+
+End to end against `config/desktop-plenoptic.yaml`, headless: preconditions
+met, session armed, pose 1 recorded at 16.0 px per square, phase advanced to
+MOVE, peaks view and diagnosis rendering, no console errors.
+
+One thing that is **not** a bug and cost a confusing minute: with the board
+spec left at its 9×6 default the five-tile cross check reports `0/5` on a rig
+whose target is 4×3. The presence map is board-size-agnostic and reads 117/117
+at the same moment. Set the board size before blaming the detector.
+
+---
+
 ## 2026-09-01 (c) — the capture loop, and the actual cause of the crash
 
 `stress-ng --cpu 4` ran on the rig without a crash and barely spun the fan.

@@ -309,9 +309,19 @@ class CheckerboardPresence(Stage):
                         "corners of the same square are never merged.",
             json_schema_extra={"widget": "box"})
         rel_threshold: float = Field(
-            0.15, gt=0.0, le=1.0, title="Peak threshold",
+            0.15, gt=0.0, le=1.0, title="Relative peak threshold",
             description="Fraction of the frame's strongest saddle response a peak "
                         "must reach. Lower finds fainter patterns and more noise.",
+            json_schema_extra={"widget": "box"})
+        min_contrast: float = Field(
+            40.0, ge=2.0, le=200.0, title="Minimum corner contrast, grey levels",
+            description="A peak is ignored unless the corner under it is worth this "
+                        "many grey levels. Without an absolute floor the relative "
+                        "threshold normalises whatever is in front of the lens up to "
+                        "'detected' -- sensor noise alone puts thousands of peaks on "
+                        "a blank wall. A printed board gives 130+, so 40 rejects "
+                        "noise with a wide margin. Lower it only after checking "
+                        "focus and light.",
             json_schema_extra={"widget": "box"})
         tint: bool = Field(
             True, title="Tint the preview",
@@ -350,9 +360,10 @@ class CheckerboardPresence(Stage):
 
         p = self.params
         if self._detector is None:
-            self._detector = PresenceDetector(p.peak_window, p.rel_threshold)
+            self._detector = PresenceDetector(p.peak_window, p.rel_threshold, p.min_contrast)
         self._detector.peak_window = int(p.peak_window)
         self._detector.rel_threshold = float(p.rel_threshold)
+        self._detector.min_contrast = float(p.min_contrast)
 
         h, w = frame.data.shape[:2]
         geom = self._geometry_source.geometry_for(w, h)

@@ -257,6 +257,23 @@ To rehearse the whole loop with no camera, run
 `config/desktop-plenoptic.yaml` and set the board to **4 × 3 inner corners,
 7 mm**.
 
+**If nothing is detected**, the answer is on the page and not in a log. The
+Preconditions panel refuses to start a session at all when the presence stage
+is missing, switched off, or not reading the MLA grid — the three ways a rig
+can run a preview and silently count nothing. Once running, the line under each
+preview reports the best tile against the threshold, the median, the total
+peaks in the frame, and what your configured board *should* give; **show what
+the detector sees** replaces the preview with every saddle peak marked and each
+micro-image's count written in its box. Between them:
+
+| what you see | what it is |
+|---|---|
+| peaks everywhere, boxes in the wrong place | the MLA grid, not the detector |
+| a handful of peaks per box where ~30 are expected | the board's squares are too large for a micro-image |
+| no peaks at all, best contrast near zero | lens cap, no light, or wildly wrong exposure |
+| peaks present, best contrast below the floor | too soft or too dim — focus and light, not the threshold |
+| 117/117 seeing but `0/5 cross tiles` | the **board size** in the settings is not the board in your hand |
+
 ### Why the tiles are polled and not streamed
 
 A browser allows about six concurrent HTTP/1.1 connections per origin, and an
@@ -309,6 +326,36 @@ enumerator made of them, which localises it in one look: in `lsblk` but not in
 the list is a bug here, in neither is a kernel or cable problem, in both but
 unmountable is a missing filesystem driver. `bash scripts/diagnose_host.sh` on
 the Pi prints the same thing with more context.
+
+### Reading a capture back
+
+Every capture is a `.npy` array plus a `.json` sidecar carrying the frame's
+metadata, the pipeline's parameters and the MLA geometry that was in force.
+`scripts/read_capture.py` opens the pair anywhere Python and OpenCV are
+installed, left or right camera, view or raw mode:
+
+```bash
+python scripts/read_capture.py path/to/left_000123.npy --show
+python scripts/read_capture.py ... --grid --corners             # overlay
+python scripts/read_capture.py ... --tile 3,-2 --zoom 6         # one micro-image
+python scripts/read_capture.py ... --detect --board 4x3 --csv corners.csv
+```
+
+The sidecar's pitch and offsets are quoted against whichever frame the stage
+was configured on, so the reader converts them to the array it is actually
+holding — a raw frame and a preview of the same pose need no different
+arguments.
+
+`--detect` is the part the rig deliberately does not do: `findChessboardCornersSB`
+over **every** micro-image, at full resolution, with the corners returned in
+frame coordinates. On the Pi that costs about a second per camera and never
+fitted in the live loop; here it costs whatever the desktop takes and is the
+input to the model fit. `--csv` writes one row per corner, `--json` the whole
+per-tile structure.
+
+Ten to twenty seconds of arithmetic on a laptop replaces a design that took the
+rig down. See §4.3 of `docs/calibration-ui-spec.md` for where each detector runs
+and why.
 
 ---
 
@@ -401,6 +448,7 @@ scripts/
   diagnose_host.sh         after a crash, or when a disk does not appear
   benchmark_detectors.py   what each detector costs, on your machine
   measure_derotation_cost.py   what tile de-rotation actually costs in precision
+  read_capture.py          open a recorded .npy + .json off the Pi, and detect
 systemd/trilobite.service  run as a service
 tests/                     all of it runs anywhere, no camera needed
 ```

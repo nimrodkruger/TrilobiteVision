@@ -451,6 +451,27 @@ def create_app(application: Application) -> FastAPI:
         """
         return application.session_discard()
 
+    @api.get("/calibration/peaks/{cam_id}.jpg")
+    def calibration_peaks(cam_id: str) -> Response:
+        """Every saddle peak the detector found, with each micro-image's count.
+
+        The diagnostic for "no board is being noticed". Read it like this:
+        peaks scattered over the image but the boxes in the wrong place is an
+        alignment problem; a handful of peaks per box where thirty are expected
+        means the board's squares are too large for a micro-image; no peaks at
+        all is exposure, focus or a lens cap.
+        """
+        _cam(cam_id)
+        try:
+            view = application.presence_overlay(cam_id)
+        except Exception as exc:
+            raise HTTPException(500, f"{type(exc).__name__}: {exc}") from None
+        if view is None:
+            raise HTTPException(
+                204, "no presence map -- is the checkerboard_presence stage enabled?")
+        return Response(encode_jpeg(view, quality=quality), media_type="image/jpeg",
+                        headers={"Cache-Control": "no-store"})
+
     @api.get("/calibration/shot/{cam_id}.jpg")
     def calibration_shot(cam_id: str) -> Response:
         """The last recorded pose, with its cross and corners drawn.

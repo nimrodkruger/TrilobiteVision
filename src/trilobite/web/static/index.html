@@ -202,6 +202,14 @@
   .banner.move { background:#2a1b33; border-color:#b07bd6; }
   .banner.move .big { color:#c79bea; }
 
+  /* --- the detector's own account of itself ------------------------------- */
+  .diag { font-family:ui-monospace,monospace; font-size:11px; color:var(--warn);
+          padding:4px 0 2px; font-variant-numeric:tabular-nums; }
+  .diag.ok { color:var(--muted); }
+  .diag b { color:var(--ink); }
+  .diag .why { color:var(--muted); font-size:10px; padding-top:2px;
+               white-space:normal; line-height:1.45; }
+
   /* --- depth spread ------------------------------------------------------- */
   .depth { margin-top:6px; }
   .depth .bars { display:flex; align-items:flex-end; gap:2px; height:44px;
@@ -976,6 +984,9 @@ async function buildCalibration() {
       <label class="why" style="margin-left:auto;display:flex;gap:5px;align-items:center">
         <input type="checkbox" id="cal-sound" checked> sound
       </label>
+      <label class="why" style="display:flex;gap:5px;align-items:center">
+        <input type="checkbox" id="cal-peaks"> show what the detector sees
+      </label>
       <span class="why">space = shoot now &nbsp; esc = discard last</span>
     </div>
     <div class="calviews" id="cal-views"></div>
@@ -1005,6 +1016,7 @@ async function buildCalibration() {
                      <span class="stat" data-seeing="${cam.cam_id}">&mdash;</span></h3>
                    <img data-calimg="${cam.cam_id}" src="/stream/${cam.cam_id}.mjpg" alt="live">
                    <div class="actions" style="display:block">
+                     <div class="diag" data-diag="${cam.cam_id}"></div>
                      <div class="cov" data-cov="${cam.cam_id}"></div>
                      <div class="covkey">
                        <span><i style="background:var(--ok)"></i>at target</span>
@@ -1126,6 +1138,21 @@ function applySession(state) {
       el.textContent = `${d.seeing}/${d.whole} seeing · strength ${d.strength}`;
       el.style.color = d.seeing ? "var(--ok)" : "var(--muted)";
     }
+    // The detector's own account of itself. "0 of 117 seeing" is true and
+    // useless; the distribution the threshold is applied to is what separates
+    // a lens cap from a threshold set twice too high from a board whose
+    // squares are larger than a micro-image.
+    const dg = document.querySelector(`[data-diag="${camId}"]`);
+    if (dg && d.diagnosis) {
+      const q = d.diagnosis;
+      dg.className = "diag" + (q.seeing ? " ok" : "");
+      dg.innerHTML =
+        `<b>best tile ${q.best}/${q.threshold}</b> · median ${q.median} · ` +
+        `${q.total_peaks} peaks in frame` +
+        (q.expected_for_board ? ` · a ${CAL.board.cols}×${CAL.board.rows} board ` +
+          `should give ~${q.expected_for_board}` : "") +
+        `<div class="why">${q.why}</div>`;
+    }
     const cov = document.querySelector(`[data-cov="${camId}"]`);
     if (cov) renderCoverage(cov, d);
   }
@@ -1137,6 +1164,19 @@ function applySession(state) {
    actually recorded, with its cross and corners drawn. Looking at a later
    preview frame that merely resembles it would defeat the point of the pause. */
 function swapViews(reviewing) {
+  const peaks = $("#cal-peaks");
+  if (peaks && peaks.checked) {
+    for (const img of document.querySelectorAll("[data-calimg]")) {
+      if (img.dataset.busy === "1") continue;
+      img.dataset.mode = "peaks";
+      img.dataset.busy = "1";
+      const done = () => { img.dataset.busy = "0"; };
+      img.onload = done; img.onerror = done;
+      img.style.outline = "2px solid var(--warn)";
+      img.src = `/calibration/peaks/${img.dataset.calimg}.jpg?t=${Date.now()}`;
+    }
+    return;
+  }
   for (const img of document.querySelectorAll("[data-calimg]")) {
     const cam = img.dataset.calimg;
     if (reviewing && img.dataset.mode !== "shot") {
@@ -1146,6 +1186,7 @@ function swapViews(reviewing) {
       img.style.outline = "2px solid var(--ok)";
     } else if (!reviewing && img.dataset.mode !== "live") {
       img.dataset.mode = "live";
+      img.dataset.busy = "0";
       img.style.outline = "";
       img.src = `/stream/${cam}.mjpg`;
     }

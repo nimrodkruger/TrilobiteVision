@@ -142,6 +142,24 @@ class SyntheticSource(CameraSource):
         # visible effect here too and the UI is testable without the rig.
         return np.clip(img * 255.0 * self._brightness, 0, 255).astype(np.uint8)
 
+    def _phase(self, at: float) -> float:
+        """Scene phase at wall-clock time `at`.
+
+        `synthetic_drift_px == 0` means a **static scene**, not merely a board
+        that does not translate: the phase is pinned to zero and every render
+        is byte-identical. Without that, a test asserting on this source is
+        asserting on the wall clock. It cost two intermittently failing
+        discrimination tests to find -- the `gratings` negative case is two
+        drifting sinusoids, and at the phases where their crests cross they
+        manufacture real saddle points, up to 21 in a micro-image against a
+        threshold of 20. The board case never flickered, so the flake looked
+        like the detector and was not.
+        """
+        if float(self.cfg.synthetic_drift_px) == 0.0:
+            return 0.0
+        # Camera id shifts the phase so two synthetic cameras look different.
+        return (at - self._t0) * 0.4 + 0.3 * (abs(hash(self.cam_id)) % 7)
+
     def read_preview(self) -> Frame | None:
         if not self._open:
             return None
@@ -153,9 +171,7 @@ class SyntheticSource(CameraSource):
             time.sleep(wait)
         self._last = time.monotonic()
         self._run_ae()
-        phase = (self._last - self._t0) * 0.4
-        # Camera id shifts the phase so two synthetic cameras look different.
-        phase += 0.3 * (abs(hash(self.cam_id)) % 7)
+        phase = self._phase(self._last)
         image = self._render(self._prev, phase)
         self._last_mean = float(image.mean())
         seq = self._next_seq()
@@ -179,7 +195,7 @@ class SyntheticSource(CameraSource):
         )
 
     def capture_full(self, raw: bool = True) -> Frame:
-        phase = (time.monotonic() - self._t0) * 0.4
+        phase = self._phase(time.monotonic())
         return Frame.now(
             self._render(self._full, phase),
             self.cam_id,

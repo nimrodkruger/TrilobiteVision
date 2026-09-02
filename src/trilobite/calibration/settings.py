@@ -546,8 +546,43 @@ def readiness_report(
         # and the symptom is the console saying "show the board" while the
         # board is plainly in shot. Blocking, because in that state the whole
         # hands-free loop is inert.
+        # The whole hands-free loop reads this stage and nothing else. It ships
+        # DISABLED in config/pi.yaml, because it is meaningless until the MLA is
+        # aligned -- and the first field run of the loop went straight into
+        # "SHOW THE BOARD" forever with a board plainly in shot, because the
+        # stage was still off and nothing said so. The MLA stage had a blocking
+        # check; this one did not. Now it does.
         presence = cam.presence_stage() if hasattr(cam, "presence_stage") else None
-        if presence is not None:
+        if presence is None:
+            checks.append(Check(
+                id=f"{cid}.presence", ok=False, blocking=True,
+                message=f"{cid}: no checkerboard_presence stage in the pipeline. "
+                        f"Add it AFTER the mla_grid_overlay stage -- it counts "
+                        f"corners into that grid's micro-images, and without it "
+                        f"the capture loop can never see a board.",
+            ))
+        else:
+            checks.append(Check(
+                id=f"{cid}.presence_enabled", ok=bool(presence.params.enabled),
+                blocking=True,
+                message=(f"{cid}: presence map enabled" if presence.params.enabled
+                         else f"{cid}: the checkerboard_presence stage is DISABLED. "
+                              f"It ships off because it is meaningless before the "
+                              f"MLA is aligned. Enable it in the imaging page -- "
+                              f"nothing can be detected until you do."),
+            ))
+            bound = getattr(presence, "_geometry_source", None) is not None
+            checks.append(Check(
+                id=f"{cid}.presence_bound", ok=bound, blocking=True,
+                message=(f"{cid}: presence map reads the MLA grid" if bound else
+                         f"{cid}: the presence stage is not bound to an MLA stage. "
+                         f"It must come after mla_grid_overlay in the pipeline."),
+            ))
+
+        # Only when the stage is actually running. A disabled presence stage
+        # is a rig not using the hands-free loop, and telling it its preview is
+        # too small is noise about a feature it is not using.
+        if presence is not None and presence.params.enabled:
             prev = _preview_resolution(cam) or (full_w, full_h)
             prev_pitch = float(p.pitch_px) * (
                 prev[0] / ref[0] if ref[0] else 1.0)

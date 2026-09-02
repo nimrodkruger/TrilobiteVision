@@ -60,6 +60,60 @@ def counts_on(img, rotation=0.0):
 # -- discrimination ---------------------------------------------------------
 
 
+def test_the_scene_is_static_with_drift_off():
+    """Guards every other assertion in this file. With `synthetic_drift_px=0`
+    the scene must not move, so successive frames differ only by sensor noise
+    -- a few grey levels, not a shifted pattern. Without that, a test that
+    measures the detector is measuring the wall clock, which is how the two
+    discrimination tests below came to fail about one run in three."""
+    for pattern in ("plenoptic_board", "gratings"):
+        s = source(pattern=pattern)
+        a = s.read_preview().data.astype(np.int16)
+        b = s.read_preview().data.astype(np.int16)
+        assert np.abs(a - b).mean() < 4.0, pattern
+
+
+def test_noise_alone_does_not_manufacture_corners():
+    """The defect the absolute contrast floor exists to close. A blank field
+    with realistic sensor noise has a saddle response everywhere; a purely
+    relative threshold normalises that up to thousands of 'corners'."""
+    from trilobite.calibration.presence import PresenceDetector
+
+    rng = np.random.default_rng(0)
+    flat = np.clip(128 + rng.normal(0, 2.5, (PREVIEW[1], PREVIEW[0])), 0, 255)
+    img = flat.astype(np.uint8)
+
+    assert PresenceDetector().saddle(img)[0].sum() == 0
+    # ... and it is the floor doing it, not luck: drop the floor and the
+    # relative gate lets thousands through.
+    assert PresenceDetector(min_contrast=2.0).saddle(img)[0].sum() > 1000
+
+
+def test_the_floor_is_quoted_in_grey_levels():
+    """The constant relating response to contrast is measured, and the whole
+    point of it is that a threshold can be stated as a property of the board.
+    An ideal step corner of contrast C must land at (1.061 C)^2."""
+    from trilobite.calibration.presence import SADDLE_PER_LEVEL, PresenceDetector
+
+    det = PresenceDetector()
+    for c in (20, 40, 80, 160):
+        img = np.full((200, 200), 128 - c // 2, np.uint8)
+        img[:100, :100] = 128 + c // 2
+        img[100:, 100:] = 128 + c // 2
+        s = det.saddle(img)[1][95:105, 95:105].max()
+        assert np.sqrt(s) / c == pytest.approx(SADDLE_PER_LEVEL, abs=0.01), c
+
+    # A corner just under the floor is rejected, just over it is kept.
+    def peaks(c):
+        img = np.full((200, 200), 128 - c // 2, np.uint8)
+        img[:100, :100] = 128 + c // 2
+        img[100:, 100:] = 128 + c // 2
+        return int(det.saddle(img)[0].sum())
+
+    assert peaks(30) == 0
+    assert peaks(60) > 0
+
+
 def test_a_board_reads_far_above_an_empty_scene():
     """The negative case here is deliberately unfair. The `gratings` pattern
     carries a hard square grid, so it genuinely contains saddle corners -- a

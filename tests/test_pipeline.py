@@ -358,25 +358,29 @@ def test_working_distance_at_the_centre_plane_is_flagged_not_infinite():
     assert "singular" in d.note
 
 
-def _cal_app(tmp_path, enabled=True, derotate=False, pitch=12.5):
+def _cal_app(tmp_path, enabled=True, derotate=False, pitch=50.0, presence=True):
     """A one-camera app for the readiness checks.
 
-    The preview is 182 x 136 -- one eighth of the 1456 x 1088 sensor, so it
-    shares the sensor's aspect ratio. That matters now that readiness converts
-    the grid to the frame detection actually runs on: a preview of some
-    unrelated shape is not a valid configuration and the checks say so, which
-    would make every test here fail for the wrong reason. The default pitch of
-    12.5 preview px is therefore 100 px on the sensor -- a realistic grid.
+    The preview is 728 x 544 -- half the 1456 x 1088 sensor, exactly as the rig
+    is configured. Two checks depend on that being realistic: the grid is
+    converted to the frame detection runs on, so a preview of some unrelated
+    aspect ratio is refused; and the presence map needs the preview to resolve
+    a board's squares, so a tiny preview is refused too. The default pitch of
+    50 preview px is 100 px on the sensor.
     """
     from trilobite.app import Application
     from trilobite.config import AppConfig, StageConfig, StorageConfig
 
+    stages = [StageConfig(type="mla_grid_overlay", name="mla", params={
+        "enabled": enabled, "pitch_px": pitch, "derotate_views": derotate,
+    })]
+    if presence:
+        stages.append(StageConfig(type="checkerboard_presence", name="presence",
+                                  params={"enabled": True, "min_corners": 20}))
     cfg = AppConfig(
         cameras=[CameraConfig(
-            cam_id="left", backend="synthetic", fps=1000, preview_resolution=(182, 136),
-            pipeline=[StageConfig(type="mla_grid_overlay", name="mla", params={
-                "enabled": enabled, "pitch_px": pitch, "derotate_views": derotate,
-            })],
+            cam_id="left", backend="synthetic", fps=1000, preview_resolution=(728, 544),
+            pipeline=stages,
         )],
         storage=StorageConfig(root=str(tmp_path / "d")),
     )
@@ -443,13 +447,48 @@ def test_crop_scale_warning_reports_the_bound(tmp_path):
 
 def test_default_grid_warns_but_does_not_block(tmp_path):
     """20 px is a legal pitch, so an untouched-looking grid is advice, not a
-    refusal -- blocking on it would be wrong for a rig that genuinely wants it."""
-    app = _cal_app(tmp_path, pitch=20.0)
+    refusal -- blocking on it would be wrong for a rig that genuinely wants it.
+
+    Asserted per check rather than on r["ready"]: this rig deliberately has no
+    presence stage, which is separately blocking. The claim under test is only
+    that *alignment* never blocks."""
+    app = _cal_app(tmp_path, pitch=20.0, presence=False)
     app.start()
     try:
         r = app.calibration_readiness()
-        assert r["ready"] is True
         assert any("alignment" in w for w in r["warnings"])
+        blocked = {c["id"] for c in r["checks"] if c["blocking"] and not c["ok"]}
+        assert not any(cid.endswith(".aligned") for cid in blocked), blocked
+    finally:
+        app.stop()
+
+
+def test_missing_presence_stage_blocks(tmp_path):
+    """The hands-free loop is driven by checkerboard_presence. A pipeline
+    without it starts, shows a preview, and silently never sees a board -- which
+    is exactly the failure reported from the rig. Make it a refusal to start."""
+    app = _cal_app(tmp_path, presence=False)
+    app.start()
+    try:
+        r = app.calibration_readiness()
+        assert r["ready"] is False
+        ids = {c["id"] for c in r["checks"] if c["blocking"] and not c["ok"]}
+        assert "left.presence" in ids, ids
+    finally:
+        app.stop()
+
+
+def test_disabled_presence_stage_blocks(tmp_path):
+    """Present but switched off is the same silence, and was the shipped state
+    of config/pi.yaml -- so it gets its own check with its own message."""
+    app = _cal_app(tmp_path)
+    app.camera("left").pipeline.update_params("presence", {"enabled": False})
+    app.start()
+    try:
+        r = app.calibration_readiness()
+        assert r["ready"] is False
+        ids = {c["id"] for c in r["checks"] if c["blocking"] and not c["ok"]}
+        assert "left.presence_enabled" in ids, ids
     finally:
         app.stop()
 

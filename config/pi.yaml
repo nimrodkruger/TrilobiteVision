@@ -43,14 +43,26 @@ cameras:
     pipeline:
       - {type: stats,      name: stats}
       - {type: levels,     name: display, params: {gain: 1.0, gamma: 1.0}}
+      # The grid must be enabled and its pitch/offsets set to the real MLA
+      # before calibration will start -- readiness blocks on both. 20 px is
+      # a placeholder, not a measurement.
       - {type: mla_grid_overlay, name: mla, params: {enabled: false, pitch_px: 20}}
       # Live checkerboard presence, for the hands-free capture loop. Costs
       # about 3 ms per preview frame and needs no camera access of its own.
       # Must come AFTER the MLA stage: it counts into that grid.
+      #
+      # ON by default, and deliberately. It shipped off, which is why the first
+      # field session reported "no board is being noticed": the calibration
+      # page started, the preview ran, and nothing ever counted anything. There
+      # was no error because a disabled stage is a legal no-op. Readiness now
+      # refuses to start the capture loop if this stage is missing or off.
+      #
       # min_corners: roughly two thirds of (cols+2)x(rows+2) for your board --
       # the Preconditions panel says what yours implies.
+      # min_contrast: grey levels a corner must be worth. 40 rejects sensor
+      # noise; a printed board gives 130+.
       - {type: checkerboard_presence, name: presence,
-         params: {enabled: false, min_corners: 20}}
+         params: {enabled: true, min_corners: 20, min_contrast: 40.0}}
 
   - cam_id: right
     label: Right camera
@@ -66,11 +78,23 @@ cameras:
     pipeline:
       - {type: stats,      name: stats}
       - {type: levels,     name: display, params: {gain: 1.0, gamma: 1.0}}
+      # The grid must be enabled and its pitch/offsets set to the real MLA
+      # before calibration will start -- readiness blocks on both. 20 px is
+      # a placeholder, not a measurement.
       - {type: mla_grid_overlay, name: mla, params: {enabled: false, pitch_px: 20}}
       # Live checkerboard presence, for the hands-free capture loop. Costs
       # about 3 ms per preview frame and needs no camera access of its own.
       # Must come AFTER the MLA stage: it counts into that grid.
+      #
+      # ON by default, and deliberately. It shipped off, which is why the first
+      # field session reported "no board is being noticed": the calibration
+      # page started, the preview ran, and nothing ever counted anything. There
+      # was no error because a disabled stage is a legal no-op. Readiness now
+      # refuses to start the capture loop if this stage is missing or off.
+      #
       # min_corners: roughly two thirds of (cols+2)x(rows+2) for your board --
       # the Preconditions panel says what yours implies.
+      # min_contrast: grey levels a corner must be worth. 40 rejects sensor
+      # noise; a printed board gives 130+.
       - {type: checkerboard_presence, name: presence,
-         params: {enabled: false, min_corners: 20}}
+         params: {enabled: true, min_corners: 20, min_contrast: 40.0}}

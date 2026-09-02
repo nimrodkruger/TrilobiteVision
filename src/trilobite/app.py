@@ -374,6 +374,27 @@ class Application:
             self.session.discard_last()
         return self.session_state()
 
+    def presence_overlay(self, cam_id: str):
+        """The current preview with every saddle peak and tile count drawn.
+
+        The answer to "no board is being noticed". A number cannot distinguish
+        a misplaced grid from a board whose squares are too large from a lens
+        cap; a picture with the peaks marked and the counts written in each
+        micro-image does it at a glance.
+        """
+        from .calibration.presence import peaks_overlay  # noqa: PLC0415 - needs cv2
+
+        cam = self.camera(cam_id)
+        stage, mla = cam.presence_stage(), cam.mla_stage()
+        frame = cam.latest()
+        if stage is None or mla is None or frame is None or stage._detector is None:
+            return None
+        h, w = frame.data.shape[:2]
+        return peaks_overlay(
+            frame.data, stage._detector, mla.geometry_for(w, h),
+            float(mla.params.crop_scale), int(stage.params.min_corners),
+        )
+
     def session_shot(self, cam_id: str):
         """The annotated review image for the last pose, or None."""
         if self.session is None:

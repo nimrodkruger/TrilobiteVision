@@ -299,11 +299,20 @@ class CaptureSession:
     def state(self) -> dict[str, Any]:
         title, hint = BANNER[self.phase]
         cams: dict[str, Any] = {}
+        board = (self.settings.board.cols, self.settings.board.rows)
         for cid, cam in self.cameras.items():
             stage = cam.presence_stage()
             result = getattr(stage, "result", None) if stage else None
             thresh = int(stage.params.min_corners) if stage else 0
             cams[cid] = {
+                "diagnosis": (
+                    result.diagnose(thresh, board) if result else
+                    {"why": ("no presence map. The checkerboard_presence stage is "
+                             "missing, disabled, or not yet producing frames."),
+                     "seeing": 0, "best": 0, "threshold": thresh, "median": 0,
+                     "whole": 0, "total_peaks": 0, "strength": 0,
+                     "expected_for_board": (board[0] + 2) * (board[1] + 2)}
+                ),
                 "seeing": len(result.seeing(thresh)) if result else 0,
                 "whole": result.n_whole if result else 0,
                 "strength": round(result.strength) if result else 0,
@@ -429,8 +438,19 @@ class CaptureSession:
         if not enough and not forced:
             self._still_run = 0
             self._last_sig = sigs
-            short = ", ".join(f"{cid} {v}/{need}" for cid, v in sorted(seen.items()))
-            self._set_phase(Phase.SEARCHING, short)
+            # Not "0/5 seeing", which is true and says nothing. The number that
+            # localises the problem is how close the BEST micro-image got to the
+            # threshold: 0 is a lens cap or a misplaced grid, 4 against 20 is a
+            # board whose squares are too large, 18 against 20 is a threshold to
+            # lower. Each has a different fix and they cost a session each to
+            # tell apart when the console only reported the count.
+            parts = []
+            for cid, (m, thresh) in sorted(maps.items()):
+                d = m.diagnose(thresh, (self.settings.board.cols, self.settings.board.rows))
+                parts.append(f"{cid} {d['seeing']}/{need} seeing, best tile "
+                             f"{d['best']}/{thresh} corners")
+            self._set_phase(Phase.SEARCHING, "  ·  ".join(parts) if parts
+                            else "no presence map -- is the stage enabled?")
             return
 
         change = max(
