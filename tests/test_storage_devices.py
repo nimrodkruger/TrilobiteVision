@@ -300,3 +300,159 @@ def test_diagnostics_reports_all_three_sources(monkeypatch):
     d = devices.diagnostics()
     assert {"lsblk", "udisks2", "proc_mounts", "block_devices", "enumerated"} <= set(d)
     assert d["udisks2"]["available"] is True
+
+
+# -- durability -------------------------------------------------------------
+#
+# The field failure these exist for: a session directory on an external drive
+# holding correctly named, correctly placed, ZERO-BYTE .npy and .json files,
+# while session.json was intact. Nothing raised; every capture reported
+# "saved". The cause is that close() does not write to a disk -- it hands the
+# bytes to the page cache and returns. Metadata takes a different route and is
+# journalled promptly, so the names survive a pulled disk and the data does
+# not. session.json survived because it is written at startup and writeback had
+# had minutes to flush it.
+
+
+def test_a_capture_is_fsynced_before_it_is_reported_saved(writer, monkeypatch):
+    """The mechanism, asserted directly: fsync must be called on the file, and
+    on the directory holding it, before save_still returns."""
+    import os as _os
+
+    synced = []
+    real_fsync = _os.fsync
+    monkeypatch.setattr(_os, "fsync", lambda fd: (synced.append(fd), real_fsync(fd))[1])
+
+    out = writer.save_still(frame())
+    # image + image's directory + sidecar + sidecar's directory
+    assert len(synced) >= 4, synced
+    assert out["bytes"] > 0
+
+
+def test_save_still_reports_the_size_on_disk(writer):
+    out = writer.save_still(frame())
+    from pathlib import Path as _P
+    assert out["bytes"] == _P(out["image"]).stat().st_size
+    assert out["bytes"] > 128            # a .npy header alone is 128 bytes
+
+
+def test_an_empty_file_is_an_error_not_a_success(writer, monkeypatch):
+    """The whole point. A filesystem that accepts every byte and stores none
+    must produce a failure the operator sees at the rig, not a directory of
+    empty files discovered at the desk a day later."""
+    from trilobite.storage import writer as W
+
+    monkeypatch.setattr(W, "write_durably", lambda path, payload: (path.write_bytes(b""), 0)[1])
+    monkeypatch.setattr(devices, "is_mounted", lambda p: True)
+
+    with pytest.raises(W.EmptyWriteError) as exc:
+        writer.save_still(frame())
+    assert "0 bytes" in str(exc.value)
+
+
+def test_a_short_write_is_an_error_too(writer, monkeypatch):
+    """Not only zero. A device that is full, or failing, or lying about its
+    writes gives a file of the wrong length, and that is equally not a save."""
+    from trilobite.storage import writer as W
+
+    def truncating(path, payload):
+        path.write_bytes(payload[: len(payload) // 2])
+        return path.stat().st_size
+
+    monkeypatch.setattr(W, "write_durably", truncating)
+    monkeypatch.setattr(devices, "is_mounted", lambda p: True)
+
+    with pytest.raises(W.EmptyWriteError) as exc:
+        writer.save_still(frame())
+    assert "bytes on disk but" in str(exc.value)
+
+
+def test_an_empty_write_falls_back_to_the_internal_disk(writer, tmp_path, monkeypatch):
+    """EmptyWriteError is an OSError deliberately, so it takes the existing
+    recovery path: a device that just silently discarded a frame is one the
+    rest of the session must not be written to either."""
+    from trilobite.storage import writer as W
+
+    stick = tmp_path / "stick"
+    stick.mkdir()
+    writer.retarget(stick)
+
+    calls = {"n": 0}
+    real = W.write_durably
+
+    def once_empty(path, payload):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            path.write_bytes(b"")
+            return 0
+        return real(path, payload)
+
+    monkeypatch.setattr(W, "write_durably", once_empty)
+    monkeypatch.setattr(devices, "is_mounted", lambda p: False)
+
+    out = writer.save_still(frame())
+    assert out["image"].startswith(str(writer.default_root))
+    assert out["bytes"] > 128
+    assert any("recovering" in n for n in writer.notes)
+
+
+def test_the_written_file_actually_loads_back(writer):
+    """End to end, because a size check is not a content check."""
+    import numpy as _np
+
+    f = Frame.now(_np.arange(64, dtype=_np.uint8).reshape(8, 8), "left", 1)
+    out = writer.save_still(f)
+    assert _np.array_equal(_np.load(out["image"]), f.data)
+
+
+def test_the_session_manifest_is_durable_too(writer):
+    """It survived the field failure by luck -- it is written at startup, so
+    writeback had flushed it. A manifest written after a retarget has no such
+    head start."""
+    import os as _os
+
+    synced = []
+    real_fsync = _os.fsync
+    import trilobite.storage.writer as W
+    monkeypatch_target = W.os
+    orig = monkeypatch_target.fsync
+    monkeypatch_target.fsync = lambda fd: (synced.append(fd), real_fsync(fd))[1]
+    try:
+        path = writer.write_session_manifest({"hello": "world"})
+    finally:
+        monkeypatch_target.fsync = orig
+    assert path.stat().st_size > 0
+    assert len(synced) >= 2
+
+
+def test_verify_device_passes_on_a_working_filesystem(tmp_path):
+    from trilobite.storage.writer import verify_device
+
+    r = verify_device(tmp_path, size_bytes=1 << 20)
+    assert r["ok"] is True
+    assert r["on_disk"] == 1 << 20
+    assert r["write_mb_s"] > 0
+    assert not list(tmp_path.glob(".trilobite-verify-*")), "the probe must be cleaned up"
+
+
+def test_verify_device_fails_on_a_filesystem_that_stores_nothing(tmp_path, monkeypatch):
+    """The exact field failure, simulated: writes are accepted and discarded."""
+    from trilobite.storage import writer as W
+
+    monkeypatch.setattr(W, "write_durably", lambda path, payload: (path.write_bytes(b""), 0)[1])
+    r = W.verify_device(tmp_path, size_bytes=1 << 20)
+    assert r["ok"] is False
+    assert "0 bytes" in r["message"]
+
+
+def test_verify_device_fails_when_the_bytes_come_back_wrong(tmp_path, monkeypatch):
+    from trilobite.storage import writer as W
+
+    def corrupting(path, payload):
+        path.write_bytes(bytes(len(payload)))      # right length, wrong content
+        return path.stat().st_size
+
+    monkeypatch.setattr(W, "write_durably", corrupting)
+    r = W.verify_device(tmp_path, size_bytes=1 << 16)
+    assert r["ok"] is False
+    assert "corrupting" in r["message"]

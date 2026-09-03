@@ -12,6 +12,93 @@ git checkout .              # everything back to HEAD
 
 ---
 
+## 2026-09-03 (f) — captures reached the disk as zero-byte files
+
+Reported from the rig, writing to an external drive: the session directory, the
+per-camera subdirectories and every filename were correct, `session.json` was
+intact, and **every `.npy` and `.json` from the run was zero bytes**. Nothing
+raised. Every capture had reported "saved".
+
+### The mechanism
+
+`close()` does not write anything to a disk. It returns as soon as the bytes are
+in the kernel's page cache; writeback flushes them when it feels like it —
+thirty seconds later by default (`dirty_expire_centisecs`), or never if the
+power goes or the disk is pulled. File **metadata** takes a different route: on
+a journalling filesystem the directory entry is durable long before the data is.
+
+The two together produce a signature that looks like nothing else and points
+straight at the cause: correct names, correct places, zero length. And it
+explains the one file that survived — `session.json` is written at startup, so
+writeback had had minutes to flush it, while the captures were minutes or
+seconds old when the drive left.
+
+Every write in the project was `close()`-and-hope: `np.save(path, ...)`,
+`Path.write_text(...)`, in both the still writer and the calibration session.
+
+### The fix
+
+| change | file |
+|---|---|
+| `fsync_file`, `fsync_dir`, `write_durably`, `verify_size`, `EmptyWriteError` | `storage/writer.py` |
+| `_write_image` serialises to memory, writes the buffer, fsyncs, verifies the exact length | `storage/writer.py` |
+| the sidecar and `session.json` go through the same path | `storage/writer.py` |
+| pose frames, pose sidecars, the manifest and `poses.jsonl` likewise | `calibration/session.py` |
+| `bytes` in every save response, shown next to every capture in the UI | `storage/writer.py`, `web/static/index.html` |
+
+Three properties, in order of importance:
+
+1. **Verified, not just flushed.** The size is read back off the filesystem and
+   checked against the exact number of bytes written. A device that accepts
+   everything and stores nothing now raises `EmptyWriteError` at the rig instead
+   of producing a directory of empty files discovered a day later. This matters
+   more than the fsync: fsync prevents the loss, verification prevents the
+   *silence*.
+2. **Both the data and the name.** Fsyncing a file says nothing about the
+   directory entry pointing at it, so the containing directory is fsync'd too.
+   Windows cannot open a directory, so that failure is logged at debug and
+   ignored rather than failing captures on the dev machine.
+3. **An empty write takes the existing recovery path.** `EmptyWriteError`
+   subclasses `OSError` deliberately: a device that just silently discarded a
+   frame is one the rest of the session must not be written to either, so the
+   writer falls back to the internal disk and notes it.
+
+Cost, measured: `save_still` for a 1456×1088 uint8 frame went to a **median of
+20.4 ms** (p90 22.1, max 22.6) including the fsync. At 1 Hz, or at the rate a
+person presses the space bar, that is not a constraint.
+
+### Also: a pre-flight check
+
+`POST /api/storage/verify`, and a **Verify** button on the storage panel. Writes
+4 MB to the active session directory, flushes it, reads every byte back and
+compares. Catches a mount that accepts writes and stores nothing, a full or
+read-only filesystem, and a device too slow to hold the capture rate — before a
+session rather than after. It does not prove the disk survives being unplugged;
+nothing short of unplugging it does.
+
+Rollback: `write_durably` reverts to `path.write_bytes(payload)` and
+`verify_size` to `return path.stat().st_size` — that restores the old behaviour
+exactly, without touching any call site.
+
+### Verification
+
+```
+pytest -q                       → 143 passed
+ruff check src/ tests/ scripts/ → clean
+```
+
+Seven new tests in `tests/test_storage_devices.py`, and they were
+**mutation-tested**: reverting `write_durably` to a plain write and disabling
+the size checks — that is, restoring the exact pre-fix behaviour — fails five of
+them. A test for a data-loss bug that passes against the buggy code is worth
+nothing, so this was checked rather than assumed.
+
+End to end in the browser: quick-record wrote 1.51 MB per frame, the size
+appears beside every capture, and Verify reported 4 MB read back identically at
+86 MB/s and survived the storage panel's re-render.
+
+---
+
 ## 2026-09-02 (e) — quick-record, and the MATLAB reading path
 
 Still nothing detected on the rig after (d). Rather than keep debugging the

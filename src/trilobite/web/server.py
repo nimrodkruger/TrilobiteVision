@@ -499,6 +499,20 @@ def create_app(application: Application) -> FastAPI:
     def storage() -> dict[str, Any]:
         return application.storage_state()
 
+    @api.post("/api/storage/verify")
+    def storage_verify() -> dict[str, Any]:
+        """Write a few MB to the active session directory, flush it, read it back.
+
+        Exists because the alternative to checking a disk deliberately is
+        finding out at the end of a session. It catches a mount that accepts
+        writes and stores nothing, a full or read-only filesystem, and a device
+        too slow to hold the capture rate. It does NOT prove the disk survives
+        being unplugged -- nothing short of unplugging it does.
+        """
+        from ..storage.writer import verify_device  # noqa: PLC0415
+
+        return verify_device(application.writer.session_dir)
+
     @api.post("/api/storage/target")
     def storage_target(body: StorageTarget) -> dict[str, Any]:
         """Send subsequent captures to a different filesystem.

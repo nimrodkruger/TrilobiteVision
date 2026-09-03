@@ -315,6 +315,24 @@ from the Storage panel in imaging mode.
   mount point behind as an ordinary empty directory, so writes otherwise keep
   *succeeding* — onto the SD card, under a path that says otherwise.
 
+- **A capture is on the device before it is called saved.** `close()` does not
+  write to a disk — it hands the bytes to the page cache and returns, and
+  writeback flushes them thirty seconds later or never. Metadata is journalled
+  promptly, so a disk pulled or a Pi powered off in between leaves correctly
+  named, correctly placed, **zero-byte** files. That cost a session here. Every
+  file is now fsync'd, its directory is fsync'd so the name is durable too, and
+  the size is read back and checked against what was written before the capture
+  is reported. A write that lands short or empty raises and falls back to the
+  internal disk rather than reporting success. Cost: about 20 ms per frame.
+- **Check a disk before trusting it.** **Verify** on the storage panel writes
+  4 MB to the live session directory, flushes it, reads every byte back and
+  compares. It catches a mount that accepts writes and stores nothing, a full or
+  read-only filesystem, and a device too slow for the capture rate. It cannot
+  prove the disk survives being unplugged; nothing short of unplugging it does.
+
+The size on disk is shown beside every capture in the UI. If it ever reads
+`0 BYTES — NOT SAVED`, stop and press Verify.
+
 To remove a disk: press **Release** so captures go back to `storage.root`, then
 **Unmount**. Unmount refuses while anything holds the filesystem open, which
 includes this application, so the order matters. `storage.root` is the fallback
@@ -432,6 +450,7 @@ traps between NumPy and MATLAB.
 | POST | `/api/storage/mount` | `{"device": "/dev/sda1"}` — mount a plugged-in disk |
 | POST | `/api/storage/unmount` | `{"device": "/dev/sda1"}` — so it can be pulled safely |
 | POST | `/api/storage/release` | back to `storage.root` |
+| POST | `/api/storage/verify` | write 4 MB, flush, read it back and compare |
 | GET | `/api/storage/diagnostics` | raw `lsblk`, `/proc/mounts`, udisks2 — why is my disk missing |
 
 Sensor controls and pipeline parameters are separate endpoints on purpose. One

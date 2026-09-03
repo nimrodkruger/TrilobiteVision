@@ -45,6 +45,7 @@ files. A pose you rejected by reflex and want back later is worth more than the
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import shutil
@@ -58,6 +59,7 @@ from typing import Any
 
 import numpy as np
 
+from ..storage.writer import verify_size, write_durably
 from ..types import Frame
 from .detect import CornerDetector
 from .settings import CalibrationSettings
@@ -591,7 +593,14 @@ class CaptureSession:
                 # you are looking at the actual evidence, not at a later preview
                 # frame that merely resembles it.
                 self.last_shot[cid] = review_image(frame.data, r)
-                np.save(pose_dir / f"{cid}.npy", frame.data)
+                # Durable, and verified. A pose written into the page cache and
+                # never flushed is a pose that is not there -- see the header of
+                # storage/writer.py for the session this cost.
+                buf = io.BytesIO()
+                np.save(buf, frame.data, allow_pickle=False)
+                body = buf.getvalue()
+                write_durably(pose_dir / f"{cid}.npy", body)
+                verify_size(pose_dir / f"{cid}.npy", len(body))
                 sidecar = {
                     "cam_id": cid,
                     "seq": frame.seq,
@@ -606,8 +615,9 @@ class CaptureSession:
                     **{k: v for k, v in r.items() if k != "corners"},
                     "corners": r["corners"],
                 }
-                (pose_dir / f"{cid}.json").write_text(
-                    json.dumps(sidecar, indent=2), encoding="utf-8")
+                meta = json.dumps(sidecar, indent=2).encode("utf-8")
+                write_durably(pose_dir / f"{cid}.json", meta)
+                verify_size(pose_dir / f"{cid}.json", len(meta))
                 entry.cameras[cid] = {k: v for k, v in r.items() if k != "corners"}
                 for key in r["cross"]:
                     k = (int(key[0]), int(key[1]))
@@ -646,7 +656,7 @@ class CaptureSession:
                 "derotate_views": bool(stage.params.derotate_views),
                 "camera": info.as_dict(),
             }
-        (self.dir / "session.json").write_text(json.dumps({
+        manifest = json.dumps({
             "started": time.time(),
             "started_iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "settings": self.settings.model_dump(),
@@ -655,10 +665,14 @@ class CaptureSession:
                     "Full-field detection and the fit are done offline from the "
                     "frames in each pose directory; the cross recorded here is "
                     "only the acceptance check that let the pose be kept.",
-        }, indent=2), encoding="utf-8")
+        }, indent=2).encode("utf-8")
+        write_durably(self.dir / "session.json", manifest)
+        verify_size(self.dir / "session.json", len(manifest))
 
     def _write_index(self) -> None:
         if self.dir is None:
             return
         lines = [json.dumps(p.as_dict()) for p in self.poses]
-        (self.dir / "poses.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        body = ("\n".join(lines) + "\n").encode("utf-8")
+        write_durably(self.dir / "poses.jsonl", body)
+        verify_size(self.dir / "poses.jsonl", len(body))

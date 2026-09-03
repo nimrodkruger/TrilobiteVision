@@ -584,6 +584,13 @@ async function refreshSubaps(camId) {
 --------------------------------------------------------------------------- */
 const gb = n => `${(n / 1e9).toFixed(1)} GB`;
 
+let VERIFY_NOTE = { text: "", cls: "" };
+function setVerifyNote(text, cls) {
+  VERIFY_NOTE = { text, cls };
+  const el = $("#storage-verify-note");
+  if (el) { el.textContent = text; el.className = "note " + cls; }
+}
+
 function renderStorage(s) {
   const host = $("#storage-body");
   if (!host || !s) return;
@@ -598,9 +605,33 @@ function renderStorage(s) {
       ${a.present ? "" : `<span class="tag rm">MISSING</span>`}</div>
     <div class="path"></div>
     <div class="foot"><span class="cap">${gb(a.free_bytes)} free of ${gb(a.total_bytes)}</span>
+      <button class="ghost" id="storage-verify"
+        title="Write a few MB here, flush it, read it back and compare. Catches a disk that accepts writes and stores nothing — before a session, not after.">Verify</button>
       <button class="ghost" id="storage-release" ${a.removable ? "" : "disabled"}>Release</button>
-    </div>`;
+    </div>
+    <div class="note" id="storage-verify-note"></div>`;
   head.querySelector(".path").textContent = a.session_dir;
+  // The panel is rebuilt on every storage poll, so the verify result has to
+  // live outside the DOM or it vanishes a second after it appears.
+  const vn = head.querySelector("#storage-verify-note");
+  vn.textContent = VERIFY_NOTE.text;
+  vn.className = "note " + VERIFY_NOTE.cls;
+  head.querySelector("#storage-verify").onclick = async ev => {
+    // A pre-flight, offered because the failure it looks for is silent and
+    // total: a session written to a device that stored none of it.
+    const btn = ev.currentTarget;
+    btn.disabled = true; btn.textContent = "Checking…";
+    setVerifyNote("writing 4 MB, flushing, reading it back…", "");
+    try {
+      const r = await jsend("/api/storage/verify");
+      setVerifyNote(r.message, r.ok ? "ok" : "err");
+      log(`storage verify: ${r.message}`, r.ok ? "ok" : "err");
+    } catch (e) {
+      setVerifyNote(e.message, "err");
+    } finally {
+      btn.disabled = false; btn.textContent = "Verify";
+    }
+  };
   el.appendChild(head);
 
   for (const d of s.devices) {
@@ -776,7 +807,7 @@ async function buildLive() {
     btn.disabled = true;
     try {
       const r = await jsend(`/api/capture/${cam}/${kind}`);
-      note(cam, `${r.file}  ${r.shape.join("×")} ${r.dtype}`, "ok");
+      note(cam, savedText(r), "ok");
     } catch (e) {
       note(cam, `save ${kind} failed: ${e.message}`, "err");
     } finally {
@@ -1320,6 +1351,23 @@ async function setMode(mode) {
 $("#mode-live").onclick = () => setMode("live");
 $("#mode-cal").onclick = () => setMode("cal");
 
+/* Saved-file description. The BYTE COUNT is not decoration: the rig once
+   reported "saved" for a whole session that reached the disk as zero-length
+   files, and a size shown next to every capture is what makes that visible in
+   the first second rather than the next day. The writer now refuses to report
+   a save it cannot verify, so this should never read 0 -- but it is the number
+   that would say so. */
+function savedText(v) {
+  return `${v.file}  ${v.shape.join("×")} ${v.dtype}  ${fmtBytes(v.bytes)}`;
+}
+function fmtBytes(n) {
+  if (n === undefined || n === null) return "";
+  if (n === 0) return "0 BYTES — NOT SAVED";
+  if (n < 1024) return `${n} B`;
+  if (n < 1048576) return `${(n / 1024).toFixed(1)} kB`;
+  return `${(n / 1048576).toFixed(2)} MB`;
+}
+
 async function saveAll(kind, btn) {
   // Feedback lands in three places on purpose: the button itself (so the
   // click is visibly acknowledged even before the write finishes), each
@@ -1337,7 +1385,7 @@ async function saveAll(kind, btn) {
     const failed = Object.values(r).some(v => v.error);
     for (const [cam, v] of Object.entries(r)) {
       note(cam, v.error ? `save ${kind} failed: ${v.error}`
-                        : `${v.file}  ${v.shape.join("×")} ${v.dtype}`,
+                        : savedText(v),
            v.error ? "err" : "ok");
     }
     log(Object.entries(r).map(([k, v]) => `${k}: ${v.file || v.error}`).join("   |   "),
@@ -1405,7 +1453,7 @@ async function quickShot() {
       QUICK_N += 1;
       SOUNDS.captured();
       for (const [cam, v] of Object.entries(r)) {
-        note(cam, `${v.file}  ${v.shape.join("×")} ${v.dtype}`, "ok");
+        note(cam, savedText(v), "ok");
       }
       log(`quick-record ${QUICK_N}: ` +
           Object.entries(r).map(([k, v]) => `${k}: ${v.file}`).join("   |   "), "ok");
