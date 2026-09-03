@@ -58,8 +58,29 @@ log = logging.getLogger(__name__)
 class MLAParams(StageParams):
     """Shared by the overlay and by sub-aperture extraction.
 
-    Offsets are in pixels **from the centre pixel of the frame**, which is the
-    anchor the whole grid hangs from. Positive x is right, positive y is down.
+    **Every length here is in FULL-RESOLUTION SENSOR PIXELS**, whatever frame
+    happens to be on screen. Offsets are from the centre pixel of the sensor
+    frame, which is the anchor the whole grid hangs from; positive x is right,
+    positive y is down.
+
+    That choice is deliberate and it was made the second way round first. The
+    grid is *aligned* against the preview, so the obvious thing is to store the
+    numbers in preview pixels and convert on the way out. It works, and it puts
+    a conversion between the stored value and every consumer of it -- the
+    detector, the crops, the recorded corners, the offline readers -- so that
+    forgetting the conversion anywhere is a silent factor-of-two, and changing
+    the preview resolution silently invalidates a stored alignment.
+
+    Sensor pixels have no such dependency. The MLA pitch is a physical property
+    of the lens array: pitch_um / pixel_pitch_um, fixed by hardware, the same
+    number tomorrow whatever the preview is set to. Everything that measures
+    works in sensor pixels already, so for them the conversion disappears
+    entirely, and the only place one remains is drawing the overlay -- where
+    being wrong is visible immediately rather than six months later in a fit.
+
+    The cost is that one preview pixel of nudge is two sensor pixels of grid.
+    The boxes take fractional values, so the resolution is still there; it is
+    the sliders that are coarser, on a rig where the pitch is ~100 sensor px.
     """
 
     enabled: bool = False
@@ -67,10 +88,13 @@ class MLAParams(StageParams):
     # theoretically permissive. A pitch above ~400 px leaves three lenslets on
     # a 1456 px sensor, and the origin never needs to move more than a pitch or
     # two from centre -- the box takes exact values within these bounds anyway.
-    pitch_px: float = Field(20.0, gt=1.0, le=400.0, description="Lenslet pitch, pixels")
+    pitch_px: float = Field(
+        20.0, gt=1.0, le=800.0, description="Lenslet pitch, SENSOR pixels")
     rotation_deg: float = Field(0.0, ge=-45.0, le=45.0, description="Grid rotation, degrees")
-    offset_x: float = Field(0.0, ge=-500.0, le=500.0, description="Grid origin x from centre, px")
-    offset_y: float = Field(0.0, ge=-500.0, le=500.0, description="Grid origin y from centre, px")
+    offset_x: float = Field(
+        0.0, ge=-1000.0, le=1000.0, description="Grid origin x from centre, SENSOR px")
+    offset_y: float = Field(
+        0.0, ge=-1000.0, le=1000.0, description="Grid origin y from centre, SENSOR px")
     crop_scale: float = Field(
         1.0, gt=0.1, le=4.0, description="Sub-aperture crop side, as a multiple of pitch"
     )
@@ -82,18 +106,18 @@ class MLAParams(StageParams):
             "rotated and resampling would only blur it. See the module docstring."
         ),
     )
-    # The frame size these numbers were measured against. Learned from the
-    # first frame and thereafter carried in the saved state, because "pitch =
-    # 100 px" is meaningless on its own: the same physical grid is 100 px on the
-    # 728-wide preview you aligned it against and 200 px on the 1456-wide sensor
-    # frame that calibration crops from. Hidden in the UI -- it is a unit, not a
-    # knob.
+    # The frame these numbers are expressed in: the SENSOR frame, bound once
+    # from the camera at start-up rather than learned from whatever frame
+    # happens to arrive. It stays recorded because "pitch = 100 px" is
+    # meaningless on its own, and because a stored alignment made against a
+    # different sensor mode has to be detectable. Hidden in the UI -- it is a
+    # unit, not a knob.
     reference_width: int = Field(
-        0, ge=0, description="Frame width these parameters were set against (0 = learn it)",
+        0, ge=0, description="Sensor width these parameters are in (0 = not bound yet)",
         json_schema_extra={"widget": "hidden"},
     )
     reference_height: int = Field(
-        0, ge=0, description="Frame height these parameters were set against (0 = learn it)",
+        0, ge=0, description="Sensor height these parameters are in (0 = not bound yet)",
         json_schema_extra={"widget": "hidden"},
     )
 
@@ -137,8 +161,9 @@ class MLAGridOverlay(Stage):
     def geometry(self, width: int, height: int) -> MLAGeometry:
         """Geometry with the parameters taken **verbatim**, at this frame size.
 
-        Correct only when (width, height) is the reference resolution -- the
-        preview. Anything reading a different-sized frame wants geometry_for().
+        Correct only when (width, height) is the reference resolution -- which
+        is now the SENSOR frame. Anything holding a different-sized frame, the
+        preview included, wants geometry_for().
         """
         p = self.params
         return MLAGeometry(
@@ -159,19 +184,27 @@ class MLAGridOverlay(Stage):
         h = int(self.params.reference_height)
         return (w, h) if w > 0 and h > 0 else None
 
-    def note_frame_size(self, width: int, height: int) -> None:
-        """Record, or follow, the resolution the parameters are measured in.
+    def bind_sensor(self, width: int, height: int) -> None:
+        """Declare the sensor frame these parameters are expressed in.
 
-        Called once per preview frame. Three cases:
+        Called ONCE, at camera start, with the camera's full resolution --
+        never from a frame flowing through the pipeline. That is the whole
+        difference between this and what it replaced: the old version took its
+        reference from whatever frame it first saw, which was always the
+        preview, so the stored pitch silently meant preview pixels and every
+        consumer needed a conversion it could forget.
 
-          * no reference yet -- adopt this frame's size. First run, or a state
-            file written before this field existed.
-          * reference matches -- nothing to do, the common case.
-          * reference differs -- the preview resolution was changed in the
-            config since the grid was aligned. **Rescale the parameters** so
-            the grid stays on the same physical lenslets, and say so. The
-            alternative, keeping the numbers and quietly meaning something
-            else, would look like the alignment spontaneously drifting.
+        Three cases:
+
+          * not bound yet -- adopt the sensor size. First run, or a config
+            written before the parameters were sensor-native.
+          * already bound to this sensor -- nothing to do, the common case.
+          * bound to something else -- either an older alignment stored in
+            preview pixels, or a genuine sensor-mode change. **Rescale the
+            parameters** so the grid stays on the same physical lenslets, and
+            say so loudly. This is the migration path: a config carrying
+            `pitch_px: 50, reference_width: 728` becomes `pitch_px: 100,
+            reference_width: 1456` the first time it meets the camera, once.
         """
         ref = self.reference_shape
         if ref == (width, height):
@@ -183,13 +216,14 @@ class MLAGridOverlay(Stage):
         try:
             g = self.geometry(*ref).rescaled(width, height)
         except ValueError as exc:
-            log.warning("%s: cannot follow a resolution change: %s", self.name, exc)
+            log.warning("%s: cannot rebase the grid onto the sensor frame: %s", self.name, exc)
             self.params.reference_width = int(width)
             self.params.reference_height = int(height)
             return
         log.warning(
-            "%s: preview resolution changed %dx%d -> %dx%d; rescaling the grid "
-            "(pitch %.3f -> %.3f px) so it stays on the same lenslets",
+            "%s: rebasing the grid from a %dx%d reference onto the %dx%d sensor "
+            "frame (pitch %.3f -> %.3f px). Grid parameters are sensor pixels now; "
+            "this happens once.",
             self.name, ref[0], ref[1], width, height, self.params.pitch_px, g.pitch,
         )
         self.params.pitch_px = g.pitch
@@ -202,10 +236,11 @@ class MLAGridOverlay(Stage):
     def geometry_for(self, width: int, height: int) -> MLAGeometry:
         """Geometry converted to whatever frame size the caller is holding.
 
-        This is the entry point for anything that is not the preview -- above
-        all the calibration detector, which crops from the full-resolution
-        sensor frame while these parameters were tuned on the half-scale
-        preview. See MLAGeometry.rescaled for why the conversion is exact.
+        The entry point for **everything**. For the detector and the crops,
+        which hold the full sensor frame, it is now an identity -- that is the
+        point of storing sensor pixels. For the overlay and the preview-sized
+        views it scales down. See MLAGeometry.rescaled for why the conversion
+        is exact either way.
         """
         ref = self.reference_shape or (width, height)
         if ref == (width, height):
@@ -225,7 +260,13 @@ class MLAGridOverlay(Stage):
         )
         if key == self._key and self._mask is not None:
             return self._mask
-        geom = self.geometry(w, h)
+        # geometry_for, not geometry: the parameters are in sensor pixels and
+        # this is drawing on the preview, so the grid has to be scaled down to
+        # it. Using the parameters verbatim here would draw a grid at half the
+        # pitch it means, which is the one place this mistake is instantly
+        # visible -- and the reason the overlay is a safe place to keep the
+        # only remaining conversion.
+        geom = self.geometry_for(w, h)
         grid = geom.grid_mask((h, w), line_width=float(p.line_width))
         if p.show_centre:
             grid = grid | geom.centre_marker_mask((h, w))
@@ -243,9 +284,9 @@ class MLAGridOverlay(Stage):
     def apply(self, frame: Frame) -> Frame:
         d = frame.data
         h, w = d.shape[:2]
-        # The preview is the frame these parameters are measured against, so
-        # this is where the reference resolution is established.
-        self.note_frame_size(w, h)
+        # No reference is learned here. The parameters are sensor pixels, bound
+        # once from the camera by Application.start(); a preview frame arriving
+        # is not evidence of anything.
         grid, hi = self._masks(h, w)
         out = d.copy()
 
@@ -257,7 +298,7 @@ class MLAGridOverlay(Stage):
         out[grid] = (out[grid] * (1 - alpha) + peak * alpha).astype(out.dtype)
         out[hi] = peak
 
-        geom = self.geometry(w, h)
+        geom = self.geometry_for(w, h)
         named = geom.named_indices(float(self.params.crop_scale))
         return frame.derive(
             out,

@@ -37,13 +37,15 @@ def make_app(tmp_path, cameras=("left", "right"), pattern="plenoptic_board"):
                 full_resolution=(1456, 1088), preview_resolution=(728, 544),
                 synthetic_pattern=pattern, synthetic_pitch_px=100.0,
                 synthetic_board=BOARD,
-                # 50 preview px is 100 px on the sensor. The preview has to
-                # resolve the board's squares or the presence map sees nothing:
-                # at 1/8 scale a micro-image is 12 px across and its squares
-                # are two, which is below anything a saddle detector can find.
+                # pitch_px is SENSOR pixels, so it matches synthetic_pitch_px
+                # exactly and the overlay halves it to draw on the preview. The
+                # preview still has to resolve the board's squares or the
+                # presence map sees nothing: at 1/8 scale a micro-image is 12 px
+                # across and its squares are two, below anything a saddle
+                # detector can find.
                 pipeline=[
                     StageConfig(type="mla_grid_overlay", name="mla",
-                                params={"enabled": True, "pitch_px": 50.0}),
+                                params={"enabled": True, "pitch_px": 100.0}),
                     StageConfig(type="checkerboard_presence", name="presence",
                                 params={"enabled": True, "min_corners": 8, "tint": False}),
                 ],

@@ -20,18 +20,27 @@ function cap = tv_read_capture(path)
 %     .mla          the grid geometry, RESCALED TO THIS FRAME (see below)
 %     .files        the paths it read
 %
-%   THE RESCALING, which is the one thing that must not be got wrong.
-%   The MLA grid is aligned by eye against the preview stream (728 x 544 on
-%   this rig) and the sidecar records `pitch_px` and the offsets in THOSE
-%   pixels, together with the reference size they were quoted against. A raw
-%   capture is the full sensor frame (1456 x 1088), so pitch and both offsets
-%   must be multiplied by 1456/728 = 2 before they mean anything here.
+%     .trimmed_padding  columns of raw row-stride padding removed on load
 %
-%   Getting this wrong does not raise. It puts every crop between micro-images
-%   instead of on one, and the symptom is simply that nothing ever detects --
-%   which is indistinguishable, from the outside, from an optics problem. So
-%   the conversion is done here, once, and .mla is always in the coordinates of
-%   .image. The unscaled original is kept in .mla.reference for reference.
+%   TWO THINGS ARE RECONCILED HERE, and both are silent when wrong.
+%
+%   1. STRIDE PADDING. A raw buffer's rows are padded to a hardware-friendly
+%   stride and the array is shaped by that stride, not by the image width. The
+%   IMX296 is 1456 px wide; 1456 is not a multiple of 32, so an 8-bit raw frame
+%   arrives 1088 x 1472 with sixteen columns on the right that are not image
+%   data. Left in, they make the frame 2.022x the preview horizontally against
+%   2.000x vertically -- an anisotropic rescale -- and, worse, move the frame
+%   CENTRE 8 px right, which shifts every micro-image by a quarter of a
+%   checkerboard square. Captures are trimmed at source now; this trims the
+%   files already on disk, using camera.full_resolution from the sidecar.
+%
+%   2. UNITS. The MLA parameters are recorded in FULL-RESOLUTION SENSOR pixels,
+%   alongside the reference frame they are expressed in, so for a raw capture
+%   the conversion below is the identity. Older captures recorded them in
+%   preview pixels against a 728-wide reference; those still read correctly,
+%   because the conversion is driven by the recorded reference either way.
+%   .mla is always in the coordinates of .image, and .mla.reference keeps the
+%   numbers exactly as recorded.
 %
 %   COORDINATES. .mla is in the Python convention: pixel centres at 0-based
 %   integers, x to the right, y DOWN, the frame centre at ((W-1)/2, (H-1)/2).
@@ -76,7 +85,8 @@ function cap = tv_read_capture(path)
   end
 
   % The sidecar records the shape independently of the file. If they disagree,
-  % one of the two was written by something other than this rig.
+  % one of the two was written by something other than this rig. Checked before
+  % any trimming, so it compares like with like.
   if isfield(info, 'shape')
     want = double(info.shape(:))';
     got  = size(img);
@@ -86,10 +96,13 @@ function cap = tv_read_capture(path)
     end
   end
 
+  [img, trimmed] = i_trim_stride(img, info);
+
   cap = struct();
   cap.image  = img;
   cap.height = size(img, 1);
   cap.width  = size(img, 2);
+  cap.trimmed_padding = trimmed;
   cap.info   = info;
   cap.files  = struct('image', img_path, 'metadata', json_path);
 
@@ -102,6 +115,53 @@ function cap = tv_read_capture(path)
   cap.camera   = i_get(info, 'camera', struct());
 
   [cap.mla, cap.has_mla] = i_geometry(cap.pipeline, cap.width, cap.height);
+end
+
+
+function [img, trimmed] = i_trim_stride(img, info)
+%I_TRIM_STRIDE  Drop raw row-stride padding from captures that still carry it.
+%
+%   A raw buffer's rows are padded out to a hardware-friendly stride, and the
+%   array is shaped by that stride rather than by the image width. The IMX296
+%   is 1456 px wide, 1456 is not a multiple of 32, so an 8-bit raw frame
+%   arrives 1088 x 1472: sixteen columns on the right that are not image data.
+%
+%   Two things go wrong if they are left in, both silently:
+%     * 1472/728 = 2.022 horizontally against 2.000 vertically, so rescaling
+%       any grid onto the frame is anisotropic -- which is the error that sent
+%       us looking;
+%     * the grid hangs off the frame CENTRE, and the centre of a 1472-wide
+%       array is 8 px right of the centre of the image, so every micro-image
+%       would land 8 px off. A quarter of a checkerboard square, and it looks
+%       exactly like a rig that will not detect.
+%
+%   The capture path trims this at source now. This exists for the files
+%   already on disk, and it can do it safely because the sidecar records the
+%   real sensor size in camera.full_resolution.
+  trimmed = 0;
+  if ~isstruct(info) || ~isfield(info, 'camera') || ...
+     ~isfield(info.camera, 'full_resolution')
+    return;
+  end
+  full = double(info.camera.full_resolution(:))';
+  if numel(full) ~= 2
+    return;
+  end
+  full_w = full(1);  full_h = full(2);
+  [h, w] = size(img);
+
+  if w == full_w || h ~= full_h
+    return;                       % already right, or not a stride story
+  end
+  if w < full_w || w > full_w + 128
+    warning('tv_read_capture:shape', ...
+            ['image is %dx%d but the sensor is %dx%d, and the difference is ' ...
+             'not a row-stride pad. Leaving it untouched -- the MLA geometry ' ...
+             'will not apply correctly to it.'], w, h, full_w, full_h);
+    return;
+  end
+  trimmed = w - full_w;
+  img = img(:, 1:full_w);
 end
 
 

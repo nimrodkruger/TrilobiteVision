@@ -503,17 +503,21 @@ def readiness_report(
         det_geom = None
         scale_error = ""
         try:
-            det_geom = stage.geometry(*ref).rescaled(full_w, full_h)
+            # An identity now that the parameters are sensor-native, and kept as
+            # a conversion so a stored alignment from an older sensor mode still
+            # transfers rather than being applied verbatim to the wrong frame.
+            det_geom = stage.geometry_for(full_w, full_h)
             n_tiles = len(det_geom.whole_indices(scale, derotate=derot))
         except (ValueError, ZeroDivisionError) as exc:
             n_tiles, scale_error = 0, str(exc)
 
         if scale_error:
             message = (
-                f"{cid}: the preview ({ref[0]}x{ref[1]}) and the sensor frame "
-                f"({full_w}x{full_h}) do not share an aspect ratio, so the grid "
-                f"you aligned cannot be transferred to the frame detection runs "
-                f"on. Fix preview_resolution in the config. ({scale_error})"
+                f"{cid}: the grid is expressed against a {ref[0]}x{ref[1]} frame "
+                f"and the sensor is {full_w}x{full_h}, which do not share an "
+                f"aspect ratio, so it cannot be transferred. If those differ only "
+                f"by a few columns it is raw row-stride padding and the capture "
+                f"path should be trimming it. ({scale_error})"
             )
         elif n_tiles == 0:
             message = (

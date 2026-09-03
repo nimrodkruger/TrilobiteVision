@@ -165,19 +165,55 @@ def test_preview_scale_geometry_on_a_full_frame_finds_almost_nothing():
     assert len(r.found_tiles) == 0
 
 
-def test_geometry_for_recovers_the_right_scale():
+def test_the_sensor_frame_is_the_reference_not_whatever_arrives():
+    """The units decision, asserted. Parameters are SENSOR pixels, bound once
+    from the camera; a preview frame flowing through establishes nothing.
+
+    The old behaviour took the reference from the first frame it saw, which was
+    always the preview, so the stored pitch silently meant preview pixels and
+    every consumer needed a conversion it could forget. That is a factor of two
+    hiding between the stored value and the fit."""
     from trilobite.processing.stages.plenoptic import MLAGridOverlay
 
-    stage = MLAGridOverlay("mla", enabled=True, pitch_px=PITCH / 2)
+    stage = MLAGridOverlay("mla", enabled=True, pitch_px=PITCH)
     src = source()
-    stage.apply(src.read_preview())          # learns the 728x544 reference
-    assert stage.reference_shape == (728, 544)
+    stage.apply(src.read_preview())
+    assert stage.reference_shape is None, "a preview frame must not bind the units"
 
+    stage.bind_sensor(1456, 1088)
+    assert stage.reference_shape == (1456, 1088)
+    assert stage.params.pitch_px == pytest.approx(PITCH), "binding must not rescale"
+
+    # For the sensor frame the conversion is now the identity ...
     frame = full_frame(src)
     g = stage.geometry_for(frame.data.shape[1], frame.data.shape[0])
     assert g.pitch == pytest.approx(PITCH)
     r = detector().run(frame.data, g, "left", 1)
     assert len(r.found_tiles) == len(r.tiles) > 100
+
+    # ... and the overlay is the only place left that scales, downwards.
+    assert stage.geometry_for(728, 544).pitch == pytest.approx(PITCH / 2)
+
+
+def test_an_old_preview_referenced_alignment_is_rebased_once():
+    """The migration path. A config or state file written when the parameters
+    meant preview pixels carries its 728-wide reference, so binding to the
+    sensor rescales it to mean the same physical lenslets -- once, loudly."""
+    from trilobite.processing.stages.plenoptic import MLAGridOverlay
+
+    stage = MLAGridOverlay("mla", enabled=True, pitch_px=PITCH / 2,
+                           offset_x=3.0, offset_y=-4.0,
+                           reference_width=728, reference_height=544)
+    stage.bind_sensor(1456, 1088)
+
+    assert stage.params.pitch_px == pytest.approx(PITCH)
+    assert stage.params.offset_x == pytest.approx(6.0)
+    assert stage.params.offset_y == pytest.approx(-8.0)
+    assert stage.reference_shape == (1456, 1088)
+
+    # Idempotent: binding again changes nothing.
+    stage.bind_sensor(1456, 1088)
+    assert stage.params.pitch_px == pytest.approx(PITCH)
 
 
 def test_wrong_board_size_finds_nothing():
@@ -271,3 +307,86 @@ def test_nothing_in_this_module_owns_a_thread_or_a_camera():
     assert "threading" not in source_text
     assert "capture_request" not in source_text
     assert not hasattr(mod, "DetectionWorker")
+
+
+# -- raw row-stride padding -------------------------------------------------
+#
+# The IMX296 is 1456 px wide and 1456 is not a multiple of 32, so libcamera
+# pads each raw row out to 1472 and picamera2 shapes the array by that stride.
+# The reported symptom was tv_read_capture refusing a 1472x1088 frame as an
+# anisotropic rescale (x2.0220 across, x2.0000 down). The refusal was right;
+# the padding was the bug.
+
+
+class _FakeRaw:
+    """Just enough of PiCameraSource to exercise _trim_stride."""
+
+    def __init__(self, full=(1456, 1088)):
+        self._full_res = full
+        self.cam_id = "left"
+
+    _trim_stride = None       # filled in below
+
+
+def _trimmer(full=(1456, 1088)):
+    from trilobite.cameras.picam import Picamera2Source
+
+    fake = _FakeRaw(full)
+    fake._trim_stride = Picamera2Source._trim_stride.__get__(fake, _FakeRaw)
+    return fake
+
+
+def test_stride_padding_is_trimmed_from_raw_frames():
+    padded = np.zeros((1088, 1472), dtype=np.uint8)
+    padded[:, 1456:] = 200                      # the pad, visibly not image
+    out, note = _trimmer()._trim_stride(padded)
+
+    assert out.shape == (1088, 1456)
+    assert note["raw_stride_px"] == 1472
+    assert note["raw_padding_px"] == 16
+    assert note["image_width"] == 1456
+    assert out.max() == 0, "only the padding may be removed"
+
+
+def test_the_trimmed_frame_rescales_isotropically():
+    """The actual failure, in one assertion. A 1472-wide frame is 2.0220x the
+    728-wide preview across and 2.0000x down, so no single pitch exists for it.
+    Trimmed, the two agree exactly and MLAGeometry.rescaled accepts it."""
+    from trilobite.optics.mla import MLAGeometry
+
+    preview = MLAGeometry(728, 544, 50.0)
+    with pytest.raises(ValueError, match="anisotropic"):
+        preview.rescaled(1472, 1088)
+
+    out, _ = _trimmer()._trim_stride(np.zeros((1088, 1472), dtype=np.uint8))
+    g = preview.rescaled(out.shape[1], out.shape[0])
+    assert g.pitch == pytest.approx(100.0)
+
+
+def test_padding_would_move_the_grid_origin_off_centre():
+    """Why it could not simply be ignored. The grid hangs off the frame centre,
+    and the centre of a 1472-wide array is 8 px right of the image's -- a
+    quarter of a checkerboard square on every micro-image, which reads as a rig
+    that will not detect rather than as a units bug."""
+    from trilobite.optics.mla import MLAGeometry
+
+    padded = MLAGeometry(1472, 1088, 100.0)
+    trimmed = MLAGeometry(1456, 1088, 100.0)
+    assert padded.origin[0] - trimmed.origin[0] == pytest.approx(8.0)
+
+
+def test_a_frame_that_is_already_the_right_width_is_untouched():
+    data = np.arange(1088 * 1456, dtype=np.uint8).reshape(1088, 1456)
+    out, note = _trimmer()._trim_stride(data)
+    assert out is data
+    assert "raw_padding_px" not in note
+
+
+def test_an_unexplained_shape_is_flagged_not_cropped():
+    """A packed raw format has an array width that is not a pixel count at all,
+    so cropping it by pixels would be nonsense. Record and leave alone."""
+    packed = np.zeros((1088, 1820), dtype=np.uint8)      # 10-bit packed, 5/4
+    out, note = _trimmer()._trim_stride(packed)
+    assert out is packed
+    assert note["raw_unexpected_shape"] is True
+    assert note["raw_buffer_shape"] == [1088, 1820]

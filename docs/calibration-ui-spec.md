@@ -218,13 +218,30 @@ arrived with, not a later one.
 
 ### 4.4 Units
 
-The MLA parameters are expressed in **preview pixels** (728 × 544) because that
-is the image the alignment overlay draws on. Detection crops from the **sensor**
-frame (1456 × 1088). Handled in one place:
+The MLA parameters are expressed in **full-resolution sensor pixels**
+(1456 × 1088), which is the frame detection crops from. The overlay draws on the
+preview (728 × 544) and scales down to do it.
 
-* `MLAParams.reference_width` / `reference_height` — the frame size the numbers
-  were measured against, learned from the first preview frame and carried in the
-  saved state. Hidden in the UI: it is a unit, not a knob.
+It was the other way round first, and that was wrong. Storing the numbers in
+preview pixels puts a conversion between the stored value and *every* consumer
+— the detector, the crops, the recorded corners, both offline readers — so
+forgetting it anywhere is a silent factor of two, and it was forgotten twice.
+It also means changing `preview_resolution` silently invalidates a stored
+alignment. Sensor pixels have no such dependency: the pitch is
+`pitch_um / pixel_pitch_um`, fixed by hardware. The conversion now exists in
+exactly one place, the overlay, where being wrong is visible in the preview
+immediately.
+
+* `MLAParams.reference_width` / `reference_height` — the **sensor** frame the
+  numbers are expressed in, bound once from the camera at start-up rather than
+  learned from a frame flowing through, and carried in the saved state. Hidden
+  in the UI: it is a unit, not a knob. A stored alignment carrying a different
+  reference is rebased onto the sensor frame once, with a warning.
+* **Raw stride padding** is trimmed before any of this applies. A raw buffer's
+  rows are padded to a multiple of 32; 1456 is not one, so a frame arrives
+  1088 × 1472 with sixteen non-image columns. They break the rescale
+  (2.0220 across against 2.0000 down) and move the frame centre 8 px right,
+  which would shift every micro-image by a quarter of a checkerboard square.
 * `MLAGeometry.rescaled(w, h)` — exact. Under the pixel-area convention a
   preview pixel at `x` maps to `(x + ½)s − ½`, and applying that to the origin
   gives `c_s + Δx·s` with no half-pixel remainder, so the offsets simply scale.
@@ -405,8 +422,8 @@ session_<timestamp>/
 `session.json` carrying the frozen MLA geometry **in sensor pixels** is not
 optional. A corner list without the crop geometry that produced it cannot be
 interpreted, and that is the single most likely thing to be missing in six
-months. Note that it is stored converted: the UI shows preview pixels, the file
-records what detection actually used.
+months. The UI and the file now agree — both are sensor pixels — which is the
+point of the units decision above.
 
 The corners in each pose are only the five-tile cross that let the pose be
 accepted. Full-field detection is an offline job on `*.npy`, and the note field

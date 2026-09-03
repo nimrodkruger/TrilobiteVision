@@ -42,9 +42,10 @@ cameras:
     pipeline:
       - {type: stats,  name: stats}
       - {type: levels, name: display, params: {gain: 1.0, gamma: 1.0}}
-      # pitch_px is in PREVIEW pixels -- half of synthetic_pitch_px. The stage
-      # records that reference and the detector scales it to the sensor frame.
-      - {type: mla_grid_overlay, name: mla, params: {enabled: true, pitch_px: 50}}
+      # pitch_px is in FULL-RESOLUTION SENSOR pixels, so it equals
+      # synthetic_pitch_px exactly. The overlay scales it down to draw on the
+      # preview; nothing that measures has to convert anything.
+      - {type: mla_grid_overlay, name: mla, params: {enabled: true, pitch_px: 100}}
       # The cheap live detector. Must come after the MLA stage -- it counts
       # saddle points into that grid's micro-images. ~3 ms per frame.
       - {type: checkerboard_presence, name: presence,
@@ -66,6 +67,6 @@ cameras:
       - {type: stats,  name: stats}
       - {type: levels, name: display, params: {gain: 1.0, gamma: 1.0}}
       - {type: mla_grid_overlay, name: mla,
-         params: {enabled: true, pitch_px: 50, rotation_deg: 2.0, crop_scale: 0.9}}
+         params: {enabled: true, pitch_px: 100, rotation_deg: 2.0, crop_scale: 0.9}}
       - {type: checkerboard_presence, name: presence,
          params: {enabled: true, min_corners: 20}}

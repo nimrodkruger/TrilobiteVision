@@ -12,6 +12,121 @@ git checkout .              # everything back to HEAD
 
 ---
 
+## 2026-09-03 (g) — raw stride padding, and grid parameters in sensor pixels
+
+Reported from MATLAB:
+
+```
+the grid was aligned on a 728x544 frame and this capture is 1472x1088
+(x2.0220 horizontally, x2.0000 vertically). Pitch has no single value
+under an anisotropic rescale.
+```
+
+The refusal was correct. Two separate problems were behind it, and only one of
+them was the one being asked about.
+
+### 1. The raw frame is 1472 px wide and the image is 1456
+
+**This is the cause of the error, and it is not a units question.** A raw
+buffer's rows are padded out to a hardware-friendly stride, and picamera2's
+`make_array` shapes the array by that stride rather than by the image width.
+The IMX296 is 1456 px wide; 1456 is not a multiple of 32, the next one up is
+1472, and an 8-bit raw frame therefore arrives as 1088 × **1472** with sixteen
+columns on the right that are not image data.
+
+`1472 = 46 × 32`, and `1456 = 45.5 × 32`. That arithmetic is the whole
+diagnosis.
+
+Left in, those columns do two things, both silent:
+
+* the frame is 2.0220× the preview width against exactly 2.0000× its height,
+  so any rescale of the grid onto it is anisotropic — the reported error;
+* **the grid hangs off the frame centre**, and the centre of a 1472-wide array
+  is 8 px right of the centre of the image. Every micro-image would land 8 px
+  off — a quarter of a checkerboard square. Had the second fix below been made
+  without this one, the error would have gone away and the detection would
+  still have failed, for a reason nothing was reporting.
+
+| change | file |
+|---|---|
+| `_trim_stride`: crop raw frames to the sensor width, record `raw_stride_px` / `raw_padding_px` / `image_width` in the metadata | `cameras/picam.py` |
+| trim on load for files already on disk, using `camera.full_resolution` from the sidecar | `scripts/read_capture.py`, `matlab/tv_read_capture.m` |
+
+Only trimmed when the height already matches and the excess is small enough to
+be a stride pad. A *packed* raw format — 10-bit as 5 bytes per 4 pixels — has an
+array width that is not a pixel count at all, so cropping it by pixels would be
+nonsense; that case is recorded as `raw_unexpected_shape` and left alone.
+
+Captures already on the drive read correctly without being rewritten, because
+the sidecar records the true sensor size.
+
+### 2. Grid parameters are sensor pixels now (option b)
+
+The right call, and for a sharper reason than "that's where it matters".
+
+Storing the grid in preview pixels puts a conversion between the stored value
+and *every* consumer of it — the detector, the crops, the recorded corners, both
+offline readers — so forgetting it anywhere is a silent factor of two. It has
+been forgotten twice already in this project. It also means changing
+`preview_resolution` silently invalidates a stored alignment.
+
+Sensor pixels have no such dependency. The MLA pitch is a physical property of
+the array, `pitch_um / pixel_pitch_um`, fixed by hardware. Everything that
+*measures* works in sensor pixels, so for them the conversion disappears
+entirely, and the only one left is drawing the overlay — where being wrong is
+visible in the preview immediately rather than six months later in a fit.
+
+| change | file |
+|---|---|
+| `note_frame_size` → `bind_sensor`: the reference is the sensor frame, declared once from the camera, never learned from a frame flowing through | `processing/stages/plenoptic.py` |
+| `apply()` and `_masks()` draw from `geometry_for`, scaling **down** to the preview | `processing/stages/plenoptic.py` |
+| `bind_sensor` called at `CameraRuntime.start()`, **and again after `_restore_state()`** | `app.py` |
+| the tile-count check uses `geometry_for` (an identity now) | `calibration/settings.py` |
+| `pitch_px` 50 → 100 in `config/desktop-plenoptic.yaml`; units documented in `config/pi.yaml` | configs |
+
+The second `bind_sensor` call is not redundant. State is restored *after* the
+cameras start, so a state file written when the parameters meant preview pixels
+would otherwise overwrite what binding had just fixed — restoring a factor of
+two from a file after everything upstream had been made correct. Verified
+against the real `desktop-plenoptic.state.json`, which carried
+`pitch_px: 50, reference_width: 728`.
+
+**Migration is automatic and happens once.** A stored alignment carrying its own
+reference is rebased onto the sensor frame with a warning:
+
+```
+mla: rebasing the grid from a 728x544 reference onto the 1456x1088 sensor
+frame (pitch 50.000 -> 100.000 px). Grid parameters are sensor pixels now;
+this happens once.
+```
+
+**Both readers are unchanged by this**, which is the sign the abstraction was
+right and only the choice of reference was wrong: they convert from whatever
+reference the sidecar records, so old and new captures both read correctly.
+
+### Verification
+
+```
+pytest -q                       → 149 passed
+ruff check src/ tests/ scripts/ → clean
+tv_selftest, unpadded capture   → 19 passed
+tv_selftest, padded capture     → 20 passed  (the extra one is the padding)
+```
+
+Nine new tests. The padding ones assert the failure directly: `preview.rescaled(1472, 1088)`
+raises `anisotropic`, the trimmed frame gives exactly 100.00 px, and a
+1472-wide geometry's origin is 8.0 px right of a 1456-wide one.
+
+Reproduced the reported failure end to end by synthesising a 1472-wide capture
+with a 728-referenced sidecar: both readers now trim 16 columns, report a clean
+×2.0000, and recover 117 complete micro-images at 100 px.
+
+Live: the rebase fires once per camera, readiness reports 117 and 130 whole
+micro-images at 100 px on the sensor, and the overlay still draws one grid cell
+per micro-image on the preview — the check that a units error could not survive.
+
+---
+
 ## 2026-09-03 (f) — captures reached the disk as zero-byte files
 
 Reported from the rig, writing to an external drive: the session directory, the

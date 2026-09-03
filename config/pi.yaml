@@ -43,6 +43,9 @@ cameras:
     pipeline:
       - {type: stats,      name: stats}
       - {type: levels,     name: display, params: {gain: 1.0, gamma: 1.0}}
+      # pitch_px, offset_x and offset_y are FULL-RESOLUTION SENSOR pixels --
+      # 1456 x 1088 here, not the 728 x 544 preview you align against. The
+      # overlay scales down to draw; nothing that measures converts anything.
       # The grid must be enabled and its pitch/offsets set to the real MLA
       # before calibration will start -- readiness blocks on both. 20 px is
       # a placeholder, not a measurement.
@@ -78,6 +81,9 @@ cameras:
     pipeline:
       - {type: stats,      name: stats}
       - {type: levels,     name: display, params: {gain: 1.0, gamma: 1.0}}
+      # pitch_px, offset_x and offset_y are FULL-RESOLUTION SENSOR pixels --
+      # 1456 x 1088 here, not the 728 x 544 preview you align against. The
+      # overlay scales down to draw; nothing that measures converts anything.
       # The grid must be enabled and its pitch/offsets set to the real MLA
       # before calibration will start -- readiness blocks on both. 20 px is
       # a placeholder, not a measurement.

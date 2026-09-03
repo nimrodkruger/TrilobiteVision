@@ -253,9 +253,67 @@ class Picamera2Source(CameraSource):
             space = "mono8"
         meta["stream"] = "raw" if raw else "main"
         meta["mono_sensor"] = self._mono
+        if raw:
+            data, pad = self._trim_stride(data)
+            meta.update(pad)
         return Frame.now(
             np.ascontiguousarray(data), self.cam_id, self._next_seq(), space=space, **meta
         )
+
+    def _trim_stride(self, data: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+        """Drop the row padding libcamera adds to raw buffers.
+
+        A raw buffer's rows are padded out to a hardware-friendly stride, and
+        `make_array` shapes the array by that stride rather than by the image
+        width. The IMX296 is 1456 px wide; 1456 is not a multiple of 32, so the
+        next one up is 1472, and an 8-bit raw frame arrives as 1088 x **1472**
+        with sixteen columns of padding on the right.
+
+        Those columns are not image data. Left in, they do two things, both
+        silent:
+
+          * the array is 2.022x the preview width but exactly 2.000x its
+            height, so any geometry rescale from the preview is anisotropic and
+            either raises or, worse, gets fudged;
+          * the grid hangs off the *centre* of the frame, and the centre of a
+            1472-wide array is 8 px right of the centre of the image, so every
+            micro-image would land 8 px off. That is a quarter of a
+            checkerboard square, and it looks exactly like a rig that will not
+            detect.
+
+        Cropping here rather than in each reader keeps every file on disk
+        honest about what it contains, and the counts go into the metadata so a
+        capture can still say what its buffer looked like.
+
+        Only trimmed when the height already matches and the excess is small
+        enough to be a stride pad. A *packed* raw format -- 10-bit as 5 bytes
+        per 4 pixels -- has an array width that is not a pixel count at all,
+        and cropping that by pixels would be nonsense, so it is recorded and
+        left alone instead.
+        """
+        full_w, full_h = self._full_res
+        if data.ndim < 2:
+            return data, {}
+        h, w = data.shape[:2]
+        note: dict[str, Any] = {"image_width": int(full_w), "image_height": int(full_h)}
+
+        if w == full_w and h == full_h:
+            return data, note
+
+        if h == full_h and full_w < w <= full_w + 128:
+            note["raw_stride_px"] = int(w)
+            note["raw_padding_px"] = int(w - full_w)
+            return data[:, :full_w], note
+
+        note["raw_buffer_shape"] = [int(h), int(w)]
+        note["raw_unexpected_shape"] = True
+        log.warning(
+            "%s: raw buffer is %dx%d but the sensor is %dx%d, and the difference is "
+            "not a row-stride pad. Saving the buffer untouched -- the MLA geometry "
+            "cannot be applied to it until this is understood.",
+            self.cam_id, w, h, full_w, full_h,
+        )
+        return data, note
 
     def describe(self) -> CameraInfo:
         return CameraInfo(

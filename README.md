@@ -212,9 +212,11 @@ schemas. Save raw or save view, per camera or both at once.
 
 The MLA parameters — pitch, rotation, offsets, crop scale — are what the
 sub-aperture crops use, so what you see aligned is what gets extracted. They
-are set in **preview pixels**, and the frame size they were measured against is
-recorded with them; anything reading a different-sized frame converts through
-`MLAGridOverlay.geometry_for()`.
+are in **full-resolution sensor pixels** — 1456 × 1088 here, not the 728 × 544
+preview you align against. The overlay scales them down to draw; everything
+that measures uses them as they are. The sensor frame they are expressed in is
+recorded with them, and anything holding a different-sized frame converts
+through `MLAGridOverlay.geometry_for()`.
 
 The Storage panel lives here — see below.
 
@@ -640,10 +642,18 @@ belong there.
 comparable to each other. Turning AE off pins the exposure it had converged to,
 and the UI writes that number back into the box.
 
-**MLA parameters are in preview pixels.** Pitch 50 on a 728-wide preview is
-pitch 100 on the sensor. The conversion is handled in one place
-(`MLAGeometry.rescaled`) and the reference resolution is recorded with the
-parameters, but the number on screen is the preview one.
+**MLA parameters are in SENSOR pixels.** The number on screen is the sensor
+one: pitch 100 means 100 px on the 1456-wide sensor and draws as 50 px on the
+728-wide preview. It was the other way round until a stored alignment turned out
+to mean something different from what every consumer of it assumed. A stored
+grid carrying an older preview-referenced reference is rebased once, at
+start-up, with a warning in the log.
+
+**Raw frames are 1472 px wide before trimming.** Row stride is padded to a
+multiple of 32, and 1456 is not one, so a raw buffer arrives with sixteen
+columns that are not image data. They are trimmed at capture now. Left in they
+make the frame 2.022× the preview horizontally against 2.000× vertically, and
+move the frame centre — which the whole grid hangs off — 8 px right.
 
 **Put the data on an SSD.** See **Output storage**.
 

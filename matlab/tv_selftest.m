@@ -33,9 +33,15 @@ function ok = tv_selftest(path)
   check('loads', true, '');
 
   % -- the array is the right way round ---------------------------------
-  check('shape matches the sidecar', ...
-        isequal([cap.height cap.width], double(cap.info.shape(:))'), ...
-        sprintf('%dx%d vs %s', cap.height, cap.width, mat2str(cap.info.shape(:)')));
+  % The sidecar records the shape of the FILE; cap.image may legitimately be
+  % narrower, because raw row-stride padding is trimmed on load. So the
+  % identity to check is file width minus the columns removed.
+  want = double(cap.info.shape(:))';
+  want(2) = want(2) - cap.trimmed_padding;
+  check('shape matches the sidecar, less any trimmed padding', ...
+        isequal([cap.height cap.width], want), ...
+        sprintf('%dx%d vs %s (trimmed %d)', cap.height, cap.width, ...
+                mat2str(want), cap.trimmed_padding));
 
   check('dtype preserved', strcmp(class(cap.image), i_class(cap.info.dtype)), ...
         sprintf('%s vs %s', class(cap.image), cap.info.dtype));
@@ -127,6 +133,20 @@ function ok = tv_selftest(path)
     t2 = tv_micro_images(cap, 'Derotate', true);
     check('de-rotated tiles are the same size', ...
           isequal(size(t2{1}), size(tiles{1})), '');
+  end
+
+  % -- raw row-stride padding ----------------------------------------------
+  % The IMX296 is 1456 px wide and 1456 is not a multiple of 32, so a raw
+  % frame's rows are padded to 1472 and the array is shaped by that stride.
+  % Left in, the 16 extra columns make the frame 2.022x the preview width
+  % against 2.000x its height -- the anisotropic rescale this reader used to
+  % refuse -- and move the frame centre 8 px right, shifting every micro-image
+  % by a quarter of a checkerboard square.
+  if cap.trimmed_padding > 0
+    check('padding was trimmed and the rescale came out isotropic', ...
+          abs(cap.mla.scale_applied - cap.height / cap.mla.reference.reference_height) < 1e-9, ...
+          sprintf('trimmed %d columns, scale x%.4f', ...
+                  cap.trimmed_padding, cap.mla.scale_applied));
   end
 
   % -- the sampling geometry, against arithmetic rather than another file ---

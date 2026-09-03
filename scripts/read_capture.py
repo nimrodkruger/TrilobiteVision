@@ -90,6 +90,9 @@ class Capture:
     offset_x: float = 0.0
     offset_y: float = 0.0
     crop_scale: float = 1.0
+    # Columns of raw row-stride padding removed on load. Non-zero means the
+    # file was written before the capture path started trimming them.
+    trimmed_padding: int = 0
 
     @property
     def has_geometry(self) -> bool:
@@ -111,6 +114,40 @@ class Capture:
                            offset_x=self.offset_x, offset_y=self.offset_y)
 
 
+def _trim_stride(image: np.ndarray, meta: dict) -> tuple[np.ndarray, int]:
+    """Drop raw row-stride padding from captures that still carry it.
+
+    A raw buffer's rows are padded out to a hardware-friendly stride and the
+    array is shaped by that stride rather than by the image width. The IMX296
+    is 1456 px wide; 1456 is not a multiple of 32, so an 8-bit raw frame
+    arrives as 1088 x 1472 with sixteen columns on the right that are not
+    image data.
+
+    Left in they do two things, both silent: the frame becomes 2.022x the
+    preview width against exactly 2.000x its height, so any rescale of the
+    grid onto it is anisotropic; and the frame CENTRE -- which is what the
+    whole grid hangs off -- moves 8 px right, putting every micro-image a
+    quarter of a checkerboard square out of place.
+
+    Captures are trimmed at source now. This is for the files already on disk,
+    and it is safe because the sidecar records the true sensor size.
+    """
+    cam = (meta.get("camera") or {})
+    full = cam.get("full_resolution")
+    if not full or len(full) != 2 or image.ndim < 2:
+        return image, 0
+    full_w, full_h = int(full[0]), int(full[1])
+    h, w = image.shape[:2]
+    if w == full_w or h != full_h:
+        return image, 0
+    if not (full_w < w <= full_w + 128):
+        print(f"warning: frame is {w}x{h} but the sensor is {full_w}x{full_h}, and "
+              f"the difference is not a row-stride pad — leaving it untouched",
+              file=sys.stderr)
+        return image, 0
+    return np.ascontiguousarray(image[:, :full_w]), w - full_w
+
+
 def load(npy_path: Path) -> Capture:
     path = Path(npy_path)
     if not path.exists():
@@ -121,7 +158,9 @@ def load(npy_path: Path) -> Capture:
     if not side.exists():
         print(f"warning: no sidecar beside {path.name} — pixels only", file=sys.stderr)
 
+    image, trimmed = _trim_stride(image, meta)
     cap = Capture(path=path, image=image, meta=meta, kind="bare")
+    cap.trimmed_padding = trimmed
     h, w = image.shape[:2]
 
     if "geometry" in meta:
@@ -143,10 +182,11 @@ def load(npy_path: Path) -> Capture:
             cap.offset_y *= s
     else:
         cap.kind = str(meta.get("tag", "bare"))
-        # A capture sidecar. The MLA stage's parameters are in PREVIEW pixels
-        # and carry the resolution they were measured against, so they have to
-        # be converted -- the same factor of two that has bitten this project
-        # once already.
+        # A capture sidecar. The MLA stage's parameters carry the resolution
+        # they are expressed in, so the conversion is driven by that and works
+        # for both vintages: sensor-native (the identity here, for a raw frame)
+        # and the older preview-native form (the factor of two that has bitten
+        # this project more than once).
         mla = None
         for name, values in (meta.get("pipeline") or {}).items():
             if isinstance(values, dict) and "pitch_px" in values:

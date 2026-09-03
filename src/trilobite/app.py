@@ -69,6 +69,16 @@ class CameraRuntime:
 
     def start(self) -> None:
         self.source.open()
+        # The MLA parameters are in SENSOR pixels, so the sensor frame has to be
+        # declared before any of them mean anything -- here, once, from the
+        # camera itself, rather than inferred from whatever frame arrives first.
+        # A stored alignment expressed against some other frame (an old config
+        # in preview pixels, or a changed sensor mode) is rebased now, once,
+        # with a warning.
+        mla = self.mla_stage()
+        if mla is not None:
+            w, h = self.source.describe().full_resolution
+            mla.bind_sensor(int(w), int(h))
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._run, name=f"capture-{self.cam_id}", daemon=True
@@ -467,6 +477,18 @@ class Application:
         # device, and a pipeline parameter is meaningless before its stage
         # exists.
         self._restore_state()
+        # ...and re-bind the MLA units afterwards, because a state file written
+        # before the parameters were sensor-native carries its own
+        # reference_width and has just overwritten what cam.start() bound. The
+        # rebase is idempotent, so doing it twice costs nothing and skipping it
+        # here would silently restore a preview-referenced grid over a
+        # sensor-referenced one -- a factor of two, from a file, after
+        # everything upstream was made correct.
+        for cam in self.cameras.values():
+            mla = cam.mla_stage()
+            if mla is not None and cam.source.is_open:
+                w, h = cam.source.describe().full_resolution
+                mla.bind_sensor(int(w), int(h))
         if self.state:
             self.state.start_autosave()
 

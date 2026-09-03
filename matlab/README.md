@@ -52,15 +52,27 @@ relying on the sub-aperture views being detailed.
 `tv_sub_apertures` is a `permute`. Nothing is interpolated and nothing is lost;
 applying it twice returns the input.
 
-## Three things that will bite you
+## Four things that will bite you
 
-**The rescale.** The MLA grid is aligned by eye against the *preview* (728×544)
-and the sidecar records `pitch_px` and the offsets in those pixels, alongside
-the `reference_width`/`reference_height` they were quoted against. A raw
-capture is the full sensor frame (1456×1088), so pitch and both offsets must be
-doubled before they mean anything. `tv_read_capture` does this and returns
-`.mla` already in the frame's own coordinates, with the unscaled original kept
-in `.mla.reference`.
+**Raw stride padding.** A raw buffer's rows are padded to a hardware-friendly
+stride, and the array is shaped by that stride rather than by the image width.
+The IMX296 is 1456 px wide; 1456 is not a multiple of 32, so a raw frame arrives
+1088×**1472** with sixteen columns on the right that are not image data.
+
+Left in they make the frame 2.022× the preview width against 2.000× its height
+— an anisotropic rescale, which is what this reader used to refuse outright —
+and, worse, move the frame *centre* 8 px right. The grid hangs off that centre,
+so every micro-image would land a quarter of a checkerboard square out of
+place. Captures are trimmed at source now; `tv_read_capture` trims the files
+already on disk and reports how many columns in `.trimmed_padding`.
+
+**The rescale.** `pitch_px` and the offsets are recorded in full-resolution
+sensor pixels, alongside the reference frame they are expressed in, so for a
+raw capture the conversion is the identity. Captures written before that change
+recorded them in preview pixels against a 728-wide reference; those still read
+correctly, because the conversion is driven by the recorded reference either
+way. `.mla` is always in the coordinates of `.image`, and `.mla.reference`
+keeps the numbers exactly as recorded.
 
 Getting it wrong does not raise. It puts every crop between micro-images
 instead of on one, and the only symptom is that nothing ever detects — which
@@ -92,6 +104,7 @@ inside `tv_micro_images`, and nowhere else.
 ## Verification
 
 `tv_selftest` passes 19 of 19 on both cameras of a real capture pair, including
-the rotated one (2°, crop scale 0.9). Separately, the de-rotated extraction was
+the rotated one (2°, crop scale 0.9), and 20 of 20 on a stride-padded frame
+(the extra check is the padding). Separately, the de-rotated extraction was
 compared pixel for pixel against `MLAGeometry.crop_derotated` in Python on the
 same file: **max difference 0**.
