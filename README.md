@@ -102,19 +102,30 @@ Write, wait for verification, eject.
 > including `rpi-usb-gadget`, which matters if you want the USB-C addressing
 > option below.
 
-#### 2. First boot
+#### 2. First boot, through a router
+
+**Put the Pi on a network that has a DHCP server** — any home or travel router,
+or the lab network. Do not start with a cable straight to your PC: there is no
+DHCP server on that link, NetworkManager does not fall back to an IPv4
+link-local address, and the Pi ends up with no IPv4 address at all. It looks
+exactly like a dead board. `docs/pi-troubleshooting.md` has the way out if you
+are ever stuck there.
 
 Card in, both camera ribbons already seated (see step 4 before powering on if
-they are not), Ethernet in, power last. Give it two minutes: the first boot
-resizes the filesystem and reboots itself.
+they are not), Ethernet in, power last. The first boot resizes the filesystem
+and reboots itself, so give it two minutes.
 
 ```bash
 ssh flyeye@flyeye.local
 ```
 
-**Check:** you get a prompt. If the name does not resolve, your network is
-dropping mDNS — find the address from your router or with
-`nmap -sn 10.44.0.0/22` and use that for now; step 7 fixes it properly.
+**Check:** you get a prompt. If the name does not resolve, open the router's
+admin page — its attached-devices or DHCP-clients list shows the Pi by hostname
+with its address. Use that.
+
+Home routers do not block mDNS, so `flyeye.local` usually just works. Windows
+resolves `.local` only partially; installing Apple's **Bonjour Print Services**
+makes it reliable, and a Mac or Linux box is a useful second opinion.
 
 #### 3. Update, then reboot
 
@@ -210,17 +221,21 @@ rate.
 
 #### 7. Give it a stable address
 
-Do this before you rely on the rig, not after it disappears.
+DHCP changes its mind — on a lease expiry, a port change, a reboot after a
+power cut — and a rig that has moved is a rig you cannot reach.
 
-```bash
-bash scripts/setup_network.sh
-```
+**On a router you control, use its address reservation.** Bind the Pi's MAC to
+a fixed IP in the router's own DHCP settings. One checkbox, permanent, nothing
+installed on the Pi. This is the right answer whenever it is available.
 
-See **Addressing** below for what it does and which of the three mechanisms to
-lean on. It is safe to re-run and it does not touch the DHCP lease.
+On a network you do not control, `bash scripts/setup_network.sh` is the
+fallback: it sets up mDNS, advertises the UI so the rig appears in network
+browsers, adds a fixed second address alongside the DHCP lease, and prints the
+MAC addresses to send to whoever runs the network. Safe to re-run, and it does
+not touch the lease.
 
-**Check:** `http://flyeye.local:8000/` opens, and the script's summary lists a
-fixed address that will still be there tomorrow.
+**Check:** `http://flyeye.local:8000/` opens, and the address you got is one
+that will still be there tomorrow.
 
 #### 8. Storage
 
@@ -247,77 +262,6 @@ cameras makes manual runs fail with a confusing "device busy". Enable it when
 the rig is doing unattended work, not while you are developing against it.
 
 ---
-
-### Addressing — so the rig stops moving
-
-The Pi takes its address from DHCP, and DHCP changes its mind: on a lease
-expiry, a switch port change, a reboot after a power cut. `scripts/setup_network.sh`
-installs three answers, and the reason for having all three is that they fail
-independently.
-
-| mechanism | address | needs | fails when |
-|---|---|---|---|
-| **mDNS** | `flyeye.local` | nothing — already on Pi OS | the network drops multicast between VLANs, which many enterprise networks do |
-| **Fixed second address** | `192.168.50.10` | one `nmcli` command | never, on a direct cable — it does not involve DHCP at all |
-| **DHCP reservation** | whatever IT assigns | a ticket, and the MAC address | the Pi moves to a different network |
-
-**mDNS** is the everyday path. Raspberry Pi OS runs `avahi-daemon`, so
-`<hostname>.local` resolves from macOS, Windows 10 and later, and Linux with
-avahi installed. The script also advertises the web UI as an `_http._tcp`
-service, so the rig appears in network browsers rather than only answering when
-asked by name.
-
-**The fixed second address is the one that always works**, and it is worth
-understanding why it is safe. NetworkManager applies manually configured
-addresses *in addition to* the DHCP lease as long as `ipv4.method` stays
-`auto`. So the Pi keeps its normal network access and also always answers on
-`192.168.50.10`. Give a laptop an address on that subnet, connect the two with
-a single Ethernet cable, and the rig is reachable with no DHCP server, no
-router and nobody's permission:
-
-```bash
-# on the laptop (Linux); Windows and macOS equivalents are in the script output
-sudo ip addr add 192.168.50.20/24 dev enp0s31f6
-curl http://192.168.50.10:8000/api/status
-```
-
-Setting `ipv4.method manual` instead would take the Pi *off* the network
-entirely — and doing that over SSH is how you end up needing a monitor and a
-keyboard. The script does not do it, and neither should you.
-
-**A DHCP reservation** is the correct answer on a managed network. The script
-prints the MAC addresses to send to IT.
-
-**Whatever happens, the rig can be asked where it is.** The startup banner
-lists every URL, and so does the status endpoint:
-
-```bash
-journalctl -u trilobite | grep -A6 'reachable at'
-curl -s http://flyeye.local:8000/api/status | jq -r '.network.urls[]'
-python -m trilobite.net          # on the Pi, without starting the app
-```
-
-#### The fourth option: one USB-C cable
-
-Raspberry Pi OS Trixie images dated 2025-10-20 and later ship `rpi-usb-gadget`,
-which turns the Pi 5's USB-C port into a USB Ethernet device. One cable from a
-laptop carries power and network, the Pi is always at **10.12.194.1**, and no
-network administrator is involved at any point.
-
-```bash
-sudo apt install rpi-usb-gadget
-sudo rpi-usb-gadget on
-sudo reboot
-```
-
-Two caveats, and the first is the reason this is not the headline
-recommendation for this rig:
-
-- **Power.** That port becomes the Pi's only power input, and a Pi 5 driving
-  two cameras and a USB SSD can draw more than a laptop USB-C port will supply.
-  The failure mode is a reboot in the middle of a capture. Use a powered hub,
-  or keep this for a Pi with nothing else attached.
-- **It stops being a USB host port.** Networking and power only, once enabled.
 
 ### Desktop (Windows, macOS, Linux)
 
@@ -566,6 +510,24 @@ the list is a bug here, in neither is a kernel or cable problem, in both but
 unmountable is a missing filesystem driver. `bash scripts/diagnose_host.sh` on
 the Pi prints the same thing with more context.
 
+### Orientation
+
+**Flip horizontal** and **Flip vertical** in each camera's Sensor panel mirror
+the image. They are applied at **acquisition**, before anything else sees the
+pixels, so the preview, the saved `.npy`, the sub-aperture crops and the
+recorded calibration corners all agree — there is no way for the display and
+the data to differ, because there is only one flip. Every sidecar records the
+setting.
+
+It is a statement about how the camera is *mounted* — a fold mirror, an
+inverted bracket — rather than a display preference, which is why it sits with
+the sensor controls and not in the pipeline.
+
+**Set it before aligning the MLA grid.** The grid offsets are measured from the
+frame centre, and a flip negates the axis they run along, so changing it
+afterwards invalidates the alignment. The UI says so when you toggle it with a
+grid enabled.
+
 ### Quick-record
 
 The manual counterpart to the hands-free calibration loop, in imaging mode, for
@@ -725,8 +687,10 @@ scripts/
   probe_cameras.py         run this first on the Pi
   install_pi.sh            apt, config.txt, venv — idempotent
   setup_network.sh         mDNS, a fixed second address, the MACs to give IT
+  boot_report.sh           a flight recorder for a Pi you cannot reach
   diagnose_cameras.sh      when libcamera reports zero cameras
   diagnose_host.sh         after a crash, or when a disk does not appear
+  boot_report.sh           read a Pi's state off the SD card when it will not answer
   benchmark_detectors.py   what each detector costs, on your machine
   measure_derotation_cost.py   what tile de-rotation actually costs in precision
   read_capture.py          open a recorded .npy + .json off the Pi, and detect
@@ -827,7 +791,9 @@ browser.
 |---|---|
 | `docs/calibration-spec.md` | the imaging model, the unknowns, the measurements, the fit. Start here. |
 | `docs/calibration-ui-spec.md` | the acquisition workflow: detection, acceptance, what gets saved, what is built |
+| `docs/pi-troubleshooting.md` | when the Pi will not answer at all. Not needed for a normal setup. |
 | `docs/cleanup-log.md` | removals and their rollback, newest first |
+| `matlab/README.md` | reading captures in MATLAB, and the traps between NumPy and MATLAB |
 | `apt-packages.txt` | every Pi package, tiered and annotated |
 
 ---
@@ -876,12 +842,21 @@ columns that are not image data. They are trimmed at capture now. Left in they
 make the frame 2.022× the preview horizontally against 2.000× vertically, and
 move the frame centre — which the whole grid hangs off — 8 px right.
 
-**The rig's IP address will change.** DHCP does that, and it cost an afternoon
-once. Reach it by name (`flyeye.local`) or at the fixed second address
-`setup_network.sh` adds, not by whatever number worked last week. When it has
-moved anyway, the rig will tell you where it went: `python -m trilobite.net` on
-the Pi, `journalctl -u trilobite | grep -A6 'reachable at'`, or
-`curl -s http://.../api/status | jq -r '.network.urls[]'`. See **Addressing**.
+**The Pi 5's default raw format is COMPRESSED.** libcamera hands the mono
+IMX296 `MONO_PISP_COMP1` unless told otherwise — the imaging pipeline's
+compressed transport, one byte per pixel, not sensor counts. `make_array`
+returns it as a plain uint8 image, so captures have the right shape and obvious
+structure and every value wrong. It looks like a picture that has gone slightly
+wrong rather than like a decode failure, which is why a whole session was
+recorded that way before anyone noticed. The backend now picks an uncompressed
+format itself, records which one in every sidecar, and logs an error if it
+cannot find one. The same code on a Pi 4 got `R10` and was fine.
+
+**The rig's IP address will change.** DHCP does that. Reach it by name
+(`flyeye.local`), or give it a reservation in your router. When it has moved
+anyway, the rig will tell you where it went: `python -m trilobite.net` on the
+Pi, `journalctl -u trilobite | grep -A6 'reachable at'`, or
+`curl -s http://.../api/status | jq -r '.network.urls[]'`.
 
 **Put the data on an SSD.** See **Output storage**.
 

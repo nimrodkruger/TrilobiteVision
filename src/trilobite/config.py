@@ -54,6 +54,22 @@ class CameraConfig(BaseModel):
     # Frames per second requested from the sensor.
     fps: float = 30.0
 
+    # Mirror the sensor image. Applied at ACQUISITION, so the preview, the raw
+    # captures, the sub-aperture crops and the calibration corners all see the
+    # same orientation -- there is no way for the display and the saved data to
+    # disagree, because there is only one flip and it happens before anything
+    # else looks at the pixels.
+    #
+    # This is a statement about how the camera is MOUNTED (a fold mirror, an
+    # inverted bracket), not a display preference, which is why it lives with
+    # the camera rather than in the pipeline.
+    #
+    # Changing it invalidates an MLA alignment: the grid offsets are measured
+    # from the frame centre, and a flip negates the axis they are measured
+    # along. Set it before aligning, and re-check the grid if you change it.
+    flip_horizontal: bool = False
+    flip_vertical: bool = False
+
     # Force a specific raw stream format, e.g. "R10" or "R12".
     #
     # Leave null and libcamera picks for you -- on a Pi 5 that is

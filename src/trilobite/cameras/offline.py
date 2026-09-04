@@ -181,27 +181,30 @@ class SyntheticSource(CameraSource):
         # second thread reaching into the source on its own schedule.
         if self.full_frame_pending:
             self._serve_full_frame(Frame.now(
-                self._render(self._full, phase), self.cam_id, seq,
-                space="mono8", Synthetic=True, stream="main", **self._controls,
+                self._orient(self._render(self._full, phase)), self.cam_id, seq,
+                space="mono8", Synthetic=True, stream="main",
+                **self.orientation, **self._controls,
             ))
 
         return Frame.now(
-            image,
+            self._orient(image),
             self.cam_id,
             seq,
             space="mono8",
             Synthetic=True,
+            **self.orientation,
             **self._controls,
         )
 
     def capture_full(self, raw: bool = True) -> Frame:
         phase = self._phase(time.monotonic())
         return Frame.now(
-            self._render(self._full, phase),
+            self._orient(self._render(self._full, phase)),
             self.cam_id,
             self._next_seq(),
             space="raw" if raw else "mono8",
             Synthetic=True,
+            **self.orientation,
             **self._controls,
         )
 

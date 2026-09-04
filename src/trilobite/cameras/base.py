@@ -142,6 +142,38 @@ class CameraSource(ABC):
             return None
         return self.take_full_frame()
 
+    def _orient(self, data: np.ndarray) -> np.ndarray:
+        """Apply the configured mirroring. Every frame passes through here.
+
+        Applied once, at acquisition, before anything else sees the pixels --
+        so the preview, the saved raw, the sub-aperture crops and the recorded
+        corners cannot disagree about which way round the image is. A flip that
+        lived in the display pipeline would have flipped what you look at and
+        not what you measure, which is a difference nobody notices until the
+        calibration is finished and mirrored.
+
+        np.flip returns a view with negative strides; the copy back to
+        contiguous is what makes it a real array again, and costs about
+        0.3 ms for a 1456x1088 uint8 frame.
+        """
+        if data is None or data.ndim < 2:
+            return data
+        if self.cfg.flip_horizontal:
+            data = np.flip(data, axis=1)
+        if self.cfg.flip_vertical:
+            data = np.flip(data, axis=0)
+        if self.cfg.flip_horizontal or self.cfg.flip_vertical:
+            return np.ascontiguousarray(data)
+        return data
+
+    @property
+    def orientation(self) -> dict[str, bool]:
+        """Recorded in every sidecar: a frame has to say which way round it is."""
+        return {
+            "flip_horizontal": bool(self.cfg.flip_horizontal),
+            "flip_vertical": bool(self.cfg.flip_vertical),
+        }
+
     @staticmethod
     def _to_mono(frame: Frame) -> Frame:
         """Reduce an ISP frame to one channel.

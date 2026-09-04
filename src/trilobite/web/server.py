@@ -327,6 +327,43 @@ def create_app(application: Application) -> FastAPI:
         cam = _cam(cam_id)
         return {"spec": cam.source.control_spec(), "requested": dict(cam.cfg.controls)}
 
+    @api.get("/api/orientation/{cam_id}")
+    def read_orientation(cam_id: str) -> dict[str, Any]:
+        return _cam(cam_id).source.orientation
+
+    @api.post("/api/orientation/{cam_id}")
+    def write_orientation(cam_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Mirror the sensor image, for the preview AND the saved data.
+
+        A separate endpoint from the sensor controls because it is neither a
+        driver control nor a pipeline parameter: it is applied at acquisition,
+        before either. See CameraSource._orient.
+
+        Changing this invalidates an MLA alignment -- the grid offsets are
+        measured from the frame centre and a flip negates the axis they run
+        along -- so the response says so and the caller is expected to pass it
+        on rather than swallow it.
+        """
+        cam = _cam(cam_id)
+        changed = []
+        for key in ("flip_horizontal", "flip_vertical"):
+            if key in body:
+                new_value = bool(body[key])
+                if new_value != bool(getattr(cam.cfg, key)):
+                    setattr(cam.cfg, key, new_value)
+                    changed.append(key)
+        mla = cam.mla_stage()
+        aligned = bool(mla is not None and mla.params.enabled)
+        return {
+            **cam.source.orientation,
+            "changed": changed,
+            "warning": (
+                "the MLA grid is aligned against the un-flipped image; "
+                "re-check pitch and offsets before calibrating"
+                if changed and aligned else ""
+            ),
+        }
+
     @api.post("/api/controls/{cam_id}")
     def write_controls(cam_id: str, body: ControlUpdate) -> dict[str, Any]:
         """Sensor controls: ExposureTime, AnalogueGain, AeEnable, ...

@@ -31,6 +31,17 @@ from .base import CameraSource
 log = logging.getLogger(__name__)
 
 
+def _is_compressed_raw(name: str) -> bool:
+    """Is this raw format one of the Pi 5 pipeline's COMPRESSED transports?
+
+    `MONO_PISP_COMP1`, `PISP_COMP1_*` and friends carry compressed bytes, not
+    pixel values. Matched by name because that is what libcamera exposes, and
+    the naming is stable: everything compressed carries PISP and COMP.
+    """
+    u = name.upper()
+    return "PISP" in u or "COMP" in u
+
+
 class Picamera2Source(CameraSource):
     def __init__(self, cfg: CameraConfig) -> None:
         super().__init__(cfg)
@@ -102,11 +113,9 @@ class Picamera2Source(CameraSource):
         )
 
         raw_stream: dict[str, Any] = {"size": sensor_res}
-        if self.cfg.raw_format:
-            # Explicit format, because libcamera's default on a Pi 5 is
-            # MONO_PISP_COMP1 -- companded, not linear, and wrong for anything
-            # that fits a model to pixel values.
-            raw_stream["format"] = self.cfg.raw_format
+        chosen = self._choose_raw_format(picam)
+        if chosen:
+            raw_stream["format"] = chosen
 
         config = picam.create_video_configuration(
             main={"size": self._full_res},
@@ -204,8 +213,9 @@ class Picamera2Source(CameraSource):
             if full.ndim == 3:
                 full = full[..., 0]
             self._serve_full_frame(Frame.now(
-                np.ascontiguousarray(full), self.cam_id, seq,
-                space="mono8", stream="main", mono_sensor=self._mono, **meta,
+                self._orient(np.ascontiguousarray(full)), self.cam_id, seq,
+                space="mono8", stream="main", mono_sensor=self._mono,
+                **self.orientation, **meta,
             ))
 
         # lores is YUV420; the first height rows are the luma plane. For a mono
@@ -216,7 +226,8 @@ class Picamera2Source(CameraSource):
         # Kept so that turning auto-exposure off can pin the values AE just
         # chose -- see set_controls.
         self._last_meta = meta
-        return Frame.now(luma, self.cam_id, seq, space="mono8", **meta)
+        return Frame.now(self._orient(luma), self.cam_id, seq, space="mono8",
+                         **self.orientation, **meta)
 
 
     def capture_full(self, raw: bool = True) -> Frame:
@@ -253,12 +264,104 @@ class Picamera2Source(CameraSource):
             space = "mono8"
         meta["stream"] = "raw" if raw else "main"
         meta["mono_sensor"] = self._mono
+        # What the pixels ARE. Without this a .npy does not say whether its
+        # values are linear sensor counts or a compressed transport format,
+        # and those are indistinguishable by inspection -- which is exactly how
+        # a session was recorded in MONO_PISP_COMP1 and only noticed later.
+        meta["raw_format"] = self._raw_format_name()
+        meta["raw_format_choice"] = getattr(self, "_raw_choice", "unknown")
         if raw:
+            # Trim BEFORE orienting. The stride padding is on the right of the
+            # buffer as it comes off the sensor; flip first and it would be on
+            # the left, and cropping the right would then remove real image.
             data, pad = self._trim_stride(data)
             meta.update(pad)
+        meta.update(self.orientation)
         return Frame.now(
-            np.ascontiguousarray(data), self.cam_id, self._next_seq(), space=space, **meta
+            np.ascontiguousarray(self._orient(data)), self.cam_id,
+            self._next_seq(), space=space, **meta
         )
+
+    def _choose_raw_format(self, picam: Any) -> str | None:
+        """Pick an uncompressed raw format, and never a PiSP-compressed one.
+
+        **This is the bug that corrupted a whole recording session.** On a Pi 5
+        libcamera's default raw format for the mono IMX296 is
+        `MONO_PISP_COMP1`. PISP_COMP1 is not raw sensor data in any useful
+        sense: it is the Pi 5 imaging pipeline's *compressed* transport format,
+        one byte per pixel, produced to save memory bandwidth. The same code
+        on a Pi 4 got `R10` and worked, which is why this only appeared after
+        the move to the 5.
+
+        `make_array` hands those bytes back as a plain uint8 image, and nothing
+        anywhere says they are compressed. The result has the right shape, the
+        right size, and obvious structure in it -- so it looks like a picture
+        that has gone slightly wrong rather than like a decode failure, which
+        is the worst possible failure mode. Every value is wrong, so anything
+        fitted to those pixels is fitted to an artefact.
+
+        So the format is chosen here rather than left to libcamera:
+
+          * an explicit `raw_format` in the config always wins, but is checked
+            and warned about if it looks compressed;
+          * otherwise the sensor's advertised modes are searched for an
+            uncompressed one, preferring the **unpacked** variant (`R10` over
+            `R10_CSI2P`) so the array comes back as plain uint16 with no
+            bit-unpacking left to do;
+          * if nothing suitable is advertised, libcamera's default is used and
+            a loud warning is logged, because silence is what caused this.
+
+        Returns the format string to request, or None to accept the default.
+        """
+        configured = (self.cfg.raw_format or "").strip()
+        if configured:
+            if _is_compressed_raw(configured):
+                log.error(
+                    "%s: raw_format is set to %r, which is a PiSP COMPRESSED "
+                    "format. Captures will contain compressed bytes, not pixel "
+                    "values -- they will look like a damaged image. Set an "
+                    "uncompressed format (run scripts/probe_cameras.py to see "
+                    "what this sensor offers) or remove the setting to let one "
+                    "be chosen automatically.",
+                    self.cam_id, configured,
+                )
+            self._raw_choice = f"{configured} (from config)"
+            return configured
+
+        candidates: list[str] = []
+        try:
+            for mode in picam.sensor_modes or []:
+                # picamera2 gives both the packed transport format and the
+                # unpacked name; the unpacked one is what we want to be handed.
+                for key in ("unpacked", "format"):
+                    name = str(mode.get(key) or "").strip()
+                    if name and not _is_compressed_raw(name) and name not in candidates:
+                        candidates.append(name)
+        except Exception as exc:                       # pragma: no cover - driver
+            log.debug("%s: cannot read sensor_modes: %s", self.cam_id, exc)
+
+        # Prefer unpacked (no _CSI2P suffix), then the widest bit depth, so a
+        # 10-bit sensor is not quietly recorded at 8.
+        def rank(name: str) -> tuple[int, int]:
+            packed = 1 if name.upper().endswith("_CSI2P") else 0
+            digits = "".join(c for c in name if c.isdigit())
+            return (packed, -int(digits or 0))
+
+        for name in sorted(candidates, key=rank):
+            log.info("%s: raw format %s (chosen; uncompressed)", self.cam_id, name)
+            self._raw_choice = f"{name} (auto)"
+            return name
+
+        log.error(
+            "%s: no uncompressed raw format is advertised by this sensor, so "
+            "libcamera's default will be used -- on a Pi 5 that is very likely "
+            "MONO_PISP_COMP1, which is COMPRESSED and will make every capture "
+            "look like a corrupted image. Run scripts/probe_cameras.py and set "
+            "'raw_format' in the config by hand.",
+            self.cam_id,
+        )
+        self._raw_choice = "libcamera default (UNCHECKED)"
+        return None
 
     def _trim_stride(self, data: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
         """Drop the row padding libcamera adds to raw buffers.

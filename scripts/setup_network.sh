@@ -123,7 +123,13 @@ else
       # monitor.
       sudo nmcli connection modify "$CON" +ipv4.addresses "$STATIC_ADDR"
       sudo nmcli connection modify "$CON" ipv4.method auto
-      note "added ${STATIC_ADDR}; DHCP left enabled"
+      # ...and the connection must be allowed to come up when DHCP finds
+      # nothing, which is exactly the direct-cable case this address exists
+      # for. may-fail=yes is the default, but assert it: without it a link
+      # with no DHCP server never activates, and the static address that was
+      # supposed to rescue you is never applied.
+      sudo nmcli connection modify "$CON" ipv4.may-fail yes
+      note "added ${STATIC_ADDR}; DHCP left enabled, may-fail asserted"
       sudo nmcli connection up "$CON" >/dev/null 2>&1 || \
         note "bring the link up yourself, or reboot, to apply it"
     fi

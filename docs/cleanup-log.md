@@ -12,6 +12,164 @@ git checkout .              # everything back to HEAD
 
 ---
 
+## 2026-09-05 (j) — the raw format was compressed; flip; README split
+
+### 1. Captures were structured noise
+
+Reported after the first successful recording session: the files contained
+image data, "but it is nowhere near what the image is supposed to be".
+
+**libcamera's default raw format on a Pi 5 for the mono IMX296 is
+`MONO_PISP_COMP1`** — the Pi 5 imaging pipeline's *compressed* transport, one
+byte per pixel, produced to save memory bandwidth. `make_array` hands those
+bytes back as a plain uint8 image. The array has the right shape, the right
+size, and obvious structure, and every value is wrong.
+
+That is the worst available failure mode: it looks like a photograph that has
+gone slightly wrong rather than like a decode failure, so it does not announce
+itself. The same code on a Pi 4 received `R10` and was correct, which is why it
+only appeared after the move to the 5.
+
+The code already had a `raw_format` config field, and its own comment already
+said the Pi 5 default was unsuitable — but the field defaulted to `None` and no
+config ever set it. A documented hazard with no enforcement.
+
+| change | file |
+|---|---|
+| `_choose_raw_format`: pick an uncompressed format from the sensor's advertised modes, preferring unpacked (`R10` over `R10_CSI2P`) and the widest bit depth | `cameras/picam.py` |
+| `_is_compressed_raw`: name-match PISP/COMP | `cameras/picam.py` |
+| an explicit compressed `raw_format` is honoured but logged at ERROR; no uncompressed option available is also ERROR | `cameras/picam.py` |
+| `raw_format` and `raw_format_choice` recorded in every sidecar | `cameras/picam.py` |
+
+The metadata addition matters as much as the fix. A `.npy` gave no way to tell
+linear sensor counts from a compressed transport, and those are
+indistinguishable by inspection — which is how a session was recorded before
+anyone noticed. Files now say what their pixels are.
+
+Rollback: set `raw_format` explicitly in the config; `_choose_raw_format`
+returns it unchanged.
+
+### 2. Flip horizontal / vertical
+
+Requested for the saved data, not only the display — so it is applied at
+**acquisition**, in `CameraSource._orient`, before anything else sees the
+pixels.
+
+| change | file |
+|---|---|
+| `flip_horizontal` / `flip_vertical` on `CameraConfig` | `config.py` |
+| `_orient()` and `orientation` on `CameraSource` | `cameras/base.py` |
+| applied on all three frame paths: preview, the full frame served to calibration, and `capture_full` | `cameras/picam.py`, `cameras/offline.py` |
+| `GET`/`POST /api/orientation/{cam}` | `web/server.py` |
+| checkboxes in the Sensor panel | `web/static/index.html` |
+
+Two decisions worth recording. It lives with the **camera**, not the pipeline:
+a pipeline stage would flip the preview and not `capture_full`, which bypasses
+the pipeline entirely — mirroring what you look at and not what you measure,
+discovered when a calibration comes back mirrored. And the raw path **trims the
+stride before orienting**: the padding is on the right of the buffer as it
+leaves the sensor, so flipping first would move it to the left and the crop
+would then remove real image.
+
+Changing the flip invalidates an MLA alignment (the grid offsets are measured
+from the frame centre, and a flip negates the axis they run along). The
+endpoint returns a warning saying so when a grid is enabled, and the UI shows
+it.
+
+### 3. README split
+
+The install section had accumulated a running account of one week's network
+debugging — IPv6 link-local recovery, the SD-card flight recorder, USB gadget
+mode, three addressing mechanisms — which is the wrong content for a document
+whose job is "how to run this".
+
+`docs/pi-troubleshooting.md` (263 lines) now holds all of it, opening with the
+advice that supersedes most of it: put the Pi on a router with DHCP and the
+whole class of problem disappears. The README's step 2 says the same in three
+lines and points at the router's client list.
+
+README: 1088 → 884 lines.
+
+### Verification
+
+```
+pytest -q                       → 172 passed  (15 new)
+ruff check src/ tests/ scripts/ → clean
+```
+
+The flip tests assert exact array equality against `np.flip` on all three frame
+paths, including the one the calibration loop uses. The raw-format tests drive
+`_choose_raw_format` against the IMX296's real advertised mode list and assert
+that a compressed format is never chosen, that `R10` wins over `R10_CSI2P` and
+`R8`, and that both failure branches log at ERROR.
+
+Live, against the synthetic rig: the orientation endpoint flips, returns the
+alignment warning, the UI checkboxes render, and two captures taken either side
+of the toggle differ by the mirroring with the flag recorded in each sidecar.
+
+**Not verified on the rig.** The raw-format fix is the one that matters and it
+cannot be tested here — there is no PiSP hardware in this container. The next
+capture on the Pi is the test: the sidecar should read `raw_format: R10` (or
+whatever `probe_cameras.py` reports) rather than anything containing PISP.
+
+---
+
+## 2026-09-04 (i) — the first-contact gap in (h)
+
+The reflashed Pi could not be reached at all: `flyeye.local` failed, a direct
+Ethernet cable showed nothing, and the PC pinned to `192.168.50.20` still saw
+nothing. ACT LED blinking, Ethernet lights on, SSH enabled at flash time,
+hostname set. So the board was fine and the advice was wrong.
+
+**Two defects in (h)'s documentation, one of them mine to own.**
+
+1. **The fixed address is created by the script, and the script needs a shell.**
+   §Addressing presented `192.168.50.10` as somewhere to point a PC, without
+   saying it does not exist until `setup_network.sh` has run once. Telling
+   someone to set their PC to `192.168.50.20` on a freshly flashed card puts
+   the two ends on different subnets with nothing at the far end. Step 2 also
+   said "step 7 fixes it properly", which is useless when the failure is that
+   you cannot get to step 7.
+
+2. **NetworkManager does not do IPv4 link-local fallback.** Unlike the `dhcpcd`
+   it replaced in Bookworm, it does not hand an interface a `169.254.x.x` when
+   DHCP times out. On a direct cable a fresh Pi therefore has **no IPv4 address
+   at all** on eth0 — so every IPv4 approach fails for the same reason, and the
+   symptom is indistinguishable from a dead board.
+
+   What always exists is the IPv6 link-local `fe80::` address. That is the way
+   in, and it needed to be in the document.
+
+| change | file |
+|---|---|
+| new §"If you cannot reach the Pi at all": the IPv4-less explanation, IPv6 link-local recovery with the Windows PowerShell commands, and three ways to avoid it next time | `README.md` |
+| §Addressing states that the fixed address exists only after the script runs | `README.md` |
+| step 2 points at the recovery section instead of at step 7 | `README.md` |
+| Windows mDNS is partial; Bonjour Print Services makes `.local` reliable | `README.md` |
+| `ipv4.may-fail yes` asserted alongside the static address | `scripts/setup_network.sh` |
+
+That last one is small and load-bearing. A connection whose IPv4 is allowed to
+fail still activates when DHCP finds nothing, and the manual address is still
+applied. Without it, the direct-cable case the fixed address exists for is
+exactly the case where it would not appear. It is the default, but a default
+this scenario depends on is worth writing down.
+
+### Verification
+
+```
+pytest -q                       → 157 passed
+ruff check src/ tests/ scripts/ → clean
+shellcheck scripts/setup_network.sh → clean
+```
+
+The diagnosis is from documentation and from the reported symptoms, not from a
+Pi: the IPv6 link-local recovery has **not** been executed against this rig.
+Facts checked rather than recalled: NetworkManager needs explicit configuration
+for zeroconf fallback, and Windows `.local` resolution is partial without
+Bonjour.
+
+---
+
 ## 2026-09-04 (h) — a from-SD-card Pi procedure, and a rig that stops moving
 
 The Pi's address changed and the rig went missing. Separately, the SD card is

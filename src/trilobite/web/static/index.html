@@ -516,7 +516,46 @@ async function buildSensorPanel(camId) {
     SENSOR_ROWS[camId][n] = row;
     body.appendChild(row);
   }
+  body.appendChild(await buildOrientationRows(camId));
   return makePanel("Sensor", "driver", body, false);
+}
+
+/* Mirroring. Deliberately in the Sensor panel rather than the pipeline: it is
+   applied at ACQUISITION, so it affects the saved raw data and the calibration
+   corners, not only what you are looking at. A flip that changed the preview
+   and not the file would be a trap. */
+async function buildOrientationRows(camId) {
+  const wrap = document.createElement("div");
+  let state = { flip_horizontal: false, flip_vertical: false };
+  try { state = await jget(`/api/orientation/${camId}`); } catch { /* backend without it */ }
+
+  for (const [key, label] of [["flip_horizontal", "Flip horizontal"],
+                              ["flip_vertical", "Flip vertical"]]) {
+    const row = document.createElement("div");
+    row.className = "row";
+    const name = document.createElement("label");
+    name.textContent = label;
+    name.title = "Applied to the preview AND to every saved frame. " +
+                 "Changing it after aligning the MLA grid invalidates the alignment.";
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = !!state[key];
+    box.onchange = async ev => {
+      ev.target.blur();
+      try {
+        const r = await jsend(`/api/orientation/${camId}`, { [key]: ev.target.checked });
+        note(camId, `${label.toLowerCase()} = ${r[key]}` +
+                    (r.warning ? ` — ${r.warning}` : ""), r.warning ? "err" : "ok");
+        refreshSubaps(camId);
+      } catch (e) {
+        ev.target.checked = !ev.target.checked;
+        note(camId, `${label}: ${e.message}`, "err");
+      }
+    };
+    row.append(name, box);
+    wrap.appendChild(row);
+  }
+  return wrap;
 }
 
 async function buildPipelinePanels(camId, host) {
