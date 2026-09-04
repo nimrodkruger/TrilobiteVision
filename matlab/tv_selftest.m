@@ -33,18 +33,40 @@ function ok = tv_selftest(path)
   check('loads', true, '');
 
   % -- the array is the right way round ---------------------------------
-  % The sidecar records the shape of the FILE; cap.image may legitimately be
-  % narrower, because raw row-stride padding is trimmed on load. So the
-  % identity to check is file width minus the columns removed.
-  want = double(cap.info.shape(:))';
-  want(2) = want(2) - cap.trimmed_padding;
-  check('shape matches the sidecar, less any trimmed padding', ...
-        isequal([cap.height cap.width], want), ...
-        sprintf('%dx%d vs %s (trimmed %d)', cap.height, cap.width, ...
-                mat2str(want), cap.trimmed_padding));
+  % The sidecar records the shape and dtype of the FILE. cap.image can
+  % legitimately differ from both, and for two separate reasons:
+  %   * row-stride padding is trimmed off, so it is narrower;
+  %   * a 10-bit buffer arrives as uint8 with the row length in BYTES, and is
+  %     re-viewed as uint16, so it is half as wide again and a different class.
+  % The invariant worth checking is therefore not "same as the file" but "the
+  % sensor's own width", which the sidecar records independently.
+  file_shape = double(cap.info.shape(:))';
+  check('height matches the sidecar', cap.height == file_shape(1), ...
+        sprintf('%d vs %d', cap.height, file_shape(1)));
 
-  check('dtype preserved', strcmp(class(cap.image), i_class(cap.info.dtype)), ...
-        sprintf('%s vs %s', class(cap.image), cap.info.dtype));
+  if cap.trimmed_padding > 0 && isfield(cap.camera, 'full_resolution')
+    sensor_w = double(cap.camera.full_resolution(1));
+    check('width is the sensor width after trimming', cap.width == sensor_w, ...
+          sprintf('%d vs %d', cap.width, sensor_w));
+  else
+    check('width matches the sidecar', cap.width == file_shape(2), ...
+          sprintf('%d vs %d', cap.width, file_shape(2)));
+  end
+
+  % A re-view to uint16 is expected and correct; anything else is not.
+  file_class = i_class(cap.info.dtype);
+  ok_class = strcmp(class(cap.image), file_class) || ...
+             (strcmp(file_class, 'uint8') && strcmp(class(cap.image), 'uint16'));
+  check('dtype preserved, or re-viewed to uint16', ok_class, ...
+        sprintf('%s from a %s file', class(cap.image), file_class));
+
+  if strcmp(class(cap.image), 'uint16') && strcmp(file_class, 'uint8')
+    % Two bytes per pixel: the row length in bytes has to come out even, and
+    % the values must exceed 8-bit range somewhere or the re-view is suspect.
+    check('a 10-bit buffer was re-viewed, not truncated', ...
+          max(cap.image(:)) > 255 || min(cap.image(:)) > 0, ...
+          sprintf('range %d..%d', min(cap.image(:)), max(cap.image(:))));
+  end
 
   check('not transposed (wider than tall)', cap.width >= cap.height, ...
         sprintf('%dx%d', cap.width, cap.height));

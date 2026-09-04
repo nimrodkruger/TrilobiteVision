@@ -115,22 +115,24 @@ class Capture:
 
 
 def _trim_stride(image: np.ndarray, meta: dict) -> tuple[np.ndarray, int]:
-    """Drop raw row-stride padding from captures that still carry it.
+    """Turn a raw buffer into an image: right pixel size, no row padding.
 
-    A raw buffer's rows are padded out to a hardware-friendly stride and the
-    array is shaped by that stride rather than by the image width. The IMX296
-    is 1456 px wide; 1456 is not a multiple of 32, so an 8-bit raw frame
-    arrives as 1088 x 1472 with sixteen columns on the right that are not
-    image data.
+    A raw buffer's rows are padded to a hardware-friendly stride (64 bytes on
+    this pipeline) and the array is shaped by that stride **in bytes**, handed
+    over as uint8 whatever the real pixel size is:
 
-    Left in they do two things, both silent: the frame becomes 2.022x the
-    preview width against exactly 2.000x its height, so any rescale of the
-    grid onto it is anisotropic; and the frame CENTRE -- which is what the
-    whole grid hangs off -- moves 8 px right, putting every micro-image a
-    quarter of a checkerboard square out of place.
+        8-bit  (R8)   1456 px = 1456 bytes -> stride 1472 -> array 1472 wide
+        10-bit (R10)  1456 px = 2912 bytes -> stride 2944 -> array 2944 wide
 
-    Captures are trimmed at source now. This is for the files already on disk,
-    and it is safe because the sidecar records the true sensor size.
+    In the second case the array is 1472 *uint16* pixels laid out as 2944
+    bytes, not 1456 pixels plus padding. Cropping its width to 1456 would keep
+    the first 728 pixels and half of the next -- structure at the wrong scale.
+
+    Left undone, the padding makes any rescale of the MLA grid anisotropic and
+    moves the frame centre, which the grid hangs off, by half the padding.
+
+    Captures are trimmed at source now; this is for the files already on disk.
+    Safe because the sidecar records the true sensor size.
     """
     cam = (meta.get("camera") or {})
     full = cam.get("full_resolution")
@@ -140,12 +142,26 @@ def _trim_stride(image: np.ndarray, meta: dict) -> tuple[np.ndarray, int]:
     h, w = image.shape[:2]
     if w == full_w or h != full_h:
         return image, 0
-    if not (full_w < w <= full_w + 128):
-        print(f"warning: frame is {w}x{h} but the sensor is {full_w}x{full_h}, and "
-              f"the difference is not a row-stride pad — leaving it untouched",
-              file=sys.stderr)
-        return image, 0
-    return np.ascontiguousarray(image[:, :full_w]), w - full_w
+
+    row_bytes = w * image.dtype.itemsize
+    for bpp in (1, 2):
+        want = full_w * bpp
+        if not (want <= row_bytes <= want + 256):
+            continue
+        out = image
+        if bpp == 2 and image.dtype.itemsize == 1:
+            if w % 2:
+                break
+            out = np.ascontiguousarray(image).view(np.uint16)
+        if out.shape[1] < full_w:
+            break
+        return np.ascontiguousarray(out[:, :full_w]), out.shape[1] - full_w
+
+    print(f"warning: raw buffer is {w}x{h} of {image.dtype} ({row_bytes} bytes per "
+          f"row) and the sensor is {full_w}x{full_h} -- not a whole number of "
+          f"bytes per pixel plus a stride pad. Leaving it untouched; this is "
+          f"most likely a PACKED format.", file=sys.stderr)
+    return image, 0
 
 
 def load(npy_path: Path) -> Capture:

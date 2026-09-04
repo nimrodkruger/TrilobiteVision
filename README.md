@@ -836,11 +836,14 @@ to mean something different from what every consumer of it assumed. A stored
 grid carrying an older preview-referenced reference is rebased once, at
 start-up, with a warning in the log.
 
-**Raw frames are 1472 px wide before trimming.** Row stride is padded to a
-multiple of 32, and 1456 is not one, so a raw buffer arrives with sixteen
-columns that are not image data. They are trimmed at capture now. Left in they
-make the frame 2.022× the preview horizontally against 2.000× vertically, and
-move the frame centre — which the whole grid hangs off — 8 px right.
+**A raw buffer is not an image until two things are undone.** Its rows are
+padded to a 64-byte stride, and the array is shaped by that stride *in bytes*
+and delivered as uint8 whatever the real pixel size is — so 10-bit `R10` at
+1456 px arrives as 1088 × **2944** uint8, which is 1472 uint16 pixels, not 1456
+pixels plus padding. The capture path works out the bytes per pixel from the
+row length, re-views the buffer, then trims. Left undone, the padding makes any
+rescale of the MLA grid anisotropic and moves the frame centre — which the grid
+hangs off — by half the padding.
 
 **The Pi 5's default raw format is COMPRESSED.** libcamera hands the mono
 IMX296 `MONO_PISP_COMP1` unless told otherwise — the imaging pipeline's

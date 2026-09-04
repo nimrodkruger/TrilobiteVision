@@ -119,25 +119,25 @@ end
 
 
 function [img, trimmed] = i_trim_stride(img, info)
-%I_TRIM_STRIDE  Drop raw row-stride padding from captures that still carry it.
+%I_TRIM_STRIDE  Turn a raw buffer into an image: pixel size, then padding.
 %
-%   A raw buffer's rows are padded out to a hardware-friendly stride, and the
-%   array is shaped by that stride rather than by the image width. The IMX296
-%   is 1456 px wide, 1456 is not a multiple of 32, so an 8-bit raw frame
-%   arrives 1088 x 1472: sixteen columns on the right that are not image data.
+%   A raw buffer's rows are padded to a hardware-friendly stride (64 bytes on
+%   this pipeline) and the array is shaped by that stride IN BYTES, stored as
+%   uint8 whatever the real pixel size is:
 %
-%   Two things go wrong if they are left in, both silently:
-%     * 1472/728 = 2.022 horizontally against 2.000 vertically, so rescaling
-%       any grid onto the frame is anisotropic -- which is the error that sent
-%       us looking;
-%     * the grid hangs off the frame CENTRE, and the centre of a 1472-wide
-%       array is 8 px right of the centre of the image, so every micro-image
-%       would land 8 px off. A quarter of a checkerboard square, and it looks
-%       exactly like a rig that will not detect.
+%       8-bit  (R8)   1456 px = 1456 bytes -> stride 1472 -> array 1472 wide
+%       10-bit (R10)  1456 px = 2912 bytes -> stride 2944 -> array 2944 wide
 %
-%   The capture path trims this at source now. This exists for the files
-%   already on disk, and it can do it safely because the sidecar records the
-%   real sensor size in camera.full_resolution.
+%   The second case is 1472 *uint16* pixels laid out as 2944 bytes, not 1456
+%   pixels plus padding. Cropping its width to 1456 keeps the first 728 pixels
+%   and half of the next -- structure at the wrong scale, and the reason this
+%   reader reported a 2.022 : 1.000 aspect ratio.
+%
+%   Left undone, the padding makes the MLA rescale anisotropic and moves the
+%   frame CENTRE, which the whole grid hangs off, by half the padding.
+%
+%   Captures are trimmed at source now. This is for files already on disk, and
+%   it is safe because the sidecar records the true sensor size.
   trimmed = 0;
   if ~isstruct(info) || ~isfield(info, 'camera') || ...
      ~isfield(info.camera, 'full_resolution')
@@ -153,15 +153,50 @@ function [img, trimmed] = i_trim_stride(img, info)
   if w == full_w || h ~= full_h
     return;                       % already right, or not a stride story
   end
-  if w < full_w || w > full_w + 128
-    warning('tv_read_capture:shape', ...
-            ['image is %dx%d but the sensor is %dx%d, and the difference is ' ...
-             'not a row-stride pad. Leaving it untouched -- the MLA geometry ' ...
-             'will not apply correctly to it.'], w, h, full_w, full_h);
+
+  bytes_per_element = i_element_bytes(class(img));
+  row_bytes = w * bytes_per_element;
+
+  for bpp = [1 2]
+    want = full_w * bpp;
+    if row_bytes < want || row_bytes > want + 256
+      continue;
+    end
+    out = img;
+    if bpp == 2 && bytes_per_element == 1
+      if mod(w, 2) ~= 0
+        break;
+      end
+      % A row of 2N bytes IS N little-endian uint16 pixels. typecast works on
+      % a vector, so the rows are laid end to end first -- img.' because
+      % MATLAB is column-major and the bytes run along rows.
+      u16 = typecast(reshape(img.', [], 1), 'uint16');
+      out = reshape(u16, w / 2, h).';
+    end
+    if size(out, 2) < full_w
+      break;
+    end
+    trimmed = size(out, 2) - full_w;
+    img = out(:, 1:full_w);
     return;
   end
-  trimmed = w - full_w;
-  img = img(:, 1:full_w);
+
+  warning('tv_read_capture:shape', ...
+          ['raw buffer is %dx%d of %s (%d bytes per row) and the sensor is ' ...
+           '%dx%d -- not a whole number of bytes per pixel plus a stride pad. ' ...
+           'Leaving it untouched; most likely a PACKED format.'], ...
+          w, h, class(img), row_bytes, full_w, full_h);
+end
+
+
+function n = i_element_bytes(cls)
+  switch cls
+    case {'uint8', 'int8'},   n = 1;
+    case {'uint16', 'int16'}, n = 2;
+    case {'uint32', 'int32', 'single'}, n = 4;
+    case {'uint64', 'int64', 'double'}, n = 8;
+    otherwise, n = 1;
+  end
 end
 
 

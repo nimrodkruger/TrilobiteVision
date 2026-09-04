@@ -12,6 +12,94 @@ git checkout .              # everything back to HEAD
 
 ---
 
+## 2026-09-05 (k) — the second half of the raw buffer story
+
+Fixing the compressed format in (j) moved the symptom rather than removing it.
+The reader now reported **2944 x 1088**, a 2.0220 : 1.0000 aspect ratio, raw
+only, both cameras, MLA on or off. View captures were fine throughout, which
+localised it to the raw buffer and nothing else.
+
+`2944 = 2 x 1472`, and `1472 = 1456 + 16`. So (j) worked: the format is now
+10-bit `R10`, **two bytes per pixel**. What did not change is `_trim_stride`,
+which assumed one byte per pixel throughout.
+
+A raw buffer's rows are padded to a 64-byte stride and `make_array` shapes the
+array by that stride **in bytes**, handing it over as uint8 whatever the pixel
+size really is:
+
+| format | image | row bytes | stride | delivered as |
+|---|---|---|---|---|
+| R8 | 1456 px | 1456 | 1472 | 1088 x 1472 uint8 |
+| R10 | 1456 px | 2912 | 2944 | 1088 x 2944 uint8 |
+
+The second is 1472 *uint16* pixels laid out as 2944 bytes. The old trim tested
+`1456 < w <= 1584`, 2944 matched nothing, and it correctly refused and flagged
+`raw_unexpected_shape` — so the frame was saved untouched rather than mangled.
+Which was the right failure to have: had the window been wider, it would have
+cropped to 1456 *bytes* — the first 728 pixels and half of the 729th, which is
+structure at the wrong scale and much harder to recognise.
+
+| change | file |
+|---|---|
+| `_trim_stride` infers bytes per pixel from the row length, re-views a 2-byte buffer as uint16, then trims | `cameras/picam.py` |
+| `_unexpected()` split out; its message now names packed formats as the likely cause | `cameras/picam.py` |
+| `raw_stride_bytes` and `raw_bytes_per_pixel` added to the metadata | `cameras/picam.py` |
+| the same inference in both offline readers, for files already on disk | `scripts/read_capture.py`, `matlab/tv_read_capture.m` |
+| self-test checks rewritten: the sidecar records the FILE's shape and dtype, and the image legitimately differs from both | `matlab/tv_selftest.m` |
+
+The re-view is a re-view, not a conversion: no copy, no arithmetic, and the
+values become the 10-bit counts the sensor produced rather than their low
+bytes.
+
+### Verification
+
+```
+pytest -q                       → 177 passed  (5 new)
+ruff check src/ tests/ scripts/ → clean
+tv_selftest, 8-bit capture      → 20 passed
+tv_selftest, 10-bit repro       → 22 passed
+```
+
+Reproduced the reported file exactly — a known 10-bit image laid out as
+1472 uint16 per row with 16 pixels of pad, delivered as 1088 x 2944 uint8 —
+and both readers recover it **bit for bit**: `np.array_equal` against the
+source image in Python, and matching values in Octave. The Python test asserts
+the same on the capture-side path, plus that packed formats are still refused
+and that the 8-bit branch is unchanged.
+
+Still not verified on the rig. The next capture's sidecar should read
+`raw_bytes_per_pixel: 2`, `raw_stride_bytes: 2944`, `shape: [1088, 1456]`.
+
+### A flake fixed on the way past
+
+`tests/test_detection.py` failed about one run in thirty on
+`test_every_whole_tile_yields_the_full_pattern`. Its synthetic source never
+pinned `synthetic_drift_px`, which defaults to 3.0, so the board wandered with
+the **wall clock** and at some phases an edge micro-image lost a corner. The
+same flake was found and fixed in `test_presence.py` earlier and never
+propagated here.
+
+Pinning the drift then exposed two things it had been hiding, both real and
+neither a bug in the code under test:
+
+* At 4 degrees rotation the outermost ring of tiles is whole for the
+  axis-aligned predicate and reaches off-sensor for the rotated one, where the
+  bilinear sampler clamps at the border. A clamped edge moves corners by a few
+  pixels. `test_derotated_and_plain_crops_agree_on_corner_positions` now
+  compares only tiles whole under **both** predicates, which is the set where
+  its precision claim means anything.
+* At a crop scale of 0.85 the crop cuts into the synthetic board's one-square
+  quiet margin, and `findChessboardCornersSB` can lock onto a 4x3 sub-grid
+  shifted by one square — the two routes then disagree by multiples of the
+  square size. Measured across scales: 1.0, 0.95 and 0.9 give zero
+  disagreements out of ~130 tiles, 0.85 gives eight. The test uses 0.9 and says
+  why.
+
+Both had been passing for an accidental reason. Nine consecutive full-suite
+runs clean afterwards.
+
+---
+
 ## 2026-09-05 (j) — the raw format was compressed; flip; README split
 
 ### 1. Captures were structured noise

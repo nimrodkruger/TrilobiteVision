@@ -364,35 +364,36 @@ class Picamera2Source(CameraSource):
         return None
 
     def _trim_stride(self, data: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
-        """Drop the row padding libcamera adds to raw buffers.
+        """Turn a raw buffer into an image: strip the row padding, and get the
+        pixel size right.
 
-        A raw buffer's rows are padded out to a hardware-friendly stride, and
-        `make_array` shapes the array by that stride rather than by the image
-        width. The IMX296 is 1456 px wide; 1456 is not a multiple of 32, so the
-        next one up is 1472, and an 8-bit raw frame arrives as 1088 x **1472**
-        with sixteen columns of padding on the right.
+        A raw buffer's rows are padded out to a hardware-friendly stride --
+        64 bytes on this pipeline -- and `make_array` shapes the array by that
+        stride **in bytes**, not in pixels, and hands it back as uint8 whatever
+        the real pixel size is. Two things therefore have to be undone, and the
+        second one is the one that was missed:
 
-        Those columns are not image data. Left in, they do two things, both
-        silent:
+            8-bit  (R8)   1456 px = 1456 bytes -> stride 1472 -> array 1472 wide
+            10-bit (R10)  1456 px = 2912 bytes -> stride 2944 -> array 2944 wide
 
-          * the array is 2.022x the preview width but exactly 2.000x its
-            height, so any geometry rescale from the preview is anisotropic and
-            either raises or, worse, gets fudged;
-          * the grid hangs off the *centre* of the frame, and the centre of a
-            1472-wide array is 8 px right of the centre of the image, so every
-            micro-image would land 8 px off. That is a quarter of a
-            checkerboard square, and it looks exactly like a rig that will not
-            detect.
+        In the second case the array is not "1456 pixels plus padding", it is
+        1472 *uint16* pixels laid out as 2944 bytes. Treating its width as a
+        pixel count and cropping to 1456 would keep the first 728 pixels and
+        half of the 729th -- structure, at the wrong scale, which is what a
+        2.022:1.000 aspect ratio in the reader was reporting.
 
-        Cropping here rather than in each reader keeps every file on disk
-        honest about what it contains, and the counts go into the metadata so a
-        capture can still say what its buffer looked like.
+        So: work out the bytes per pixel from the row length, re-view the
+        buffer at that pixel size, and only then remove the padding columns.
 
-        Only trimmed when the height already matches and the excess is small
-        enough to be a stride pad. A *packed* raw format -- 10-bit as 5 bytes
-        per 4 pixels -- has an array width that is not a pixel count at all,
-        and cropping that by pixels would be nonsense, so it is recorded and
-        left alone instead.
+        Left undone, the padding does two things, both silent: it makes any
+        rescale of the MLA grid onto the frame anisotropic, and it moves the
+        frame *centre* -- which the whole grid hangs off -- by half the padding,
+        putting every micro-image out by a quarter of a checkerboard square.
+
+        A format whose row length matches no whole bytes-per-pixel is left
+        alone and flagged. Packed 10-bit (5 bytes per 4 pixels) is the case
+        that matters: its width is not a pixel count at any scale, and cropping
+        it would be nonsense.
         """
         full_w, full_h = self._full_res
         if data.ndim < 2:
@@ -402,21 +403,52 @@ class Picamera2Source(CameraSource):
 
         if w == full_w and h == full_h:
             return data, note
+        if h != full_h:
+            return data, {**note, **self._unexpected(data)}
 
-        if h == full_h and full_w < w <= full_w + 128:
-            note["raw_stride_px"] = int(w)
-            note["raw_padding_px"] = int(w - full_w)
-            return data[:, :full_w], note
+        row_bytes = w * data.dtype.itemsize
+        # 64-byte stride alignment means at most 63 bytes of padding; the
+        # allowance is generous because the alignment is not ours to promise.
+        for bpp in (1, 2):
+            want = full_w * bpp
+            if not (want <= row_bytes <= want + 256):
+                continue
+            out = data
+            if bpp == 2 and data.dtype.itemsize == 1:
+                if w % 2:
+                    break                       # cannot be whole uint16 pixels
+                # A C-contiguous uint8 row of 2*N bytes IS N little-endian
+                # uint16 pixels. This is a re-view, not a conversion: no copy,
+                # no arithmetic, and the values become the 10-bit counts the
+                # sensor actually produced instead of their halves.
+                out = np.ascontiguousarray(data).view(np.uint16)
+            px_w = out.shape[1]
+            note.update(
+                raw_stride_bytes=int(row_bytes),
+                raw_bytes_per_pixel=int(bpp),
+                raw_stride_px=int(px_w),
+                raw_padding_px=int(px_w - full_w),
+            )
+            if px_w < full_w:
+                return data, {**note, **self._unexpected(data)}
+            return out[:, :full_w], note
 
-        note["raw_buffer_shape"] = [int(h), int(w)]
-        note["raw_unexpected_shape"] = True
+        return data, {**note, **self._unexpected(data)}
+
+    def _unexpected(self, data: np.ndarray) -> dict[str, Any]:
+        """Record and complain about a buffer shape we cannot interpret."""
+        h, w = data.shape[:2]
+        full_w, full_h = self._full_res
         log.warning(
-            "%s: raw buffer is %dx%d but the sensor is %dx%d, and the difference is "
-            "not a row-stride pad. Saving the buffer untouched -- the MLA geometry "
-            "cannot be applied to it until this is understood.",
-            self.cam_id, w, h, full_w, full_h,
+            "%s: raw buffer is %dx%d of %s (%d bytes per row) and the sensor is "
+            "%dx%d. That is not a whole number of bytes per pixel plus a stride "
+            "pad, so it is being saved untouched -- most likely a PACKED format "
+            "(10-bit as 5 bytes per 4 pixels), whose width is not a pixel count "
+            "at any scale. Set 'raw_format' to an unpacked one; "
+            "scripts/probe_cameras.py lists what this sensor offers.",
+            self.cam_id, w, h, data.dtype, w * data.dtype.itemsize, full_w, full_h,
         )
-        return data, note
+        return {"raw_buffer_shape": [int(h), int(w)], "raw_unexpected_shape": True}
 
     def describe(self) -> CameraInfo:
         return CameraInfo(

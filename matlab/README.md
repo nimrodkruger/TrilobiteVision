@@ -54,17 +54,28 @@ applying it twice returns the input.
 
 ## Four things that will bite you
 
-**Raw stride padding.** A raw buffer's rows are padded to a hardware-friendly
-stride, and the array is shaped by that stride rather than by the image width.
-The IMX296 is 1456 px wide; 1456 is not a multiple of 32, so a raw frame arrives
-1088×**1472** with sixteen columns on the right that are not image data.
+**Raw stride padding, and the pixel size.** A raw buffer's rows are padded to a
+hardware-friendly stride (64 bytes here), and the array is shaped by that
+stride **in bytes**, delivered as uint8 whatever the real pixel size is:
 
-Left in they make the frame 2.022× the preview width against 2.000× its height
-— an anisotropic rescale, which is what this reader used to refuse outright —
-and, worse, move the frame *centre* 8 px right. The grid hangs off that centre,
-so every micro-image would land a quarter of a checkerboard square out of
-place. Captures are trimmed at source now; `tv_read_capture` trims the files
-already on disk and reports how many columns in `.trimmed_padding`.
+| format | image | row bytes | stride | array as delivered |
+|---|---|---|---|---|
+| R8 | 1456 px | 1456 | 1472 | 1088 × 1472 uint8 |
+| R10 | 1456 px | 2912 | 2944 | 1088 × **2944** uint8 |
+
+The second is 1472 *uint16* pixels laid out as 2944 bytes — not 1456 pixels
+plus padding. Cropping its width to 1456 keeps the first 728 pixels and half of
+the next: structure at the wrong scale.
+
+Either way, left undone the padding makes the frame 2.022× the reference width
+against 1.000 or 2.000× its height — an anisotropic rescale, which this reader
+refuses outright — and moves the frame *centre*, which the whole grid hangs
+off, by half the padding.
+
+`tv_read_capture` works out the bytes per pixel from the row length, re-views
+the buffer at that size, then removes the padding. Captures are trimmed at
+source now too; this handles the files already on disk. `.trimmed_padding`
+reports how many pixel columns went.
 
 **The rescale.** `pitch_px` and the offsets are recorded in full-resolution
 sensor pixels, alongside the reference frame they are expressed in, so for a
@@ -105,6 +116,8 @@ inside `tv_micro_images`, and nowhere else.
 
 `tv_selftest` passes 19 of 19 on both cameras of a real capture pair, including
 the rotated one (2°, crop scale 0.9), and 20 of 20 on a stride-padded frame
-(the extra check is the padding). Separately, the de-rotated extraction was
+(the extra check is the padding), and 22 of 22 on a 10-bit R10 buffer
+delivered as 2944-wide uint8 — where the values are recovered exactly, verified
+against a known 10-bit image. Separately, the de-rotated extraction was
 compared pixel for pixel against `MLAGeometry.crop_derotated` in Python on the
 same file: **max difference 0**.

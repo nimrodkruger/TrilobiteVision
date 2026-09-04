@@ -41,6 +41,12 @@ def source(rotation=0.0):
         synthetic_pitch_px=PITCH,
         synthetic_rotation_deg=rotation,
         synthetic_board=BOARD,
+        # No drift. The board otherwise wanders up to 3 px with the WALL CLOCK,
+        # and at some phases an edge micro-image loses a corner -- so
+        # "every whole tile yields the full pattern" fails about one run in
+        # thirty, on the clock rather than on anything in the code. The same
+        # flake was fixed in test_presence.py and not propagated here.
+        synthetic_drift_px=0.0,
     )
     s = SyntheticSource(cfg)
     s.open()
@@ -137,11 +143,38 @@ def test_derotated_and_plain_crops_agree_on_corner_positions():
     """The claim that de-rotation costs precision but not validity
     (calibration-spec §2.6), as a test: both routes must put the corners in the
     same place to well under a pixel."""
+    SCALE = 0.9
+
     frame = full_frame(source(rotation=4.0))
     g = sensor_geometry(rotation=4.0)
     det = detector()
-    plain = det.run(frame.data, g, "left", 1, scale=0.85, derotate=False)
-    derot = det.run(frame.data, g, "left", 1, scale=0.85, derotate=True)
+    plain = det.run(frame.data, g, "left", 1, scale=SCALE, derotate=False)
+    derot = det.run(frame.data, g, "left", 1, scale=SCALE, derotate=True)
+
+    # SCALE is 0.9, not 0.85, and the difference is not arbitrary. The
+    # synthetic board leaves a one-square quiet margin inside each
+    # micro-image; a crop at 0.85 of the pitch cuts into it, and
+    # findChessboardCornersSB can then lock onto a 4x3 sub-grid shifted by a
+    # square. Both routes are then "right" about different patterns and the
+    # corners differ by multiples of the square size. Measured across scales on
+    # this target: 1.0, 0.95 and 0.9 all give zero disagreements out of ~130
+    # tiles; 0.85 gives eight. That is a property of the target's margin, not
+    # of the extraction, and this test is about the extraction.
+
+    # Compared only on tiles that are whole under BOTH predicates. The two
+    # routes read different sampling windows -- one axis-aligned, one rotated
+    # with the lattice -- so at 4 degrees the outermost ring is whole for one
+    # and reaches off-sensor for the other, where the bilinear sampler clamps
+    # at the border. A clamped edge distorts the pattern and moves its corners
+    # by a few pixels, which is a real property of sampling past the sensor and
+    # not the precision claim being tested here.
+    #
+    # Five tiles, all at extreme indices, and they were being compared until
+    # the synthetic board's wall-clock drift was pinned to zero -- the drift
+    # had been moving them in and out of the intersection.
+    both = (set(g.whole_indices(SCALE, derotate=True))
+            & set(g.whole_indices(SCALE, derotate=False)))
+    assert len(both) > 20, len(both)
 
     by_key = {t.key: t for t in derot.found_tiles}
     compared = 0
@@ -149,10 +182,12 @@ def test_derotated_and_plain_crops_agree_on_corner_positions():
         other = by_key.get(t.key)
         if other is None or other.n_corners != t.n_corners:
             continue
+        if tuple(t.key) not in both:
+            continue
         d = np.linalg.norm(t.corners - other.corners, axis=1)
-        assert d.mean() < 0.5
+        assert d.mean() < 0.5, (t.key, d.mean())
         compared += 1
-    assert compared > 20
+    assert compared > 20, compared
 
 
 # -- the failure the scale fix exists to prevent ----------------------------
@@ -332,7 +367,9 @@ def _trimmer(full=(1456, 1088)):
     from trilobite.cameras.picam import Picamera2Source
 
     fake = _FakeRaw(full)
-    fake._trim_stride = Picamera2Source._trim_stride.__get__(fake, _FakeRaw)
+    # Bind every method the trim reaches, not only the entry point.
+    for name in ("_trim_stride", "_unexpected"):
+        setattr(fake, name, getattr(Picamera2Source, name).__get__(fake, _FakeRaw))
     return fake
 
 
@@ -390,3 +427,85 @@ def test_an_unexplained_shape_is_flagged_not_cropped():
     assert out is packed
     assert note["raw_unexpected_shape"] is True
     assert note["raw_buffer_shape"] == [1088, 1820]
+
+
+# -- raw stride, at two bytes per pixel -------------------------------------
+#
+# The second half of the stride story. Once the raw format stopped being the
+# compressed PISP one and became 10-bit R10, the buffer arrived as uint8 with
+# the row length in BYTES: 1456 px = 2912 bytes, stride-aligned to 2944. The
+# trim assumed one byte per pixel, so 2944 matched nothing and the frame was
+# saved untouched -- 2944 x 1088, which the MATLAB reader reported as a
+# 2.022 : 1.000 aspect ratio. Cropping its width to 1456 would have been worse:
+# the first 728 pixels and half of the next, structure at the wrong scale.
+
+
+def _bytes16(image16, pad_px=16):
+    """Lay a uint16 image out the way make_array delivers it: uint8, row
+    length in bytes, stride padding on the right."""
+    padded = np.concatenate(
+        [image16, np.full((image16.shape[0], pad_px), 0xBEEF, np.uint16)], axis=1)
+    return np.ascontiguousarray(padded).view(np.uint8)
+
+
+def test_a_10_bit_buffer_is_reinterpreted_and_trimmed():
+    h, w = 1088, 1456
+    truth = (np.arange(h * w, dtype=np.uint32) % 1024).astype(np.uint16).reshape(h, w)
+    delivered = _bytes16(truth)
+    assert delivered.shape == (1088, 2944), delivered.shape
+
+    out, note = _trimmer()._trim_stride(delivered)
+
+    assert out.dtype == np.uint16, "the pixels are 16-bit, not pairs of bytes"
+    assert out.shape == (1088, 1456)
+    assert np.array_equal(out, truth), "values must survive exactly -- this is a re-view"
+    assert note["raw_bytes_per_pixel"] == 2
+    assert note["raw_stride_bytes"] == 2944
+    assert note["raw_padding_px"] == 16
+
+
+def test_the_8_bit_case_still_works():
+    """The other branch, unchanged: one byte per pixel, 1472 wide."""
+    padded = np.zeros((1088, 1472), dtype=np.uint8)
+    padded[:, 1456:] = 200
+    out, note = _trimmer()._trim_stride(padded)
+    assert out.dtype == np.uint8
+    assert out.shape == (1088, 1456)
+    assert note["raw_bytes_per_pixel"] == 1
+    assert out.max() == 0, "only padding may be removed"
+
+
+def test_an_already_uint16_buffer_is_handled():
+    """If picamera2 ever hands over a real uint16 array, the row length in
+    bytes is the same and the answer must be the same."""
+    h, w = 1088, 1456
+    truth = np.full((h, w), 513, np.uint16)
+    padded = np.concatenate([truth, np.full((h, 16), 7, np.uint16)], axis=1)
+    out, note = _trimmer()._trim_stride(padded)
+    assert out.shape == (h, w)
+    assert np.array_equal(out, truth)
+    assert note["raw_bytes_per_pixel"] == 2
+
+
+def test_a_packed_format_is_still_refused():
+    """10-bit packed is 5 bytes per 4 pixels: 1820 bytes for 1456 px. That
+    matches no whole bytes-per-pixel, and cropping it would be nonsense."""
+    packed = np.zeros((1088, 1824), dtype=np.uint8)
+    out, note = _trimmer()._trim_stride(packed)
+    assert out is packed
+    assert note["raw_unexpected_shape"] is True
+
+
+def test_the_trimmed_16_bit_frame_rescales_isotropically():
+    """The reported error, closed. 2944 x 1088 against a 1456-wide reference is
+    2.0220 : 1.0000 and has no single pitch; trimmed, it is the identity."""
+    from trilobite.optics.mla import MLAGeometry
+
+    sensor = MLAGeometry(1456, 1088, 100.0)
+    with pytest.raises(ValueError, match="anisotropic"):
+        sensor.rescaled(2944, 1088)
+
+    truth = np.zeros((1088, 1456), np.uint16)
+    out, _ = _trimmer()._trim_stride(_bytes16(truth))
+    g = sensor.rescaled(out.shape[1], out.shape[0])
+    assert g.pitch == pytest.approx(100.0)
