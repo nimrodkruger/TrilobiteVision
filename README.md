@@ -63,25 +63,85 @@ The import package is short so commands stay typeable.
 
 ## Install
 
-### Raspberry Pi 5
+### Raspberry Pi 5 — from a blank SD card
 
-Nothing below exists on a freshly flashed Pi. `install_pi.sh` creates all of
-it and is safe to re-run.
+Nine steps. Each ends with something to check, because the failures here are
+mostly silent and the checks are how you find out at the right moment rather
+than three steps later.
+
+Budget about 40 minutes, most of it `apt` downloading.
+
+#### 1. Flash the card
+
+Use **Raspberry Pi Imager** (2.0 or later) on the desktop.
+
+| setting | value | why |
+|---|---|---|
+| Device | Raspberry Pi 5 | filters the OS list to what will boot |
+| OS | **Raspberry Pi OS Lite (64-bit)** | Lite: the rig is headless, and a desktop session costs RAM and CPU the cameras want. 64-bit: picamera2 and numpy are built for it. |
+| Storage | your card | — |
+
+Then **Next → Edit Settings** and fill in the customisation, all of it:
+
+| field | value |
+|---|---|
+| Hostname | `flyeye` — this becomes `flyeye.local`, which is how you will reach the rig |
+| Username / password | `flyeye` and something you will not lose |
+| Wireless LAN | your network, if the Pi will use wifi; leave off for wired |
+| Locale / time zone | yours — wrong time zone makes every capture timestamp wrong |
+| **Services → Enable SSH** | **yes**, with password authentication (or paste a public key) |
+
+SSH is the one that cannot be fixed afterwards without a monitor and keyboard.
+If you forget it, reflash; it is faster.
+
+Write, wait for verification, eject.
+
+> **Which OS version.** Raspberry Pi OS **Trixie** (Debian 13) has been the
+> current release since 2 October 2025 and is what to use. Bookworm still
+> works and is still supported, but Trixie is where new Pi packages land —
+> including `rpi-usb-gadget`, which matters if you want the USB-C addressing
+> option below.
+
+#### 2. First boot
+
+Card in, both camera ribbons already seated (see step 4 before powering on if
+they are not), Ethernet in, power last. Give it two minutes: the first boot
+resizes the filesystem and reboots itself.
+
+```bash
+ssh flyeye@flyeye.local
+```
+
+**Check:** you get a prompt. If the name does not resolve, your network is
+dropping mDNS — find the address from your router or with
+`nmap -sn 10.44.0.0/22` and use that for now; step 7 fixes it properly.
+
+#### 3. Update, then reboot
+
+```bash
+sudo apt update && sudo apt full-upgrade -y
+sudo reboot
+```
+
+**Check:** `uname -a` and `cat /etc/os-release` after it comes back. A kernel
+update that has not been rebooted into is a common cause of "the camera worked
+yesterday".
+
+#### 4. Cameras: cable and overlays
+
+Power off before touching a ribbon. Both IMX296 ribbons go into the two CSI
+connectors, **contacts facing the board**, latch pushed home square. A ribbon
+in the wrong way round shows up as "no cameras detected", not as an error.
 
 ```bash
 git clone <your-repo> ~/TrilobiteVision
 cd ~/TrilobiteVision
 bash scripts/install_pi.sh
-sudo reboot                       # required: /boot/firmware/config.txt changed
+sudo reboot                      # /boot/firmware/config.txt changed
 ```
 
-```bash
-source ~/.venvs/trilobite/bin/activate
-python scripts/probe_cameras.py --grab      # confirm indices and sensor modes
-python -m trilobite --config config/pi.yaml
-```
-
-Three things the script does that are not optional:
+The script installs everything in `apt-packages.txt`, writes the overlays, and
+builds the virtualenv. Three things it does that are not optional:
 
 - **apt, not pip, for the camera stack.** `python3-picamera2` is a C++
   extension built against the system libcamera; pip versions drift out of step
@@ -102,12 +162,162 @@ Three things the script does that are not optional:
   dtoverlay=imx296,cam1
   ```
 
-Verify with `rpicam-hello --list-cameras` before blaming the Python. If
-libcamera reports zero cameras, run `bash scripts/diagnose_cameras.sh`.
+**Check:**
+
+```bash
+rpicam-hello --list-cameras
+```
+
+Two IMX296 entries, at `/base/axi/pcie@120000/rp1/i2c@88000/imx296@1a` and the
+matching `i2c@80000` node. One entry means one ribbon is not seated. Zero means
+the overlays did not take, or you have not rebooted: run
+`bash scripts/diagnose_cameras.sh`, which separates a kernel/cable problem from
+a software one.
 
 **Do not pip-install OpenCV on the Pi.** The apt build shares numpy's ABI with
 picamera2; a pip wheel alongside it gives two `cv2` modules and an import order
 that decides which one you get.
+
+#### 5. Prove the cameras from Python
+
+```bash
+source ~/.venvs/trilobite/bin/activate
+python scripts/probe_cameras.py --grab
+```
+
+**Check:** both cameras report their sensor modes and a frame is grabbed from
+each. This is the boundary between "libcamera can see it" and "our stack can
+use it", and it is worth crossing deliberately.
+
+#### 6. Run it
+
+```bash
+python -m trilobite --config config/pi.yaml
+```
+
+**Check:** the startup log now lists every address the rig answers on, not the
+bind address:
+
+```
+serving on 0.0.0.0:8000 -- reachable at:
+    http://flyeye.local:8000/   <- survives a DHCP change, if mDNS is not blocked
+    http://10.44.12.87:8000/
+    http://127.0.0.1:8000/   <- this Pi only
+```
+
+Open one from the desktop. Two live previews, both at their configured frame
+rate.
+
+#### 7. Give it a stable address
+
+Do this before you rely on the rig, not after it disappears.
+
+```bash
+bash scripts/setup_network.sh
+```
+
+See **Addressing** below for what it does and which of the three mechanisms to
+lean on. It is safe to re-run and it does not touch the DHCP lease.
+
+**Check:** `http://flyeye.local:8000/` opens, and the script's summary lists a
+fixed address that will still be there tomorrow.
+
+#### 8. Storage
+
+Plug in the USB SSD. On a headless Pi nothing auto-mounts it, which is normal
+and is what the **Mount** button in the Storage panel is for. Then press
+**Verify**: it writes 4 MB, flushes it, reads it back and compares.
+
+**Check:** Verify reports a sensible rate. Do not start a session on a disk
+that has not passed this — see **Output storage**.
+
+#### 9. The service, last
+
+Only once everything above works by hand:
+
+```bash
+sudo cp systemd/trilobite.service /etc/systemd/system/
+sudo sed -i "s/%USER%/$USER/g" /etc/systemd/system/trilobite.service
+sudo systemctl daemon-reload && sudo systemctl enable --now trilobite
+journalctl -u trilobite -f
+```
+
+**During active development leave this disabled.** A service holding the
+cameras makes manual runs fail with a confusing "device busy". Enable it when
+the rig is doing unattended work, not while you are developing against it.
+
+---
+
+### Addressing — so the rig stops moving
+
+The Pi takes its address from DHCP, and DHCP changes its mind: on a lease
+expiry, a switch port change, a reboot after a power cut. `scripts/setup_network.sh`
+installs three answers, and the reason for having all three is that they fail
+independently.
+
+| mechanism | address | needs | fails when |
+|---|---|---|---|
+| **mDNS** | `flyeye.local` | nothing — already on Pi OS | the network drops multicast between VLANs, which many enterprise networks do |
+| **Fixed second address** | `192.168.50.10` | one `nmcli` command | never, on a direct cable — it does not involve DHCP at all |
+| **DHCP reservation** | whatever IT assigns | a ticket, and the MAC address | the Pi moves to a different network |
+
+**mDNS** is the everyday path. Raspberry Pi OS runs `avahi-daemon`, so
+`<hostname>.local` resolves from macOS, Windows 10 and later, and Linux with
+avahi installed. The script also advertises the web UI as an `_http._tcp`
+service, so the rig appears in network browsers rather than only answering when
+asked by name.
+
+**The fixed second address is the one that always works**, and it is worth
+understanding why it is safe. NetworkManager applies manually configured
+addresses *in addition to* the DHCP lease as long as `ipv4.method` stays
+`auto`. So the Pi keeps its normal network access and also always answers on
+`192.168.50.10`. Give a laptop an address on that subnet, connect the two with
+a single Ethernet cable, and the rig is reachable with no DHCP server, no
+router and nobody's permission:
+
+```bash
+# on the laptop (Linux); Windows and macOS equivalents are in the script output
+sudo ip addr add 192.168.50.20/24 dev enp0s31f6
+curl http://192.168.50.10:8000/api/status
+```
+
+Setting `ipv4.method manual` instead would take the Pi *off* the network
+entirely — and doing that over SSH is how you end up needing a monitor and a
+keyboard. The script does not do it, and neither should you.
+
+**A DHCP reservation** is the correct answer on a managed network. The script
+prints the MAC addresses to send to IT.
+
+**Whatever happens, the rig can be asked where it is.** The startup banner
+lists every URL, and so does the status endpoint:
+
+```bash
+journalctl -u trilobite | grep -A6 'reachable at'
+curl -s http://flyeye.local:8000/api/status | jq -r '.network.urls[]'
+python -m trilobite.net          # on the Pi, without starting the app
+```
+
+#### The fourth option: one USB-C cable
+
+Raspberry Pi OS Trixie images dated 2025-10-20 and later ship `rpi-usb-gadget`,
+which turns the Pi 5's USB-C port into a USB Ethernet device. One cable from a
+laptop carries power and network, the Pi is always at **10.12.194.1**, and no
+network administrator is involved at any point.
+
+```bash
+sudo apt install rpi-usb-gadget
+sudo rpi-usb-gadget on
+sudo reboot
+```
+
+Two caveats, and the first is the reason this is not the headline
+recommendation for this rig:
+
+- **Power.** That port becomes the Pi's only power input, and a Pi 5 driving
+  two cameras and a USB SSD can draw more than a laptop USB-C port will supply.
+  The failure mode is a reboot in the middle of a capture. Use a powered hub,
+  or keep this for a Pi with nothing else attached.
+- **It stops being a USB host port.** Networking and power only, once enabled.
 
 ### Desktop (Windows, macOS, Linux)
 
@@ -132,7 +342,16 @@ git add -A; git commit -m "..."; git push          # desktop
 ```
 
 ```bash
-ssh flyeye@<address> 'cd ~/TrilobiteVision && git pull && sudo systemctl restart trilobite'
+ssh flyeye@flyeye.local 'cd ~/TrilobiteVision && git pull && sudo systemctl restart trilobite'
+```
+
+Use the name, not an address — see **Addressing** above. If mDNS is blocked on
+your network, put the fixed address in `~/.ssh/config` once and use that:
+
+```
+Host trilobite
+    HostName 192.168.50.10
+    User flyeye
 ```
 
 During active development leave the systemd service **disabled** and run the
@@ -495,6 +714,7 @@ src/trilobite/
     detect.py              corner detection — no threads, no camera, no files
     session.py             the hands-free capture loop and the recorder
   sinks/jpeg.py            JPEG encode: simplejpeg → cv2 → Pillow
+  net.py                   every address the rig is reachable at
   storage/writer.py        session directories, .npy + sidecar, live retargeting
   storage/devices.py       which filesystems can hold a session, right now
   web/server.py            FastAPI: streams, parameters, controls, capture
@@ -504,6 +724,7 @@ docs/                      the calibration model and the acquisition workflow
 scripts/
   probe_cameras.py         run this first on the Pi
   install_pi.sh            apt, config.txt, venv — idempotent
+  setup_network.sh         mDNS, a fixed second address, the MACs to give IT
   diagnose_cameras.sh      when libcamera reports zero cameras
   diagnose_host.sh         after a crash, or when a disk does not appear
   benchmark_detectors.py   what each detector costs, on your machine
@@ -654,6 +875,13 @@ multiple of 32, and 1456 is not one, so a raw buffer arrives with sixteen
 columns that are not image data. They are trimmed at capture now. Left in they
 make the frame 2.022× the preview horizontally against 2.000× vertically, and
 move the frame centre — which the whole grid hangs off — 8 px right.
+
+**The rig's IP address will change.** DHCP does that, and it cost an afternoon
+once. Reach it by name (`flyeye.local`) or at the fixed second address
+`setup_network.sh` adds, not by whatever number worked last week. When it has
+moved anyway, the rig will tell you where it went: `python -m trilobite.net` on
+the Pi, `journalctl -u trilobite | grep -A6 'reachable at'`, or
+`curl -s http://.../api/status | jq -r '.network.urls[]'`. See **Addressing**.
 
 **Put the data on an SSD.** See **Output storage**.
 

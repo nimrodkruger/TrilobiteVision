@@ -12,6 +12,84 @@ git checkout .              # everything back to HEAD
 
 ---
 
+## 2026-09-04 (h) — a from-SD-card Pi procedure, and a rig that stops moving
+
+The Pi's address changed and the rig went missing. Separately, the SD card is
+being reflashed, and the install documentation assumed a Pi that was already up
+and reachable — it started at `git clone`.
+
+**No code touched outside the two concerns below.** In particular nothing in
+the MLA, stride or calibration path, which is untested on the rig as of this
+entry.
+
+### Addressing
+
+`serving on http://0.0.0.0:8000` is the *bind* address. It is not somewhere a
+browser can go, and on a DHCP network the number you need is precisely the one
+that just changed underneath you.
+
+| change | file |
+|---|---|
+| `net.py`: enumerate every reachable address, name the mDNS one, build the URL list | `src/trilobite/net.py` (new) |
+| the startup banner lists every URL, annotated | `__main__.py` |
+| `/api/status` carries a `network` block, recomputed per call | `app.py` |
+| `python -m trilobite.net` prints the same without starting the app | `net.py` |
+| `setup_network.sh`: hostname, avahi, an `_http._tcp` advert, a fixed second address, and the MACs to send IT | `scripts/setup_network.sh` (new) |
+| `avahi-daemon` listed explicitly; `rpi-usb-gadget` documented as optional | `apt-packages.txt` |
+
+Three mechanisms, installed together because they fail independently: mDNS
+(free, blocked on some enterprise networks), a **fixed second address on eth0
+alongside DHCP** (the one that always works), and a DHCP reservation (needs a
+ticket).
+
+The second is worth recording precisely, because the obvious version of it is
+dangerous. NetworkManager applies manual addresses *in addition to* the DHCP
+lease **as long as `ipv4.method` stays `auto`**. Setting the method to `manual`
+instead takes the Pi off the network entirely — and over SSH that means a
+monitor and a keyboard. The script sets the address and then explicitly
+re-asserts `ipv4.method auto`.
+
+A fourth option is documented but not installed: Raspberry Pi OS Trixie images
+from 2025-10-20 carry `rpi-usb-gadget`, which makes the Pi 5's USB-C port a USB
+Ethernet device at a fixed 10.12.194.1. One cable, no network administrator.
+Not the recommendation *for this rig* because that port then becomes the only
+power input, and a Pi 5 with two cameras and an SSD can outdraw a laptop USB-C
+port — the failure mode being a reboot mid-capture.
+
+### The install procedure
+
+`README.md` §Install is rewritten as nine steps from a blank card: imager
+settings (including the ones that cannot be fixed later without a monitor),
+first boot, update, ribbons and overlays, proving the cameras from Python,
+first run, addressing, storage, and the service last. Each step ends with
+something to check, because the failures here are silent and finding out at the
+wrong step costs an hour.
+
+Verified against current sources rather than from memory: Raspberry Pi OS
+Trixie has been current since 2 October 2025 (Bookworm still supported), and
+Pi 5 USB gadget mode is real, is on the USB-C port, and needs an image dated
+2025-10-20 or later.
+
+### Verification
+
+```
+pytest -q                       → 157 passed  (8 new)
+ruff check src/ tests/ scripts/ → clean
+shellcheck scripts/*.sh         → clean for the new script
+bash -n on both shell scripts   → clean
+```
+
+The address tests run against a captured `ip -j -4 addr show` sample — a Pi
+with a DHCP lease, the fixed second address, wifi and a USB gadget link — so
+they assert the same thing on a Windows desktop with no `ip` command as on the
+rig. Live check: the banner and the `/api/status` network block both render.
+
+`setup_network.sh` has **not** been run on a Pi. It is written to be idempotent
+and non-destructive, and the DHCP-preserving `nmcli` behaviour is documented,
+but that is an argument, not a test.
+
+---
+
 ## 2026-09-03 (g) — raw stride padding, and grid parameters in sensor pixels
 
 Reported from MATLAB:

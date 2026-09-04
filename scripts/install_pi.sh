@@ -82,6 +82,12 @@ python -c "import trilobite; print('TrilobiteVision', trilobite.__version__)"
 echo
 if [[ "$CONFIG_CHANGED" == "1" ]]; then
   echo "config.txt changed -- REBOOT before the cameras will appear:  sudo reboot"
+  echo "Then:  source ${VENV}/bin/activate && python scripts/probe_cameras.py --grab"
 else
-  echo "Next:  source ${VENV}/bin/activate && python scripts/probe_cameras.py"
+  echo "Next:  source ${VENV}/bin/activate && python scripts/probe_cameras.py --grab"
 fi
+echo
+echo "Then give the rig a stable address, so a DHCP change stops being an event:"
+echo "  bash scripts/setup_network.sh"
+echo "It sets up mDNS, adds a fixed second address alongside DHCP, and prints"
+echo "the MAC addresses to send IT for a reservation. See the README."

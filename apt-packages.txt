@@ -47,6 +47,11 @@ git
 # RECOMMENDED -- diagnostics you will want the first time something is wrong
 # ---------------------------------------------------------------------------
 
+avahi-daemon              # mDNS: makes <hostname>.local resolve, so the rig
+                          # is reachable by name when DHCP moves it. Usually
+                          # present already on Raspberry Pi OS; listed because
+                          # the whole addressing story in the README depends
+                          # on it and "usually" is not a plan.
 v4l-utils                 # v4l2-ctl: what the kernel thinks the sensor is
 i2c-tools                 # i2cdetect: is the camera responding on the bus at
                           # all? Distinguishes a dead ribbon cable from a
@@ -102,5 +107,14 @@ pkg-config
 # python3-serial          # talking to a microcontroller for hardware triggers
 # gpiod python3-libgpiod  # GPIO from Python on Pi 5 (the old RPi.GPIO does
                           # not work on Pi 5 -- it uses a different GPIO chip)
+# rpi-usb-gadget          # Ethernet-over-USB on the Pi 5's USB-C port: one
+                          # cable from a laptop gives power AND a network at a
+                          # fixed 10.12.194.1, independent of any DHCP server.
+                          # Needs a Trixie image from 2025-10-20 or later, and
+                          # it turns that port into networking + power only --
+                          # it stops being a USB host port. Weigh the power
+                          # budget first: a Pi 5 with two cameras and an SSD
+                          # can draw more than a laptop USB-C port will give,
+                          # and the failure mode is a reboot mid-capture.
 # sqlite3                 # if session indexing outgrows JSON sidecars
 # nginx                   # only if you later put the web UI behind a proxy

@@ -15,6 +15,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
+from . import net
 from .bus import LatestFrame
 from .calibration import CalibrationSettings, DerivedOptics, readiness_report
 from .cameras.base import CameraSource
@@ -289,6 +290,9 @@ class Application:
         # hands on the board and cannot be expected to notice a dropped tab.
         self.session: Any = None
         self.session_settings: CalibrationSettings | None = None
+        # What the server was told to listen on. Set by __main__ before uvicorn
+        # starts; the default is what an embedded or test Application reports.
+        self.bound: tuple[str, int] = (cfg.server.host, cfg.server.port)
         self.restore = restore
         self.state = StateStore(Path(state_path), self._state_snapshot) if state_path else None
         self.restore_notes: list[str] = []
@@ -533,11 +537,17 @@ class Application:
             raise KeyError(f"no camera {cam_id!r}; have {sorted(self.cameras)}") from None
 
     def status(self) -> dict[str, Any]:
+        # `network` is here so a rig whose DHCP lease moved can be asked where
+        # it went -- curl http://<whatever-still-works>/api/status | jq .network
+        # -- rather than scanned for. Recomputed per call, cheaply, because an
+        # address obtained at start-up is exactly the one that goes stale.
+        host, port = self.bound
         return {
             "uptime_s": round(time.time() - self.started_at, 1),
             "session_dir": str(self.writer.session_dir),
             "storage": self.writer.state(),
             "health": host_health(),
+            "network": net.describe(port, host),
             "session_running": self.session_running,
             "state_file": str(self.state.path) if self.state else None,
             "cameras": [c.status() for c in self.cameras.values()],

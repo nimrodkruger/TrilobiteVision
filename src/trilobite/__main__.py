@@ -10,6 +10,7 @@ from pathlib import Path
 
 import uvicorn
 
+from . import net
 from .app import Application
 from .config import load_config
 from .state import default_state_path
@@ -68,7 +69,11 @@ def main(argv: list[str] | None = None) -> int:
     api = create_app(application)
     host = args.host or cfg.server.host
     port = args.port or cfg.server.port
-    log.info("serving on http://%s:%d", host, port)
+    # Every address, not the bind address. "serving on http://0.0.0.0:8000" is
+    # not somewhere a browser can go, and on a DHCP network the number you need
+    # is the one that has just changed underneath you. See trilobite/net.py.
+    application.bound = (host, port)
+    log.info("%s", net.banner(port, host))
     try:
         uvicorn.run(api, host=host, port=port, log_level="warning")
     finally:
