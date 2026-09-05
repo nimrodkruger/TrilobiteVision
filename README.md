@@ -417,6 +417,14 @@ The live preview with the MLA grid drawn on it, three sub-aperture tiles below
 it, and the controls that are properties of *this* sensor: rotation and
 mirroring, pitch, grid rotation, offsets, crop scale, and the presence map.
 
+Controls sit in a column **beside** the image here, not under it. Stacked is
+right when two cameras share the width — the image is what you look at and the
+controls scroll below it — and wrong for a single sensor's alignment, where the
+image wants the full height of the window *and* a dozen controls have to be
+reachable without scrolling the image out of sight. Below 900 px of window
+width the two columns would each be too narrow to be worth having, and the
+stacked layout comes back.
+
 The MLA parameters are what the sub-aperture crops use, so what you see aligned
 is what gets extracted. They are in **full-resolution sensor pixels** — 1456 ×
 1088 here, not the 728 × 544 preview you align against. The overlay scales them

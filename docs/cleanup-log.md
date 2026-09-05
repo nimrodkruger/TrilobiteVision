@@ -50,6 +50,17 @@ looking at them.
 Per-camera tabs are generated from `/api/cameras`, so a third camera adds a
 third tab with no edit to the page.
 
+**On a camera tab the controls sit beside the image, not under it.** Stacked is
+right when two cameras share the width; on a single sensor's alignment tab it
+means the image is either large and the controls are off-screen, or the
+controls are visible and the image is a strip. Side by side gives both — the
+image takes the height of the window, the controls take a `clamp(300px, 26vw,
+400px)` column and scroll in it — and the 1100 px single-column cap is lifted,
+because that cap exists so a lone card is not stretched across a 4K monitor and
+a card with a control column is not a lone card. Under 900 px of window the
+stacked layout returns. Measured at 1500, 1920 and 820 px wide: the whole
+control set fits without scrolling at the first two, and the third falls back.
+
 **Calibration is parked, not deleted.** It was asked for as a placeholder, and
 the tab is labelled as the unsupported path — but it is several hundred lines
 of working, tested UI over machinery (readiness checks, the coverage model, the

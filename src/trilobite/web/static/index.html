@@ -177,7 +177,42 @@
      monitor. The default `auto-fit` rule is right for two cameras and wrong
      for one. */
   main.single { grid-template-columns:minmax(0, 1100px); justify-content:center; }
-  main.single .view { height:min(62vh, 720px); }
+  main.single:not(.aside) .view { height:min(62vh, 720px); }
+
+  /* --- one camera, controls BESIDE the image -----------------------------
+     The stacked layout is right when two cameras share the width: the image
+     is the thing you look at and the controls scroll under it. It is wrong
+     for a single sensor's alignment tab, where the image wants to be as large
+     as the screen allows AND a dozen controls have to be reachable without
+     scrolling the image off the top. Side by side gives both: the image takes
+     the height of the window, the controls take a fixed column and scroll in
+     it.
+
+     Full width here, not the 1100 px cap: the cap exists so a lone card is not
+     stretched across a 4K monitor, and a card with a control column on the
+     right is not a lone card. */
+  main.single.aside { grid-template-columns:minmax(0, 1fr); }
+  .cam.aside { grid-template-rows:minmax(0, 1fr);
+               grid-template-columns:minmax(0, 1fr) clamp(300px, 26vw, 400px); }
+  .cam.aside > .viewport { border-bottom:0; border-right:1px solid var(--line);
+                           display:grid; grid-template-rows:auto minmax(0,1fr) auto auto;
+                           min-height:0; }
+  /* The image fills whatever the header, tile strip and button row leave.
+     `object-fit:contain` keeps the aspect ratio, so a portrait sensor (a
+     quarter turn) letterboxes sideways instead of stretching. */
+  .cam.aside .view { height:100%; min-height:0; }
+  /* The tile strip is three squares. Spread across a 1000 px column each
+     becomes a small square centred in a wide black box, which reads as three
+     empty panels rather than three sub-apertures. Cap the cells and centre. */
+  .cam.aside .subaps { grid-template-columns:repeat(3, minmax(0, 200px));
+                       justify-content:center; }
+  /* Below this the two columns would each be too narrow to be worth having,
+     so the stacked layout comes back. A laptop in portrait, or a phone. */
+  @media (max-width: 900px) {
+    .cam.aside { grid-template-columns:minmax(0, 1fr); grid-template-rows:auto 1fr; }
+    .cam.aside > .viewport { border-right:0; border-bottom:1px solid var(--line); }
+    .cam.aside .view { height:40vh; }
+  }
 
   /* --- storage devices ---------------------------------------------------
      Storage lives on the System tab now, so nothing about it is on screen
@@ -1080,7 +1115,10 @@ async function buildCameraTab(camId) {
   const cam = cams.find(c => c.cam_id === camId);
   const root = $("#cams");
   root.innerHTML = "";
-  root.className = "single";
+  // `aside` puts the controls in a column beside the image rather than under
+  // it: one sensor's alignment needs the largest image the screen will give
+  // AND a dozen controls reachable without scrolling the image out of sight.
+  root.className = "single aside";
   if (!cam) {
     root.innerHTML = `<section class="cam"><div class="viewport"><h2>
       <span class="ttl">${camId}</span></h2></div>
@@ -1089,6 +1127,7 @@ async function buildCameraTab(camId) {
   }
 
   const { card, controls } = cameraCard(cam, { subaps: true });
+  card.classList.add("aside");
   root.appendChild(card);
   wireSaveButtons(root);
 
