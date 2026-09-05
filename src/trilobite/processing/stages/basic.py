@@ -12,7 +12,7 @@ the browser as slider bounds automatically via the JSON schema.
 from __future__ import annotations
 
 import numpy as np
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from ...types import Frame
 from ..base import Stage, StageParams
@@ -39,8 +39,17 @@ class Levels(Stage):
     accepts = ("mono8", "mono16", "rgb8")
 
     class Params(StageParams):
-        gain: float = Field(1.0, ge=0.0, le=8.0, description="Multiplicative gain")
-        offset: float = Field(0.0, ge=-128.0, le=128.0, description="Additive offset, DN")
+        # The floor on gain is 0.05, not 0. A gain of exactly zero multiplies
+        # the frame to black, and a black preview is what a dead camera, a
+        # closed shutter and a crashed capture thread all look like -- an hour
+        # of the wrong diagnosis available from one slider at its left stop.
+        # 0.05 is dark and unmistakably alive.
+        gain: float = Field(1.0, ge=0.05, le=8.0, description="Multiplicative gain")
+        # DN, and the preview can be mono16, so the range is the 16-bit one.
+        # +-128 was an 8-bit assumption and made the control useless on a
+        # 10-bit frame promoted to 16.
+        offset: float = Field(
+            0.0, ge=-4096.0, le=4096.0, description="Additive offset, DN")
         gamma: float = Field(1.0, ge=0.1, le=4.0, description="Display gamma")
 
     def apply(self, frame: Frame) -> Frame:
@@ -70,6 +79,24 @@ class Crop(Stage):
         y0: float = Field(0.0, ge=0.0, le=1.0)
         x1: float = Field(1.0, ge=0.0, le=1.0)
         y1: float = Field(1.0, ge=0.0, le=1.0)
+
+        @model_validator(mode="after")
+        def _non_empty(self) -> Crop.Params:
+            """An inverted or empty rectangle is refused, not silently ignored.
+
+            `apply` already declines to crop when the result would be under a
+            pixel, because a zero-width array breaks every stage after it. But
+            declining leaves the control looking broken: the numbers say one
+            thing, the image shows another, and nothing anywhere says why.
+            Refusing the value at the point of entry puts the reason in front
+            of whoever typed it, which is a 422 in the UI.
+            """
+            if self.x1 <= self.x0 or self.y1 <= self.y0:
+                raise ValueError(
+                    f"empty crop: x {self.x0}..{self.x1}, y {self.y0}..{self.y1}. "
+                    f"The second corner has to be past the first in both axes."
+                )
+            return self
 
     def apply(self, frame: Frame) -> Frame:
         p: Crop.Params = self.params  # type: ignore[assignment]
@@ -122,8 +149,15 @@ class Stats(Stage):
     """
 
     class Params(StageParams):
+        # Bounded above as well as below, so the UI can draw a slider at all:
+        # an unbounded number gets a bare box and no sense of scale. 65535 is
+        # the widest frame this pipeline carries; the useful settings are just
+        # under the peak for the depth in use (250 for 8-bit, ~1000 for 10-bit
+        # promoted to 16).
         saturation_level: float = Field(
-            250.0, ge=0.0, description="DN at or above which a pixel counts as saturated"
+            250.0, ge=1.0, le=65535.0,
+            description="DN at or above which a pixel counts as saturated",
+            json_schema_extra={"widget": "box"},
         )
 
     def apply(self, frame: Frame) -> Frame:

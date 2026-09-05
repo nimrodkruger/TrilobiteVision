@@ -12,6 +12,152 @@ git checkout .              # everything back to HEAD
 
 ---
 
+## 2026-09-05 (n) — six tabs, and an audit of what the sliders may ask for
+
+### Why collapsing the storage panel did not help
+
+> storage minimisation didn't really help because the dashboards didn't expand
+> to full width anyway.
+
+Correct, and the fix was in the wrong place. `main` is
+`repeat(auto-fit, minmax(430px, 1fr))`; removing a card from a three-card row
+leaves two cards that were already at `1fr` and does not give them the freed
+column. Shrinking the third card just made the row shorter.
+
+So the dashboard is now **six tabs**, and the split is by job rather than by
+what happened to be built when:
+
+| tab | for | streams |
+|---|---|---|
+| System | storage, host health, addresses, camera rates and formats, paths | 0 |
+| one per camera | that sensor's orientation and MLA alignment | 1 |
+| Imaging | both sensors: exposure, gain, display stages, save, quick-record | 2 |
+| Video | placeholder | 0 |
+| Calibration | the existing hands-free loop | 0 |
+
+Orientation and the MLA stages appear only on a camera's own tab; exposure and
+gain appear on both, because those are what you adjust while looking at
+whatever you are looking at. `SETUP_STAGES` is the one list that decides, and
+`buildPipelinePanels` takes `only`/`skip` against it.
+
+The tabs also pay for themselves in the connection budget, which is the
+constraint the whole streaming design sits under: only the tab on screen
+streams. One camera tab is one MJPEG stream plus three polled tiles; Imaging is
+two streams and no tiles; System and the placeholders are none. Previously
+every tab held two streams and six tile polls whether or not anything was
+looking at them.
+
+Per-camera tabs are generated from `/api/cameras`, so a third camera adds a
+third tab with no edit to the page.
+
+**Calibration is parked, not deleted.** It was asked for as a placeholder, and
+the tab is labelled as the unsupported path — but it is several hundred lines
+of working, tested UI over machinery (readiness checks, the coverage model, the
+pose manifest) that any calibration needs whether the detection runs on the rig
+or on the desk. Deleting that on "not convinced" would be throwing away the
+part that is not in doubt. Say so and it goes.
+
+**What else went on System**, since it was asked: the host's temperature, load,
+memory and sticky under-voltage flag; every URL the dashboard answers on, plus
+the interfaces and the mDNS name (the answer to "the DHCP lease moved, where is
+it now"); per camera the backend, the frame sizes, all three frame rates with
+the count of frames the pipeline cap skipped, the error count and any controls
+libcamera dropped; and the session and settings-file paths. All of it existed
+in `/api/status` already and none of it was on screen anywhere.
+
+### The range audit
+
+> There is adjustments to be made for the allowed "scale" of some of the bars.
+> They except sometimes values that are not allowed and break the image.
+
+Seven, and the first is much worse than the rest.
+
+**`pitch_px` could hang the server.** `whole_indices` enumerates the lattice
+with `_search_radius` bounds and calls `is_whole` — trigonometry — on every
+candidate. The radius used the FULL frame diagonal with no offset term, so the
+count went as (2·diag/pitch)², and `MLAGridOverlay.apply` reaches it through
+`named_indices` **on every frame**. At the default pitch of 20 px that was
+34,000 tests per frame, 800,000 a second across two cameras at 12 Hz — a real
+share of the CPU the web thread was losing to. At `pitch_px: 1.5`, which the
+old `gt=1.0` bound permitted, it is 1.4 million tests inside a request handler:
+not slow, hung, with the browser and the log both showing nothing.
+
+Three changes, in order of how much they buy:
+
+1. **Memoised.** `MLAGeometry` is a frozen dataclass and hashes by value, so an
+   `lru_cache` on the enumeration turns a per-frame quadratic scan into a
+   per-edit one even though `geometry_for` builds a fresh instance every call.
+   Measured at pitch 20 on a 1456×1088 frame: 15 ms → 7 µs.
+2. **A tight radius.** Half-diagonal plus the offset magnitude, which is the
+   exact bound on |i|·pitch, rather than the full diagonal. Four times fewer
+   candidates. Tested against a deliberately absurd reference bound across 48
+   pitch/rotation/offset combinations — the sets must be *identical*, because a
+   radius that is too small silently drops the outermost ring, which is exactly
+   the lenslets the corner sub-apertures use.
+3. **A floor and a cap.** `pitch_px` ≥ 10, and `whole_indices` refuses above
+   40,000 candidates and returns an empty list, which every caller already
+   handles: the overlay draws no highlights, the tile endpoints answer 204, and
+   readiness reports zero whole tiles with the pitch in the message.
+
+**The offsets are bounded by the pitch, and folded into it.** An offset says
+which physical lenslet is index (0,0), so moving it a whole lattice vector
+renames the lenslets and draws the identical grid: offsets a pitch apart are
+one setting written two ways, and every distinct alignment lives within half a
+pitch of centre. The slider range now follows the current pitch, and a value
+outside is *folded* rather than clamped — the number jumps to the other end
+while the grid slides on unchanged. A clamp would stop the grid while the
+number kept moving, and the control would look dead at one end.
+
+The reduction is in the **lattice basis**, not per-axis: `u` and `v` rotate
+with the grid, so subtracting whole multiples of them is exact at any rotation
+where folding x and y separately modulo the pitch is only right at zero. There
+is a test at four angles; folding per-axis fails three of them.
+
+The remaining five:
+
+| parameter | was | now | the symptom |
+|---|---|---|---|
+| `crop_scale` | 0.1 – 4.0 | 0.25 – 2.0 | above 2 a "sub-aperture" spans four lenslets and is not one |
+| `levels.gain` | **0.0** – 8.0 | 0.05 – 8.0 | gain 0 is a black frame, which is also what a dead camera, a closed shutter and a crashed capture thread look like |
+| `levels.offset` | ±128 DN | ±4096 DN | an 8-bit assumption; the preview carries mono16 from a 10-bit sensor |
+| `stats.saturation_level` | ≥ 0, no maximum | 1 – 65535, boxed | no upper bound meant a 0–1 slider with the value pinned off the end |
+| `crop.x0..y1` | any 0–1 | x1 > x0, y1 > y0 | an inverted rectangle was silently ignored by `apply`, so the numbers said one thing and the image showed another |
+
+There is also a test asserting that **every numeric stage parameter has both
+bounds or explicitly asks for a box**, so the next one added cannot quietly get
+a 0–1 slider.
+
+### Two checks the test suite did not have
+
+The `<span id="live-actions"` bug from entry (m) — a missing `>` that made the
+browser read the capture buttons as attributes of the span — was invisible to
+every test, because the file is HTML and the suite is Python. `tests/test_ui_page.py`
+now parses the page, asserts every tag closes, and asserts the twelve ids the
+boot script resolves are real elements in the expected nesting. Re-introducing
+the missing bracket fails three of them.
+
+The page was also driven headlessly through Playwright while building this:
+tab list and order, stream counts per tab, which stage panels appear where, and
+the offset slider re-ranging from ±50 to ±20 when the pitch goes from 100 to 40.
+
+### Verification
+
+```
+pytest -q                  → 320 passed  (was 236)
+ruff check .               → clean
+headless Chromium          → 6 tabs, streams 2/1/0/0/0, panels split as intended
+```
+
+Mutations tested: the 409 orientation lock removed, `mark_dirty` dropped, the
+grid reset removed, the pitch zeroed, the reference not transposed, the
+`live-actions` bracket removed, per-axis offset folding. All caught. One was
+not: shrinking `_search_radius`'s `+2` margin changes nothing, because the
+bound is already exact for the centre and `is_whole` is stricter — the margin
+is deliberate slack and the code now says so, rather than leaving a reader to
+assume a test covers it.
+
+---
+
 ## 2026-09-05 (m) — orientation becomes a setup step, and three UI fixes
 
 Three reports, one of which turned out to be about caching rather than code.

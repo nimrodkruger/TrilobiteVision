@@ -43,9 +43,10 @@ overlay and the crops cannot disagree.
 from __future__ import annotations
 
 import logging
+import math
 
 import numpy as np
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from ...optics.mla import UI_SUBAPERTURES, MLAGeometry
 from ...optics.orientation import Orientation
@@ -85,19 +86,37 @@ class MLAParams(StageParams):
     """
 
     enabled: bool = False
-    # Ranges are chosen so the slider has usable resolution, not so they are
-    # theoretically permissive. A pitch above ~400 px leaves three lenslets on
-    # a 1456 px sensor, and the origin never needs to move more than a pitch or
-    # two from centre -- the box takes exact values within these bounds anyway.
+    # Ranges are chosen so the slider has usable resolution and so that every
+    # value inside them produces a grid that can actually be drawn and cropped
+    # -- not so that they are theoretically permissive.
+    #
+    # The floor on pitch is a tractability bound, not an optical one. Lattice
+    # enumeration is quadratic in 1/pitch with trigonometry per candidate, so a
+    # pitch small enough to be a typo is not slow, it is a hang: 1.5 px on this
+    # sensor is 1.4 million positions to test, inside a request handler. At
+    # 10 px it is 33,000, which the cache in optics/mla.py pays for once. Below
+    # ~10 px a micro-image also cannot hold a resolvable checkerboard, so
+    # nothing is being forbidden that the rig could have used.
     pitch_px: float = Field(
-        20.0, gt=1.0, le=800.0, description="Lenslet pitch, SENSOR pixels")
+        20.0, ge=10.0, le=800.0, description="Lenslet pitch, SENSOR pixels")
     rotation_deg: float = Field(0.0, ge=-45.0, le=45.0, description="Grid rotation, degrees")
+    # Bounded by the pitch, and folded into it -- see the validator below. The
+    # static bound is what the largest allowed pitch can produce: folding puts
+    # the offset inside half a cell, so |offset| <= pitch/sqrt(2) = 566 px at
+    # pitch 800. The UI narrows the slider to the CURRENT pitch, which is the
+    # bound that means anything; this one only has to be wide enough not to
+    # reject a value the fold would have accepted.
     offset_x: float = Field(
-        0.0, ge=-1000.0, le=1000.0, description="Grid origin x from centre, SENSOR px")
+        0.0, ge=-600.0, le=600.0, description="Grid origin x from centre, SENSOR px")
     offset_y: float = Field(
-        0.0, ge=-1000.0, le=1000.0, description="Grid origin y from centre, SENSOR px")
+        0.0, ge=-600.0, le=600.0, description="Grid origin y from centre, SENSOR px")
+    # Above 2 a "sub-aperture" spans four or more lenslets and is not a
+    # sub-aperture. Below ~0.3 it is a handful of pixels. The useful range is
+    # a little under 1 (trimming vignetted edges) to a little over (seeing the
+    # boundary while aligning); the readiness check adds the rotation-dependent
+    # ceiling, which is tighter still.
     crop_scale: float = Field(
-        1.0, gt=0.1, le=4.0, description="Sub-aperture crop side, as a multiple of pitch"
+        1.0, ge=0.25, le=2.0, description="Sub-aperture crop side, as a multiple of pitch"
     )
     derotate_views: bool = Field(
         False,
@@ -140,6 +159,49 @@ class MLAParams(StageParams):
         False, description="Vertical mirror these parameters were aligned under",
         json_schema_extra={"widget": "hidden"},
     )
+
+    @model_validator(mode="after")
+    def _fold_offset_into_one_cell(self) -> MLAParams:
+        """Reduce the origin offset modulo the lattice.
+
+        The offset says which physical lenslet is index (0, 0). Moving it by a
+        whole lattice vector gives the SAME grid with the indices renumbered,
+        so offsets differing by a multiple of the pitch are not two settings --
+        they are one setting written two ways. Every distinct alignment is
+        reachable within half a pitch of centre.
+
+        Folding rather than clamping matters, and the difference shows the
+        moment you drag the slider. A clamp at +pitch/2 stops the grid moving
+        while the number keeps changing, so the control appears dead at one
+        end. Folding sends the number to -pitch/2 while the grid slides on
+        exactly as before -- which is what the geometry actually does.
+
+        The reduction is in the LATTICE basis, not per-axis: u and v are
+        rotated with the grid, so subtracting `round(offset . u_hat / pitch)`
+        lots of u is exact at any rotation, where folding x and y separately
+        modulo the pitch is only correct at zero rotation.
+
+        Written through `__dict__` because this runs under
+        `validate_assignment=True`, and assigning to the field here would
+        re-enter validation on this same model.
+        """
+        pitch = float(self.pitch_px)
+        if pitch <= 0:
+            return self
+        t = math.radians(float(self.rotation_deg))
+        ct, st = math.cos(t), math.sin(t)
+        ox, oy = float(self.offset_x), float(self.offset_y)
+        # Components along the lattice axes, in units of the pitch.
+        a = (ox * ct + oy * st) / pitch
+        b = (-ox * st + oy * ct) / pitch
+        na, nb = round(a), round(b)
+        if na == 0 and nb == 0:
+            return self
+        a -= na
+        b -= nb
+        self.__dict__["offset_x"] = round(pitch * (a * ct - b * st), 9)
+        self.__dict__["offset_y"] = round(pitch * (a * st + b * ct), 9)
+        return self
 
 
 @register("mla_grid_overlay")

@@ -172,22 +172,19 @@
   .frozen { font-size:11px; color:var(--muted); font-family:ui-monospace,monospace;
             line-height:1.6; }
 
+  /* A tab showing ONE thing -- one camera, or the System read-outs -- gets one
+     column at a readable width, rather than a lone card stretched across a 4K
+     monitor. The default `auto-fit` rule is right for two cameras and wrong
+     for one. */
+  main.single { grid-template-columns:minmax(0, 1100px); justify-content:center; }
+  main.single .view { height:min(62vh, 720px); }
+
   /* --- storage devices ---------------------------------------------------
-     Collapsed by default, and collapsed it is a full-width strip rather than a
-     column: the device list is something you touch once, when a disk goes in,
-     and for the rest of the session it costs a whole camera-sized column of a
-     two-column layout. The strip keeps the one fact that matters visible --
-     where output is going, and how much room is left. */
-  .cam.strip { grid-column:1 / -1; grid-template-rows:auto; }
-  .cam.strip > .controls { display:none; }
-  .cam.strip .viewport { border-bottom:0; }
-  #storage-card .viewport h2 { cursor:pointer; }
-  #storage-card .chev { color:var(--muted); font-size:10px; width:10px; }
-  /* A removable disk is present that is not the one being written to. This is
-     the moment the panel exists for, so the collapsed strip says so instead of
-     waiting to be opened. */
-  #storage-card.attention .viewport h2 .ttl { color:var(--accent); }
-  #storage-card.attention .chev { color:var(--accent); }
+     Storage lives on the System tab now, so nothing about it is on screen
+     while imaging. That is the point, and also a way to miss the one moment it
+     matters -- a disk being plugged in -- so the TAB carries that signal. */
+  .modes button.attention { color:var(--accent); border-color:var(--accent); }
+  .modes button.alarm { color:var(--err); border-color:var(--err); }
 
   .dev { border:1px solid var(--line); border-radius:7px; background:var(--bg);
          padding:7px 9px; margin:6px 0; display:grid; gap:5px; }
@@ -208,8 +205,15 @@
   .dev .foot .cap { font-size:10px; color:var(--muted); font-variant-numeric:tabular-nums;
                     margin-right:auto; }
   .dev button { padding:3px 9px; font-size:11px; }
+  /* pre-wrap, because these are line-oriented read-outs assembled by joining
+     with "\n". Without it the browser collapses every newline to a space and
+     an aligned table of facts becomes one run-on sentence -- legible enough to
+     ship by accident, useless to read. */
   .notes { font-family:ui-monospace,monospace; font-size:10px; color:var(--muted);
-           line-height:1.6; max-height:80px; overflow-y:auto; }
+           line-height:1.6; max-height:80px; overflow-y:auto; white-space:pre-wrap; }
+  /* The System tab's read-outs are the content of their panel, not a footnote
+     to it, so they are not scrolled inside 80 px. */
+  .notes.tall { max-height:none; overflow:visible; }
 
   /* --- the capture banner -------------------------------------------------
      Four words, full width, colour-coded. The operator is holding a board with
@@ -290,10 +294,12 @@
         style="color:var(--warn);font-weight:650;cursor:pointer"
         title="Click to reload">⟳ page is out of date — reload</span>
   <span class="spacer"></span>
-  <span class="modes">
-    <button id="mode-live" class="on">Imaging</button>
-    <button id="mode-cal">Calibration</button>
-  </span>
+  <!-- Filled at start-up from /api/cameras: one tab per camera between System
+       and Imaging, so a three-camera rig needs no edit here. -->
+  <span class="modes" id="modes"></span>
+  <!-- Two-camera capture actions. Shown on the Imaging tab only: the space
+       bar fires a stereo set, and a screen showing one sensor is the wrong
+       place to offer that. -->
   <span id="live-actions">
     <button id="all-raw">Save raw — both</button>
     <button class="ghost" id="all-view">Save view — both</button>
@@ -386,6 +392,7 @@ function fmt(v, isInt) {
 function makeRow(key, spec, value, commit) {
   const row = document.createElement("div");
   row.className = "row";
+  row.dataset.key = key;
 
   const label = document.createElement("label");
   label.textContent = spec.title || key;
@@ -494,6 +501,14 @@ function makeRow(key, spec, value, commit) {
   }
   row.appendChild(box);
   row.sync = setBoth;
+  /* Re-range in place, for a bound that depends on another parameter -- the
+     MLA offsets, whose useful travel is half a pitch and so changes whenever
+     the pitch does. Rebuilding the row instead would lose focus mid-edit and
+     would be a second construction path to keep in step with this one. */
+  row.rerange = (lo, hi) => {
+    slider.min = box.min = lo;
+    slider.max = box.max = hi;
+  };
   return row;
 }
 
@@ -519,7 +534,13 @@ function makePanel(title, type, bodyEl, collapsed = false) {
 
 /* -------------------------------------------------------------------------- */
 
-async function buildSensorPanel(camId) {
+/* The driver controls, and optionally the orientation rows beneath them.
+   `withOrientation` is false on the Imaging tab: rotation and mirroring are a
+   per-sensor setup decision made on that sensor's own tab, and having them
+   also sit on the two-camera capture screen is how a frame gets turned in the
+   middle of a session. Exposure and gain are on both, because they are the
+   thing you adjust while looking at whatever you are looking at. */
+async function buildSensorPanel(camId, { withOrientation = true } = {}) {
   const body = document.createElement("div");
   let data;
   try { data = await jget(`/api/controls/${camId}`); } catch { data = { spec: {} }; }
@@ -531,7 +552,8 @@ async function buildSensorPanel(camId) {
   const names = WANTED.filter(n => n in spec);
   if (!names.length) {
     body.innerHTML = `<div class="empty">This backend advertises no sensor controls.</div>`;
-    return makePanel("Sensor", "driver", body, true);
+    if (withOrientation) body.appendChild(await buildOrientationRows(camId));
+    return makePanel("Sensor", "driver", body, false);
   }
   const commit = async (key, v) => {
     try {
@@ -553,7 +575,7 @@ async function buildSensorPanel(camId) {
     SENSOR_ROWS[camId][n] = row;
     body.appendChild(row);
   }
-  body.appendChild(await buildOrientationRows(camId));
+  if (withOrientation) body.appendChild(await buildOrientationRows(camId));
   return makePanel("Sensor", "driver", body, false);
 }
 
@@ -661,9 +683,20 @@ async function sendOrientation(camId, body, said) {
   await renderOrientation(camId);
 }
 
-async function buildPipelinePanels(camId, host) {
+/* Stages that belong to one sensor's SETUP rather than to capture.
+
+   The split is what the tabs are for. Aligning a lenslet grid is a job you do
+   once per camera, staring at one image; capturing a stereo set is a job you
+   do with both. Putting the grid controls on the capture screen made every
+   control on it wrong half the time -- and made it possible to nudge a pitch
+   mid-session without noticing which camera you were nudging. */
+const SETUP_STAGES = ["mla_grid_overlay", "checkerboard_presence"];
+
+async function buildPipelinePanels(camId, host, { only = null, skip = [] } = {}) {
   const stages = await jget(`/api/pipeline/${camId}`);
   for (const st of stages) {
+    if (only && !only.includes(st.type)) continue;
+    if (skip.includes(st.type)) continue;
     const body = document.createElement("div");
     const props = (st.schema && st.schema.properties) || {};
     const commit = async (key, v) => {
@@ -676,6 +709,10 @@ async function buildPipelinePanels(camId, host) {
           // The lock lives on the server; this is what makes the page agree
           // with it without a reload.
           if (key === "enabled") refreshOrientation(camId);
+          // The offsets are bounded by the pitch, so changing the pitch
+          // changes their range. The server also folds them into the new
+          // cell, so the value in the box may have moved as well.
+          if (key === "pitch_px" || key === "rotation_deg") retuneOffsetRows(panel, got);
         }
         return got[key];
       } catch (e) {
@@ -685,16 +722,51 @@ async function buildPipelinePanels(camId, host) {
     };
     for (const [key, spec] of Object.entries(props)) {
       // widget:"hidden" is for parameters that are units rather than knobs --
-      // the MLA reference resolution, which records which frame size pitch and
-      // the offsets were measured against. Editable by hand it would only ever
-      // be wrong.
+      // the MLA reference resolution and orientation, which record which frame
+      // the pitch and offsets were measured in. Editable by hand they would
+      // only ever be wrong.
       if (spec.widget === "hidden") continue;
-      body.appendChild(makeRow(key, spec, st.values[key], commit));
+      body.appendChild(makeRow(key, boundsFor(st, key, spec, st.values), st.values[key], commit));
     }
     const panel = makePanel(st.name, st.type, body, false);
     panel.dataset.stage = st.name;
     panel.dataset.cam = camId;
     host.appendChild(panel);
+  }
+}
+
+/* Bounds that depend on another parameter's current value.
+
+   The JSON schema can only carry constants, so a bound like "no further than
+   one lenslet from centre" cannot live there -- it has to be computed against
+   the pitch in force right now. The schema still carries the absolute limit,
+   which is what the server enforces; this narrows the SLIDER to the range
+   that means something, so its whole travel is useful instead of ninety
+   percent of it pushing the grid off the sensor. */
+function boundsFor(st, key, spec, values) {
+  if (st.type === "mla_grid_overlay" && (key === "offset_x" || key === "offset_y")) {
+    // Half a pitch each way covers every distinct alignment: the offset says
+    // which physical lenslet is index (0,0), and moving it a whole pitch names
+    // the next one along and draws the identical grid. The server folds
+    // anything outside back into this range rather than clamping it, so the
+    // slider hitting its stop is the only place the travel actually ends.
+    const half = Math.max(1, Number(values.pitch_px) || 0) / 2;
+    return { ...spec, minimum: -half, maximum: half };
+  }
+  return spec;
+}
+
+/* After a pitch or rotation change: re-range the two offset sliders, and take
+   whatever the server folded them to. Both have to happen, and the second is
+   the one that is easy to forget -- a stale box writes its stale value back on
+   the next nudge. */
+function retuneOffsetRows(panel, values) {
+  for (const key of ["offset_x", "offset_y"]) {
+    const row = panel.querySelector(`.row[data-key="${key}"]`);
+    if (!row) continue;
+    const half = Math.max(1, Number(values.pitch_px) || 0) / 2;
+    if (row.rerange) row.rerange(-half, half);
+    if (row.sync && values[key] !== undefined) row.sync(values[key]);
   }
 }
 
@@ -865,165 +937,116 @@ function renderStorage(s) {
   renderStorageStrip(s);
 }
 
-/* What the collapsed strip says. It has one job: make it unnecessary to open
-   the panel unless something needs doing. So it carries where output is going
-   and how much room is left, and it turns accent-coloured when a removable
-   disk is present that is not the one being written to -- the one moment the
-   panel exists for. */
+/* Storage now lives on the System tab, so the imaging screen has no sight of
+   it -- which is the point, and also a way to miss the one moment it matters.
+   So the TAB carries the signal: it goes accent-coloured when a removable disk
+   is attached that is not the one being written to, and red when the output
+   device has gone. Nothing else about storage is worth a pixel of the imaging
+   view, and this is worth a tab label. */
 function renderStorageStrip(s) {
-  const card = $("#storage-card");
-  const stat = $("#storage-stat");
-  if (!card || !stat || !s) return;
+  const tab = $("#mode-system");
+  if (!tab || !s) return;
   const a = s.active;
   const waiting = (s.devices || []).filter(d => d.removable && !d.active);
   const unmounted = waiting.filter(d => !d.mounted).length;
+  const missing = a.present === false;
 
-  card.classList.toggle("attention", waiting.length > 0 || a.present === false);
-  const bits = [];
-  if (a.present === false) bits.push("⚠ OUTPUT DEVICE MISSING");
-  bits.push(`${a.removable ? "external" : "internal"} · ${gb(a.free_bytes)} free`);
-  if (waiting.length) {
-    bits.push(unmounted
-      ? `${waiting.length} disk${waiting.length > 1 ? "s" : ""} attached, `
-        + `${unmounted} not mounted — open to mount`
-      : `${waiting.length} other disk${waiting.length > 1 ? "s" : ""} — open to switch`);
-  }
-  stat.textContent = bits.join("   ");
-  stat.style.color = a.present === false ? "var(--err)"
-                   : waiting.length ? "var(--accent)" : "";
-  const sub = card.querySelector(".viewport .sub");
-  if (sub) sub.textContent = a.session_dir || "output device";
+  tab.classList.toggle("attention", waiting.length > 0);
+  tab.classList.toggle("alarm", missing);
+  tab.title = missing
+    ? "The output device is gone. Writes are falling back to the internal disk."
+    : waiting.length
+      ? `${waiting.length} removable disk${waiting.length > 1 ? "s" : ""} attached`
+        + (unmounted ? `, ${unmounted} not mounted` : "")
+        + " — System tab to switch to it"
+      : `Writing to ${a.session_dir} · ${gb(a.free_bytes)} free`;
 }
 
 async function refreshStorage() {
   try { renderStorage(await jget("/api/storage")); } catch { /* transient */ }
 }
 
-/* Collapsed unless the operator says otherwise, and the choice is remembered
-   per browser. localStorage and not the server: which panels one person has
-   open on one screen is not rig state, and syncing it between two browsers
-   looking at the same Pi would be worse than not remembering at all. Wrapped
-   because a private window can make the accessor itself throw. */
-const STORAGE_OPEN_KEY = "tv.storage.open";
-function storageOpen() {
-  try { return localStorage.getItem(STORAGE_OPEN_KEY) === "1"; } catch { return false; }
-}
-function setStorageOpen(open) {
-  try { localStorage.setItem(STORAGE_OPEN_KEY, open ? "1" : "0"); } catch { /* fine */ }
+/* The buttons inside the storage panel, as one delegated handler. Separated
+   from the panel's construction because the panel is now built by the System
+   tab and this is the only part of it that is behaviour. */
+async function storageClick(ev) {
+  const use = ev.target.closest("[data-use]");
+  const rel = ev.target.closest("#storage-release");
+  const mnt = ev.target.closest("[data-mount]");
+  const umt = ev.target.closest("[data-unmount]");
+  if (!use && !rel && !mnt && !umt) return;
+  ev.target.disabled = true;
+  const was = ev.target.textContent;
+  if (mnt || umt) ev.target.textContent = "…";
+  try {
+    let s;
+    if (use) s = await jsend("/api/storage/target", { path: use.dataset.use });
+    else if (rel) s = await jsend("/api/storage/release");
+    else if (mnt) s = await jsend("/api/storage/mount", { device: mnt.dataset.mount });
+    else s = await jsend("/api/storage/unmount",
+                         { device: umt.dataset.unmount, mount: umt.dataset.devmount });
+    renderStorage(s);
+    log(use || rel ? `output → ${s.active.session_dir}`
+                   : `${mnt ? "mounted" : "unmounted"} ok`, "ok");
+  } catch (e) {
+    // Mount failures explain themselves precisely — "unknown filesystem type
+    // 'exfat'", "target is busy", a polkit refusal — so the message is shown
+    // whole rather than summarised.
+    log(`storage: ${e.message}`, "err");
+    ev.target.textContent = was;
+    refreshStorage();
+  }
 }
 
-function buildStorageCard() {
+/* ===========================================================================
+   CAMERA CARDS
+
+   One builder, two callers with different needs. A camera's own tab wants the
+   sub-aperture strip and the setup stages; the Imaging tab wants neither, and
+   wants two cards side by side.
+
+   `subaps` also decides how many HTTP connections the tab spends. A browser
+   allows about six per origin and an MJPEG stream holds one open forever, so
+   one camera with a stream and three polled tiles is comfortable and two
+   cameras with tiles would not be -- which is the other reason the alignment
+   view is one camera at a time.
+   =========================================================================== */
+function cameraCard(cam, { subaps = false } = {}) {
   const card = document.createElement("section");
   card.className = "cam";
-  card.id = "storage-card";
-  card.innerHTML = `
-    <div class="viewport">
-      <h2><span class="chev"></span><span class="ttl">Storage</span>
-        <span class="sub">output device</span>
-        <span class="stat" id="storage-stat">&mdash;</span></h2>
-    </div>
-    <div class="controls"><div class="panel"><div class="body" id="storage-body">
-      <div class="empty">reading devices…</div>
-    </div></div></div>`;
 
-  applyStorageCollapse(card, storageOpen());
-  card.querySelector(".viewport h2").addEventListener("click", ev => {
-    // Not on the buttons inside the header -- there are none today, but the
-    // header is also where the free-space readout lives and a stray click on
-    // a number should not be a toggle by accident of markup.
-    if (ev.target.closest("button")) return;
-    const open = card.classList.contains("strip");
-    setStorageOpen(open);
-    applyStorageCollapse(card, open);
-  });
+  const vp = document.createElement("div");
+  vp.className = "viewport";
+  vp.innerHTML = `
+    <h2><span class="ttl"></span>
+      <span class="sub"></span>
+      <span class="stat" data-fps="${cam.cam_id}">&mdash;</span>
+    </h2>
+    <img class="view" src="/stream/${cam.cam_id}.mjpg" alt="preview">
+    ${subaps ? `<div class="subaps" data-subaps="${cam.cam_id}">
+      ${SUBAPS.map(v => `
+        <div class="subap">
+          <img data-tile="${cam.cam_id}/${v}" alt="${v}">
+          <div class="cap" data-cap-for="${v}">${v.replace("_", " ")}</div>
+        </div>`).join("")}
+    </div>` : ""}
+    <div class="actions">
+      <button data-save="raw"  data-cam="${cam.cam_id}">Save raw</button>
+      <button class="ghost" data-save="view" data-cam="${cam.cam_id}">Save view</button>
+      <span class="note" data-note="${cam.cam_id}"></span>
+    </div>`;
+  vp.querySelector(".ttl").textContent = cam.label || cam.cam_id;
+  vp.querySelector(".sub").textContent = `${cam.cam_id} · ${cam.backend}`;
 
-  card.addEventListener("click", async ev => {
-    const use = ev.target.closest("[data-use]");
-    const rel = ev.target.closest("#storage-release");
-    const mnt = ev.target.closest("[data-mount]");
-    const umt = ev.target.closest("[data-unmount]");
-    if (!use && !rel && !mnt && !umt) return;
-    ev.target.disabled = true;
-    const was = ev.target.textContent;
-    if (mnt || umt) ev.target.textContent = "…";
-    try {
-      let s;
-      if (use) s = await jsend("/api/storage/target", { path: use.dataset.use });
-      else if (rel) s = await jsend("/api/storage/release");
-      else if (mnt) s = await jsend("/api/storage/mount", { device: mnt.dataset.mount });
-      else s = await jsend("/api/storage/unmount",
-                           { device: umt.dataset.unmount, mount: umt.dataset.devmount });
-      renderStorage(s);
-      log(use || rel ? `output → ${s.active.session_dir}`
-                     : `${mnt ? "mounted" : "unmounted"} ok`, "ok");
-    } catch (e) {
-      // Mount failures explain themselves precisely — "unknown filesystem type
-      // 'exfat'", "target is busy", a polkit refusal — so the message is shown
-      // whole rather than summarised.
-      log(`storage: ${e.message}`, "err");
-      ev.target.textContent = was;
-      refreshStorage();
-    }
-  });
-  return card;
+  const controls = document.createElement("div");
+  controls.className = "controls";
+  card.append(vp, controls);
+  return { card, controls };
 }
 
-function applyStorageCollapse(card, open) {
-  card.classList.toggle("strip", !open);
-  const chev = card.querySelector(".chev");
-  if (chev) chev.textContent = open ? "▾" : "▸";
-}
-
-async function buildLive() {
-  const gen = ++BUILD;
-  const cams = await jget("/api/cameras");
-  if (gen !== BUILD) return;
-  const root = $("#cams");
-  root.innerHTML = "";
-
-  for (const cam of cams) {
-    const card = document.createElement("section");
-    card.className = "cam";
-
-    const vp = document.createElement("div");
-    vp.className = "viewport";
-    vp.innerHTML = `
-      <h2><span class="ttl"></span>
-        <span class="sub"></span>
-        <span class="stat" data-fps="${cam.cam_id}">&mdash;</span>
-      </h2>
-      <img class="view" src="/stream/${cam.cam_id}.mjpg" alt="preview">
-      <div class="subaps" data-subaps="${cam.cam_id}">
-        ${SUBAPS.map(v => `
-          <div class="subap">
-            <img data-tile="${cam.cam_id}/${v}" alt="${v}">
-            <div class="cap" data-cap-for="${v}">${v.replace("_", " ")}</div>
-          </div>`).join("")}
-      </div>
-      <div class="actions">
-        <button data-save="raw"  data-cam="${cam.cam_id}">Save raw</button>
-        <button class="ghost" data-save="view" data-cam="${cam.cam_id}">Save view</button>
-        <span class="note" data-note="${cam.cam_id}"></span>
-      </div>`;
-    vp.querySelector(".ttl").textContent = cam.label || cam.cam_id;
-    vp.querySelector(".sub").textContent = `${cam.cam_id} · ${cam.backend}`;
-
-    const controls = document.createElement("div");
-    controls.className = "controls";
-
-    card.append(vp, controls);
-    root.appendChild(card);
-
-    controls.appendChild(await buildSensorPanel(cam.cam_id));
-    if (gen !== BUILD) return;
-    await buildPipelinePanels(cam.cam_id, controls);
-    if (gen !== BUILD) return;
-    refreshSubaps(cam.cam_id);
-  }
-
-  root.appendChild(buildStorageCard());
-  refreshStorage();
-
+/* Save buttons are handled by one delegated listener on the container rather
+   than per button, so a rebuilt card cannot leave a dead handler behind. */
+function wireSaveButtons(root) {
   root.addEventListener("click", async ev => {
     const btn = ev.target.closest("[data-save]");
     if (!btn) return;
@@ -1041,6 +1064,203 @@ async function buildLive() {
   });
 }
 
+/* ---------------------------------------------------------------------------
+   ONE CAMERA: alignment and setup.
+
+   Everything that is a property of THIS sensor and is decided once: which way
+   round the frame is, where the lenslet grid falls on it, whether the presence
+   map can see a board through it. One image, filling the width, because that
+   is what you are staring at; the sub-aperture strip beneath it, because that
+   is the read-out that tells you whether the grid is right.
+--------------------------------------------------------------------------- */
+async function buildCameraTab(camId) {
+  const gen = ++BUILD;
+  const cams = await jget("/api/cameras");
+  if (gen !== BUILD) return;
+  const cam = cams.find(c => c.cam_id === camId);
+  const root = $("#cams");
+  root.innerHTML = "";
+  root.className = "single";
+  if (!cam) {
+    root.innerHTML = `<section class="cam"><div class="viewport"><h2>
+      <span class="ttl">${camId}</span></h2></div>
+      <div class="controls"><div class="empty">No such camera.</div></div></section>`;
+    return;
+  }
+
+  const { card, controls } = cameraCard(cam, { subaps: true });
+  root.appendChild(card);
+  wireSaveButtons(root);
+
+  controls.appendChild(await buildSensorPanel(camId, { withOrientation: true }));
+  if (gen !== BUILD) return;
+  await buildPipelinePanels(camId, controls, { only: SETUP_STAGES });
+  if (gen !== BUILD) return;
+  refreshSubaps(camId);
+}
+
+/* ---------------------------------------------------------------------------
+   BOTH CAMERAS: capture.
+
+   Exposure, gain and the display stages, on two live images. No orientation
+   and no grid controls: those are per-sensor setup, they are on the sensor's
+   own tab, and having them here is how a frame gets turned in the middle of a
+   session. This is the tab quick-record belongs to.
+--------------------------------------------------------------------------- */
+async function buildImaging() {
+  const gen = ++BUILD;
+  const cams = await jget("/api/cameras");
+  if (gen !== BUILD) return;
+  const root = $("#cams");
+  root.innerHTML = "";
+  wireSaveButtons(root);
+
+  for (const cam of cams) {
+    const { card, controls } = cameraCard(cam, { subaps: false });
+    root.appendChild(card);
+    controls.appendChild(await buildSensorPanel(cam.cam_id, { withOrientation: false }));
+    if (gen !== BUILD) return;
+    await buildPipelinePanels(cam.cam_id, controls, { skip: SETUP_STAGES });
+    if (gen !== BUILD) return;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   SYSTEM: everything about the rig that is not an image.
+
+   Storage was the reason this tab exists, and on its own it did not justify a
+   column of the imaging view. What belongs beside it is the rest of the
+   "is this rig healthy and where is its output going" question, which was
+   previously scattered across a header strip, a log line and two endpoints
+   nobody knew about: the host's temperature and supply, the addresses the
+   dashboard can be reached on, what each camera is actually doing (rates,
+   dropped frames, the raw format in force), and where the settings file is.
+--------------------------------------------------------------------------- */
+async function buildSystem() {
+  const gen = ++BUILD;
+  const root = $("#cams");
+  root.innerHTML = "";
+  root.className = "single";
+
+  const card = document.createElement("section");
+  card.className = "cam";
+  card.innerHTML = `
+    <div class="viewport"><h2><span class="ttl">System</span>
+      <span class="sub">host, network, storage, cameras</span>
+      <span class="stat" id="sys-uptime">&mdash;</span></h2></div>
+    <div class="controls" id="sys-body"></div>`;
+  root.appendChild(card);
+  const body = $("#sys-body");
+
+  const storage = document.createElement("div");
+  storage.className = "panel";
+  storage.innerHTML = `<div class="hdr"><span class="chev">▾</span>
+      <strong>Storage</strong><span class="type">output device</span></div>
+    <div class="body" id="storage-body"><div class="empty">reading devices…</div></div>`;
+  body.appendChild(storage);
+  storage.addEventListener("click", storageClick);
+  refreshStorage();
+
+  for (const [id, title, type] of [["sys-host", "Host", "health"],
+                                   ["sys-net", "Network", "addresses"],
+                                   ["sys-cams", "Cameras", "rates and formats"],
+                                   ["sys-session", "Session", "paths"]]) {
+    const p = document.createElement("div");
+    p.className = "panel";
+    p.innerHTML = `<div class="hdr"><span class="chev">▾</span><strong>${title}</strong>
+        <span class="type">${type}</span></div>
+      <div class="body"><div class="notes tall" id="${id}">…</div></div>`;
+    p.querySelector(".hdr").onclick = () => {
+      p.classList.toggle("collapsed");
+      p.querySelector(".chev").textContent =
+        p.classList.contains("collapsed") ? "▸" : "▾";
+    };
+    body.appendChild(p);
+  }
+  if (gen !== BUILD) return;
+  renderSystem(await jget("/api/status"));
+}
+
+/* Text, not widgets. Nothing here is adjustable, and a table of read-outs that
+   looks like a form invites clicking on it. */
+function renderSystem(s) {
+  const set = (id, lines) => {
+    const el = $("#" + id);
+    if (el) el.textContent = lines.filter(Boolean).join("\n");
+  };
+  const up = $("#sys-uptime");
+  if (up) up.textContent = `up ${Math.round(s.uptime_s)} s`;
+
+  const h = s.health || {};
+  set("sys-host", [
+    h.cpu_temp_c != null ? `CPU        ${h.cpu_temp_c.toFixed(1)} °C`
+                         : "CPU        temperature not readable (not a Pi?)",
+    Array.isArray(h.load) ? `load       ${h.load.join("  ")}   (1, 5, 15 min)` : null,
+    h.mem_available_mb != null ? `memory     ${h.mem_available_mb} MB available` : null,
+    h.throttled ? `throttled  ${h.throttled}` : null,
+    // The problems list is where under-voltage surfaces, and under-voltage is
+    // the one entry here that no setting fixes -- it needs a bigger supply.
+    // It is sticky since boot, so it stays visible after the brown-out that
+    // caused it, which is exactly what makes it findable.
+    ...(h.problems || []).map(p => `!!         ${p}`),
+  ]);
+
+  const n = s.network || {};
+  set("sys-net", [
+    `hostname   ${n.hostname || "?"}${n.mdns ? `   (${n.mdns})` : ""}`,
+    `bound      ${n.bound || "?"}`,
+    "",
+    "reachable at:",
+    ...(n.urls || []).map(u => `           ${u}`),
+    "",
+    ...(n.interfaces || []).map(
+      i => `${(i.interface || "?").padEnd(10)} ${i.address}`),
+  ]);
+
+  set("sys-cams", (s.cameras || []).flatMap(c => [
+    `${c.cam_id}  ${c.label || ""}`.trimEnd(),
+    `  backend    ${c.backend}${c.open ? "" : "  (NOT OPEN)"}`,
+    c.info ? `  frame      ${(c.info.full_resolution || []).join(" x ")} full, `
+             + `${(c.info.preview_resolution || []).join(" x ")} preview` : null,
+    // Three rates, and they are not the same number -- see the README. If
+    // `pipeline` is far below `cap`, something is stalling; if `skipped` is
+    // zero with a cap set, the cap is not doing anything.
+    `  rate       ${c.fps} Hz pipeline`
+      + (c.process_fps ? ` (cap ${c.process_fps})` : " (uncapped)")
+      + `, sensor ${c.sensor_fps} Hz, ${c.skipped} frames skipped`,
+    c.errors ? `  errors     ${c.errors}  last: ${c.last_error || ""}` : null,
+    c.info && c.info.detail && c.info.detail.dropped_controls
+      && c.info.detail.dropped_controls !== "none"
+      ? `  dropped    ${c.info.detail.dropped_controls}` : null,
+  ].filter(Boolean)));
+
+  set("sys-session", [
+    `session    ${s.session_dir}`,
+    s.state_file ? `settings   ${s.state_file}` : "settings   not persisted",
+    `page       build ${UI_BUILD}`,
+  ]);
+}
+
+/* A tab that exists so the shape of the application is visible before the
+   feature is. Saying "not built yet" in the place the feature will live is
+   more use than leaving a gap and remembering where it was going. */
+function buildPlaceholder(title, sub, lines) {
+  const root = $("#cams");
+  root.innerHTML = "";
+  root.className = "single";
+  const card = document.createElement("section");
+  card.className = "cam";
+  card.innerHTML = `
+    <div class="viewport"><h2><span class="ttl"></span>
+      <span class="sub"></span></h2></div>
+    <div class="controls"><div class="panel"><div class="body">
+      <div class="notes tall"></div></div></div></div>`;
+  card.querySelector(".ttl").textContent = title;
+  card.querySelector(".sub").textContent = sub;
+  card.querySelector(".notes").textContent = lines.join("\n");
+  root.appendChild(card);
+}
+
 
 /* ===========================================================================
    CALIBRATION DASHBOARD
@@ -1055,7 +1275,7 @@ async function buildLive() {
    open session rather than becoming a one-way door.
    =========================================================================== */
 
-let MODE = "live";
+let MODE = "imaging";
 /* Building a mode is asynchronous -- it awaits the schema for every stage of
    every camera -- and a mode switch part-way through would otherwise let the
    abandoned build finish and append its panels into the new layout. That is
@@ -1355,7 +1575,7 @@ document.addEventListener("keydown", async ev => {
   // Imaging mode: quick-record, when it is armed. Checked before the
   // calibration branch so the two never contend for the space bar -- they are
   // in different modes and cannot both be live, but the guard is one line.
-  if (MODE === "live") {
+  if (MODE === "imaging") {
     const quick = $("#quick-record");
     if (ev.code === "Space" && quick && quick.checked && !ev.repeat) {
       ev.preventDefault();
@@ -1547,34 +1767,105 @@ async function refreshReadiness() {
   try { renderReadiness(await jget("/api/calibration/readiness")); } catch { /* transient */ }
 }
 
-async function setMode(mode) {
-  if (mode === MODE) return;
+/* The tabs, and what each one is for.
+
+   The order is the order of the work: check the rig, set each sensor up, then
+   capture with both. `build` is the only thing that differs between them; the
+   teardown, the streaming budget and the poll gating are shared, which is why
+   adding the next one is a row in this array.
+
+   Per-camera tabs are inserted at start-up from /api/cameras, so a third
+   camera needs no edit here. */
+const TABS = [
+  { id: "system", label: "System", build: buildSystem },
+  { id: "imaging", label: "Imaging", build: buildImaging },
+  {
+    id: "video", label: "Video", build: () => buildPlaceholder(
+      "Video capture", "not implemented",
+      ["Both sensors, continuous, to disk. Nothing here yet.",
+       "",
+       "The hard part is not the encoding, it is that a continuous write has",
+       "to survive the storage device going away mid-recording, which the",
+       "still path already handles and this will have to as well.",
+       "",
+       "Until then: quick-record on the Imaging tab writes a raw set from both",
+       "cameras per space bar press."]),
+  },
+  {
+    id: "cal", label: "Calibration", build: buildCalibration,
+    note: "on-rig detection; the supported path is quick-record plus offline "
+        + "processing in matlab/",
+  },
+];
+
+/* Which tabs are camera tabs, filled in at start-up. */
+const CAMERA_TABS = new Set();
+
+async function buildTabs() {
+  let cams = [];
+  try { cams = await jget("/api/cameras"); } catch { /* header still renders */ }
+  const tabs = [TABS[0]];
+  for (const c of cams) {
+    CAMERA_TABS.add(c.cam_id);
+    tabs.push({
+      id: c.cam_id,
+      label: c.label || c.cam_id,
+      build: () => buildCameraTab(c.cam_id),
+      note: "orientation and MLA alignment for this sensor alone",
+    });
+  }
+  tabs.push(...TABS.slice(1));
+
+  const host = $("#modes");
+  host.innerHTML = "";
+  for (const t of tabs) {
+    const b = document.createElement("button");
+    b.id = `mode-${t.id}`;
+    b.textContent = t.label;
+    if (t.note) b.title = t.note;
+    b.onclick = () => setMode(t.id);
+    host.appendChild(b);
+  }
+  TAB_BY_ID.clear();
+  for (const t of tabs) TAB_BY_ID.set(t.id, t);
+  await setMode(cams.length ? "imaging" : "system", { force: true });
+}
+
+const TAB_BY_ID = new Map();
+
+async function setMode(mode, { force = false } = {}) {
+  if (mode === MODE && !force) return;
+  const tab = TAB_BY_ID.get(mode);
+  if (!tab) return;
   MODE = mode;
   if (readinessTimer) { clearInterval(readinessTimer); readinessTimer = null; }
 
   // Replacing <main> drops the <img> elements, which closes their MJPEG
   // connections. That matters: the browser's ~6-connection budget is the
   // constraint the whole streaming design is built around, and leaking a
-  // stream per mode switch would exhaust it after three switches.
+  // stream per tab switch would exhaust it after three switches. It is also
+  // why only the tab on screen streams anything at all: a camera tab holds one
+  // stream, Imaging holds two, System and the placeholders hold none.
   for (const k of Object.keys(SENSOR_ROWS)) delete SENSOR_ROWS[k];
+  for (const k of Object.keys(ORIENT_HOSTS)) delete ORIENT_HOSTS[k];
   const root = $("#cams");
   root.className = "";
   root.innerHTML = "";
 
-  $("#mode-live").classList.toggle("on", mode === "live");
-  $("#mode-cal").classList.toggle("on", mode === "cal");
-  $("#live-actions").hidden = mode !== "live";
+  for (const b of $("#modes").children) b.classList.toggle("on", b.id === `mode-${mode}`);
+  // Quick-record is a two-camera capture action, so it belongs to the tab that
+  // shows two cameras. Leaving it in the header on a single-sensor alignment
+  // tab would let the space bar fire a stereo capture from a screen showing
+  // one image.
+  $("#live-actions").hidden = mode !== "imaging";
 
   try {
-    if (mode === "cal") { await buildCalibration(); log("calibration mode"); }
-    else { await buildLive(); log("imaging mode"); }
+    await tab.build();
+    log(`${tab.label} tab`);
   } catch (e) {
-    log(`${mode} mode failed to build: ${e.message}`, "err");
+    log(`${tab.label} tab failed to build: ${e.message}`, "err");
   }
 }
-
-$("#mode-live").onclick = () => setMode("live");
-$("#mode-cal").onclick = () => setMode("cal");
 
 /* Saved-file description. The BYTE COUNT is not decoration: the rig once
    reported "saved" for a whole session that reached the disk as zero-length
@@ -1736,7 +2027,7 @@ $("#quick-record").onchange = ev => {
    short request that completes and gives its connection back. */
 const TILE_HZ = 4;
 function pollTiles() {
-  if (MODE !== "live") { setTimeout(pollTiles, 1000 / TILE_HZ); return; }
+  if (!CAMERA_TABS.has(MODE)) { setTimeout(pollTiles, 1000 / TILE_HZ); return; }
   for (const img of document.querySelectorAll("[data-tile]")) {
     // Skip while a previous load is still in flight, so a slow encode cannot
     // build a backlog of requests.
@@ -1811,10 +2102,14 @@ async function poll() {
     // Sub-aperture indices shift as pitch changes; refresh captions at a low
     // rate rather than on every keystroke.
     tick++;
-    if (MODE === "live" && tick % 3 === 0) s.cameras.forEach(c => refreshSubaps(c.cam_id));
+    if (CAMERA_TABS.has(MODE) && tick % 3 === 0) refreshSubaps(MODE);
     // Devices appear and disappear on their own schedule, so the panel is
     // re-read on a timer rather than only when something is clicked.
-    if (MODE === "live" && tick % 5 === 0) refreshStorage();
+    // Storage is polled whatever tab is showing: the System tab needs it to
+    // be current, and every other tab needs the tab BUTTON to light up when a
+    // disk is plugged in. It is one cheap request every five seconds.
+    if (tick % 5 === 0) refreshStorage();
+    if (MODE === "system" && tick % 2 === 0) renderSystem(s);
     // Every ~15 s. Cheap, and the alternative is an operator concluding a
     // feature is broken when the page is simply the one from before the pull.
     if (tick % 15 === 0) checkStale();
@@ -1822,7 +2117,7 @@ async function poll() {
   setTimeout(poll, 1000);
 }
 
-buildLive().then(() => { poll(); pollTiles(); pollSession(); })
+buildTabs().then(() => { poll(); pollTiles(); pollSession(); })
           .catch(e => log("startup: " + e.message, "err"));
 </script>
 </body>

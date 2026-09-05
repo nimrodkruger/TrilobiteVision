@@ -383,27 +383,87 @@ second consumer of the camera exists.
 
 ## The dashboard
 
-Two modes, switched in the header. They are separate because alignment and
-calibration are different jobs: during alignment you stare at the image,
-during calibration you stare at coverage.
+Tabs across the header, in the order of the work.
 
-### Imaging mode
+| tab | what it is for | streams |
+|---|---|---|
+| **System** | the rig, not the image: storage, host health, addresses, camera rates and formats, where the settings file is | none |
+| **&lt;camera&gt;** — one per camera | that sensor's setup: orientation, MLA alignment, the presence map | one |
+| **Imaging** | both sensors, capture: exposure, gain, the display stages, save and quick-record | two |
+| **Video** | continuous capture — a placeholder | none |
+| **Calibration** | the on-rig hands-free loop | none |
 
-Per camera: the live preview with the MLA grid drawn on it, three sub-aperture
-tiles below it, and a scrolling column of controls generated from the stage
-schemas. Save raw or save view, per camera or both at once.
+The split is the point. Aligning a lenslet grid is a job you do once per
+camera, staring at one image; capturing a stereo set is a job you do with both.
+Sharing one screen meant half the controls on it were wrong at any moment — and
+made it possible to nudge a pitch mid-session without noticing which camera you
+were nudging. So orientation and the MLA stages appear **only** on a camera's
+own tab, and exposure and gain appear on both, because those are what you
+adjust while looking at whatever you are looking at.
 
-The MLA parameters — pitch, rotation, offsets, crop scale — are what the
-sub-aperture crops use, so what you see aligned is what gets extracted. They
-are in **full-resolution sensor pixels** — 1456 × 1088 here, not the 728 × 544
-preview you align against. The overlay scales them down to draw; everything
-that measures uses them as they are. The sensor frame they are expressed in is
-recorded with them, and anything holding a different-sized frame converts
-through `MLAGridOverlay.geometry_for()`.
+It is also the connection budget. A browser allows about six concurrent HTTP/1.1
+connections per origin and an MJPEG stream holds one open forever, so only the
+tab on screen streams anything: a camera tab holds one stream and three polled
+tiles, Imaging holds two streams and no tiles, System and the placeholders hold
+none. Switching tabs drops the previous tab's `<img>` elements, which closes
+them.
 
-The Storage panel lives here — see below.
+The per-camera tabs are generated from `/api/cameras`, so a third camera adds a
+third tab with no edit to the page.
 
-### Calibration mode
+### A camera's own tab
+
+The live preview with the MLA grid drawn on it, three sub-aperture tiles below
+it, and the controls that are properties of *this* sensor: rotation and
+mirroring, pitch, grid rotation, offsets, crop scale, and the presence map.
+
+The MLA parameters are what the sub-aperture crops use, so what you see aligned
+is what gets extracted. They are in **full-resolution sensor pixels** — 1456 ×
+1088 here, not the 728 × 544 preview you align against. The overlay scales them
+down to draw; everything that measures uses them as they are. The sensor frame
+they are expressed in is recorded with them, and anything holding a
+different-sized frame converts through `MLAGridOverlay.geometry_for()`.
+
+The **offset sliders are bounded by the pitch**, and their range follows it: an
+offset says which physical lenslet is index (0, 0), so moving it a whole pitch
+names the next one along and draws the identical grid. Every distinct alignment
+is within half a pitch of centre. A value outside that is *folded* back rather
+than clamped — the number jumps to the other end while the grid slides on
+unchanged, which is what the geometry actually does. A clamp would stop the
+grid moving while the number kept changing, and the control would look dead at
+one end.
+
+### Imaging
+
+Both previews side by side, exposure, gain, auto-exposure and the display
+stages. Save raw or save view, per camera or both at once, and quick-record on
+the space bar. No orientation and no grid controls: those are setup, they are
+on each sensor's own tab, and having them here is how a frame gets turned in
+the middle of a session.
+
+### System
+
+Storage — the device list, mounting, switching the output target, the write
+verification — plus the read-outs that answer "is this rig healthy and where is
+its output going": CPU temperature and supply warnings, every address the
+dashboard can be reached on, what each camera is actually doing (all three
+frame rates, frames skipped by the pipeline cap, errors, dropped controls), and
+the paths of the session directory and the settings file.
+
+Nothing about storage is on screen while imaging, which is the point and also a
+way to miss the one moment it matters. So the **System tab itself** turns
+accent-coloured when a removable disk is attached that is not the one being
+written to, and red when the output device has gone.
+
+### Calibration
+
+Parked, not removed. The rig detects on-board, gates, and captures hands-free,
+and all of it works — but the supported path today is quick-record plus offline
+processing in `matlab/`, and it is not settled that real-time detection earns
+its cost on a Pi. The tab stays because the machinery underneath it (the
+readiness checks, the coverage model, the pose manifest) is what any calibration
+will need, whether the detection happens here or on the desk. What follows
+describes it as built.
 
 **Hands-free.** The assumption behind every default: you are holding the board
 with both hands, you cannot press anything, and you are looking at the board
@@ -502,14 +562,12 @@ it out — and the right USB SSD is usually not plugged in when the application
 starts. The output directory is therefore movable while the rig is running,
 from the Storage panel in imaging mode.
 
-The panel is **collapsed by default**, to a single strip across the bottom of
-the imaging view — it is something you touch once, when a disk goes in, and
-expanded it costs a whole camera-sized column of a two-column layout. Collapsed
-it still carries the two facts worth having on screen: where output is going,
-and how much room is left. It turns accent-coloured, and says so, when a
-removable disk is present that is not the one being written to — the one moment
-the panel exists for. Click the header to open it; the choice is remembered per
-browser.
+It lives on the **System** tab, with the rest of what is true about the rig
+rather than about the image. It used to sit in the imaging view, where it cost
+a camera-sized column of a two-column layout to show a list you touch once per
+session; collapsing it there did not help, because the two camera cards did not
+expand to take the space back. The signal that a disk needs attention is on the
+System tab button instead — see the dashboard section.
 
 - **A plugged-in disk is not necessarily a mounted disk**, and this is the part
   that catches people out. A headless Pi runs no desktop session, so nothing

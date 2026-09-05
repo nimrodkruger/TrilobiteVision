@@ -35,10 +35,28 @@ data headed for calibration. If rotation ever exceeds a few degrees, rotate the
 
 from __future__ import annotations
 
+import functools
+import logging
 import math
 from dataclasses import dataclass
 
 import numpy as np
+
+log = logging.getLogger(__name__)
+
+# The most lattice positions `whole_indices` will test before giving up.
+#
+# The enumeration is quadratic in 1/pitch with trigonometry per candidate, so
+# a pitch small enough to be a mistake is not merely slow, it is a hang: pitch
+# 1.5 px on a 1456x1088 sensor is thirteen million tests, inside a request
+# handler, on a Pi. `pitch_px` is bounded from below for that reason, but a
+# bound on one parameter is not a guarantee about the product of three, so
+# this is the backstop. 40,000 candidates is about 25 ms once and free
+# afterwards through the cache below; beyond it, the honest answer is that the
+# geometry is not usable and an empty list says so to every caller at once --
+# the overlay draws no highlights, the tile endpoints return 204, and the
+# readiness check reports zero whole tiles with the pitch in the message.
+MAX_LATTICE_CANDIDATES = 40_000
 
 # The sub-apertures the UI displays, in left-to-right display order. Defined
 # here rather than in the web layer so the overlay's highlight boxes and the
@@ -204,19 +222,40 @@ class MLAGeometry:
         )
 
     def _search_radius(self, scale: float = 1.0) -> tuple[int, int]:
-        """Generous index bounds to enumerate over. Cheap; correctness first."""
-        reach = math.hypot(self.width, self.height)
+        """Index bounds to enumerate over, and they have to be honest bounds.
+
+        A lenslet centre is `origin + i*u + j*v` with u and v orthogonal and of
+        length `pitch`, so a centre inside the frame satisfies
+
+            |i| * pitch = |(centre - origin) . u_hat| <= |centre - origin|
+                       <= half-diagonal + |offset|
+
+        which is the bound below. The old version used the FULL diagonal and no
+        offset term, which is safe but twice as large on each axis and so four
+        times as many candidates -- and this is quadratic in 1/pitch, evaluated
+        with trigonometry per candidate. At the default pitch of 20 px on a
+        1456x1088 sensor that was 34,000 `is_whole` calls, and `apply()` reaches
+        it through `named_indices` on every frame: 800,000 calls a second across
+        two cameras at 12 Hz, which is a visible share of the CPU the web thread
+        was competing for.
+
+        The `+2` is slack, deliberately, and no test will fail if you remove
+        it: the bound above is already exact for the CENTRE, and `is_whole`
+        additionally requires the whole crop to fit, which is stricter. Two
+        rings of margin cost nothing next to a quadratic scan and mean that a
+        future change to what "whole" means cannot silently start dropping the
+        outermost lenslets -- which are the ones the corner sub-apertures use,
+        and the ones that reveal a wrong pitch.
+        """
+        reach = 0.5 * math.hypot(self.width, self.height) + math.hypot(
+            self.offset_x, self.offset_y
+        )
         n = int(reach / max(self.pitch, 1e-6)) + 2
         return n, n
 
     def whole_indices(self, scale: float = 1.0, derotate: bool = True) -> list[tuple[int, int]]:
-        ni, nj = self._search_radius(scale)
-        return [
-            (i, j)
-            for i in range(-ni, ni + 1)
-            for j in range(-nj, nj + 1)
-            if self.is_whole(i, j, scale, derotate)
-        ]
+        """Every lenslet that yields a complete tile. Cached; see `_whole`."""
+        return _whole(self, float(scale), bool(derotate))
 
     def index_extent(self, scale: float = 1.0, derotate: bool = True) -> tuple[int, int]:
         """Largest |i| and |j| among whole lenslets. Reporting only."""
@@ -466,3 +505,44 @@ class MLAGeometry:
         sx = cx + aa * ct - bb * st
         sy = cy + aa * st + bb * ct
         return _bilinear(image, sx, sy)
+
+
+@functools.lru_cache(maxsize=128)
+def _whole(geom: MLAGeometry, scale: float, derotate: bool) -> list[tuple[int, int]]:
+    """The whole-lenslet enumeration, memoised on the geometry itself.
+
+    `MLAGeometry` is a frozen dataclass, so it hashes by value: two geometries
+    built from the same parameters are the same cache key even though they are
+    different objects. That is what makes this worth doing -- `geometry_for`
+    constructs a fresh instance on every call, and `MLAGridOverlay.apply`
+    reaches this through `named_indices` on every frame with parameters that
+    have not changed since the last one. Memoising turns a per-frame quadratic
+    scan into a per-EDIT one.
+
+    The cache is bounded because dragging a slider produces a new geometry per
+    pixel of travel; 128 entries covers the recent history of one such drag on
+    two cameras and then discards it.
+
+    Returns a list, which a caller could mutate and corrupt the entry for
+    everyone. Nothing does, and the alternative -- copying on every call -- is
+    the cost this exists to avoid. Callers treat it as read-only.
+    """
+    ni, nj = geom._search_radius(scale)
+    candidates = (2 * ni + 1) * (2 * nj + 1)
+    if candidates > MAX_LATTICE_CANDIDATES:
+        log.warning(
+            "MLA geometry with pitch %.2f px on a %dx%d frame implies %d lattice "
+            "positions to test, past the %d cap -- refusing to enumerate and "
+            "reporting no whole lenslets. This is a pitch far too small for the "
+            "frame, not a large array: %d lenslets would each be under two pixels "
+            "across.",
+            geom.pitch, geom.width, geom.height, candidates,
+            MAX_LATTICE_CANDIDATES, candidates,
+        )
+        return []
+    return [
+        (i, j)
+        for i in range(-ni, ni + 1)
+        for j in range(-nj, nj + 1)
+        if geom.is_whole(i, j, scale, derotate)
+    ]
