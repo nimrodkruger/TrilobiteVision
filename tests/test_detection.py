@@ -356,21 +356,47 @@ def test_nothing_in_this_module_owns_a_thread_or_a_camera():
 class _FakeRaw:
     """Just enough of PiCameraSource to exercise _trim_stride."""
 
-    def __init__(self, full=(1456, 1088)):
+    def __init__(self, full=(1456, 1088), rotate_deg=0):
         self._full_res = full
         self.cam_id = "left"
+        self.rotate_deg = int(rotate_deg)
+
+    def oriented_size(self, size):
+        # The real one is CameraSource.oriented_size; reimplemented here rather
+        # than bound because it reads self.cfg, and this fake has no config.
+        w, h = int(size[0]), int(size[1])
+        return (h, w) if (self.rotate_deg // 90) % 2 else (w, h)
 
     _trim_stride = None       # filled in below
 
 
-def _trimmer(full=(1456, 1088)):
+def _trimmer(full=(1456, 1088), rotate_deg=0):
     from trilobite.cameras.picam import Picamera2Source
 
-    fake = _FakeRaw(full)
+    fake = _FakeRaw(full, rotate_deg)
     # Bind every method the trim reaches, not only the entry point.
     for name in ("_trim_stride", "_unexpected"):
         setattr(fake, name, getattr(Picamera2Source, name).__get__(fake, _FakeRaw))
     return fake
+
+
+def test_the_trim_is_against_the_sensor_frame_not_the_rotated_one():
+    """Rotation must not reach the trim, but must reach what it reports.
+
+    The padding is on the right of the buffer as the sensor delivers it. Turn
+    the frame first and the padding is along an edge that cropping the right
+    would not touch -- so the trim works in sensor coordinates and the rotation
+    is applied afterwards, in capture_full. What the note advertises as the
+    image size, though, is what the caller will end up holding: swapped.
+    """
+    padded = np.zeros((1088, 1472), dtype=np.uint8)
+    padded[:, 1456:] = 200
+    out, note = _trimmer(rotate_deg=90)._trim_stride(padded)
+
+    assert out.shape == (1088, 1456), "the trim itself is unaffected by rotation"
+    assert out.max() == 0, "only the padding may be removed"
+    assert (note["image_width"], note["image_height"]) == (1088, 1456)
+    assert note["raw_padding_px"] == 16, "padding is still counted in sensor terms"
 
 
 def test_stride_padding_is_trimmed_from_raw_frames():

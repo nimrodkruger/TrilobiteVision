@@ -450,6 +450,29 @@ symptom is a UI whose controls silently do nothing.
 So: exactly one persistent stream per camera, everything else polled as
 single-shot JPEGs. This is a constraint, not a tuning parameter.
 
+### Three frame rates, and which one to change
+
+They are separate on purpose, and the symptom of confusing them is a page where
+the preview looks fine but every slider and button responds a second late.
+
+| rate | set by | what it governs |
+|---|---|---|
+| **sensor** | `cameras[].fps` | how often the camera produces an exposure. Must be drained at this rate whatever else is happening: an unreleased picamera2 request starves a four-deep pool and stalls capture. |
+| **pipeline** | `cameras[].process_fps`, defaulting to `server.preview_fps` | how often stats, levels, the grid overlay and the presence map actually run. Frames arriving faster are released without being decoded. |
+| **browser** | `server.preview_fps` | how often an MJPEG frame is encoded and pushed. |
+
+The pipeline rate is the one that was missing. Running the full pipeline on
+every sensor frame — a ~3 ms presence map among them, twice over for two
+cameras — is sixty passes a second on four cores that also have to encode JPEG
+and answer the API, and the web thread loses. Capping it to the browser rate
+cuts that by 60% and costs nothing, because the browser is the only thing that
+reads the result. `GET /api/status` reports `fps` (pipeline), `sensor_fps` and
+`skipped` per camera, so you can see the cap working rather than assume it.
+
+`process_fps: 0` restores the old behaviour of processing every frame. Raise it
+above the browser rate only if something other than the browser starts reading
+the preview bus.
+
 ---
 
 ## Output storage
@@ -512,21 +535,49 @@ the Pi prints the same thing with more context.
 
 ### Orientation
 
-**Flip horizontal** and **Flip vertical** in each camera's Sensor panel mirror
-the image. They are applied at **acquisition**, before anything else sees the
-pixels, so the preview, the saved `.npy`, the sub-aperture crops and the
-recorded calibration corners all agree — there is no way for the display and
-the data to differ, because there is only one flip. Every sidecar records the
-setting.
+**Rotate**, **Flip horizontal** and **Flip vertical** in each camera's Sensor
+panel turn and mirror the image. They are applied at **acquisition**, before
+anything else sees the pixels, so the preview, the saved `.npy`, the
+sub-aperture crops and the recorded calibration corners all agree — there is no
+way for the display and the data to differ, because there is only one
+orientation and it happens first. Every sidecar records all three.
 
-It is a statement about how the camera is *mounted* — a fold mirror, an
-inverted bracket — rather than a display preference, which is why it sits with
-the sensor controls and not in the pipeline.
+They describe how the camera is *mounted* — a fold mirror, an inverted bracket,
+a sensor turned on its side to put the long axis across the bench — rather than
+a display preference, which is why they sit with the sensor controls and not in
+the pipeline.
 
-**Set it before aligning the MLA grid.** The grid offsets are measured from the
-frame centre, and a flip negates the axis they run along, so changing it
-afterwards invalidates the alignment. The UI says so when you toggle it with a
-grid enabled.
+Rotation is **clockwise as you look at the image**, in quarter turns only, and
+is applied **before** the two mirrors, so the flip boxes always mean "mirror
+what I am looking at" whatever the rotation. Anything other than a quarter turn
+would be a resample rather than a relabelling of pixels, and would cost
+resolution on every frame; the endpoint refuses it.
+
+**90° and 270° swap width and height**, and that swap runs the length of the
+stack. Nothing downstream may assume a landscape frame: `describe()` is the
+single place the post-rotation size is decided, and the MLA reference frame,
+the readiness arithmetic, the session manifest and the offline readers all take
+their geometry from there. The one thing that deliberately does *not* see the
+rotation is the raw stride trim — row padding is a property of the buffer as
+the sensor delivers it, so it is removed against the native sensor width first
+and the frame is turned afterwards.
+
+An MLA alignment **survives** a change of orientation. Turning or mirroring the
+camera moves no lenslets; it relabels the pixels. So the grid is carried across
+rather than invalidated: the offsets are transformed, the reference frame swaps
+if the turn was odd, the lattice tilt negates under a mirror, and pitch is
+untouched, because all eight orientations are isometries. The arithmetic is in
+`src/trilobite/optics/orientation.py` — the eight being the dihedral group of a
+rectangle — and an alignment records which orientation it was made under, so
+the change is computed rather than guessed. The UI prints what became of the
+offsets when you change it.
+
+Re-check the overlay by eye afterwards all the same. The transform is exact,
+but "nothing else moved when I turned the camera" is a claim about the bench,
+not about the software.
+
+Alignments made before the orientation was recorded are read as having been
+made at 0° with no mirrors, which is what they were.
 
 ### Quick-record
 
@@ -576,6 +627,36 @@ per-tile structure.
 Ten to twenty seconds of arithmetic on a laptop replaces a design that took the
 rig down. See §4.3 of `docs/calibration-ui-spec.md` for where each detector runs
 and why.
+
+### Lines across the image
+
+Horizontal lines — "variation on the row value, like a broken screen" — have
+four causes that look identical on screen and want completely different
+responses, and swapping the cable tests only one of them.
+`scripts/diagnose_lines.py` measures all four:
+
+```bash
+python scripts/diagnose_lines.py path/to/session/left/     # several frames
+```
+
+| what it finds | what it means | what to do |
+|---|---|---|
+| kernel reports CSI/FIFO errors | the link is failing, counted by the driver | reseat both FFC ends, shorter cable, and try one camera at a time — two share the CSI bandwidth |
+| rows match their neighbours better when **shifted sideways** | bytes are being dropped: the pixels are not wrong, they are *moved* | same as above; a sensor cannot do this |
+| row offsets **repeat** frame to frame | fixed-pattern row noise | subtract a dark frame taken at the same exposure and gain |
+| row offsets **do not repeat**, and are small | ordinary read noise with the contrast stretched | nothing — judge the frame at its real contrast first |
+
+Give it several frames. Fixed-pattern and random row noise are the same picture
+in a single frame and are only separable across a few, and more frames also
+stop a scene with genuine horizontal structure from being read as a fault.
+
+The displacement test is the one worth understanding: a dropped byte does not
+corrupt a row's values, it shifts everything after the loss one or more pixels
+early, so the row still looks like the scene and simply sits in the wrong
+place. That is invisible to any measure of row brightness — the same pixels are
+still in the row — and obvious to a cross-correlation against the rows above
+and below. It is also something no sensor does, which is what makes it
+decisive.
 
 ### In MATLAB
 

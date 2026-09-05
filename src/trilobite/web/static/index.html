@@ -520,14 +520,53 @@ async function buildSensorPanel(camId) {
   return makePanel("Sensor", "driver", body, false);
 }
 
-/* Mirroring. Deliberately in the Sensor panel rather than the pipeline: it is
-   applied at ACQUISITION, so it affects the saved raw data and the calibration
-   corners, not only what you are looking at. A flip that changed the preview
-   and not the file would be a trap. */
+/* Rotation and mirroring. Deliberately in the Sensor panel rather than the
+   pipeline: they are applied at ACQUISITION, so they affect the saved raw data
+   and the calibration corners, not only what you are looking at. An
+   orientation that changed the preview and not the file would be a trap. */
 async function buildOrientationRows(camId) {
   const wrap = document.createElement("div");
-  let state = { flip_horizontal: false, flip_vertical: false };
+  let state = { flip_horizontal: false, flip_vertical: false, rotate_deg: 0 };
   try { state = await jget(`/api/orientation/${camId}`); } catch { /* backend without it */ }
+
+  /* Rotation first in the panel because it is applied first: the two flips
+     below mirror the image as you see it AFTER the turn. A quarter turn swaps
+     width and height everywhere downstream, so this is a restart-grade change
+     wearing a dropdown -- the note it prints says what became of the grid. */
+  {
+    const row = document.createElement("div");
+    row.className = "row";
+    const name = document.createElement("label");
+    name.textContent = "Rotate";
+    name.title = "Clockwise, applied at acquisition to the preview AND to every " +
+                 "saved frame. 90 and 270 swap width and height. The MLA grid " +
+                 "offsets are carried across automatically; pitch does not change.";
+    const sel = document.createElement("select");
+    for (const [v, text] of [[0, "0°"], [90, "90° CW"], [180, "180°"], [270, "270° CW"]]) {
+      const o = document.createElement("option");
+      o.value = String(v);
+      o.textContent = text;
+      o.selected = Number(state.rotate_deg || 0) === v;
+      sel.appendChild(o);
+    }
+    let previous = Number(state.rotate_deg || 0);
+    sel.onchange = async ev => {
+      ev.target.blur();
+      try {
+        const r = await jsend(`/api/orientation/${camId}`, { rotate_deg: Number(ev.target.value) });
+        previous = Number(r.rotate_deg);
+        note(camId, `rotate = ${r.rotate_deg}° CW` +
+                    (r.rebased ? ` — ${r.rebased}` : "") +
+                    (r.warning ? ` — ${r.warning}` : ""), r.warning ? "err" : "ok");
+        refreshSubaps(camId);
+      } catch (e) {
+        ev.target.value = String(previous);
+        note(camId, `rotate: ${e.message}`, "err");
+      }
+    };
+    row.append(name, sel);
+    wrap.appendChild(row);
+  }
 
   for (const [key, label] of [["flip_horizontal", "Flip horizontal"],
                               ["flip_vertical", "Flip vertical"]]) {
@@ -545,6 +584,7 @@ async function buildOrientationRows(camId) {
       try {
         const r = await jsend(`/api/orientation/${camId}`, { [key]: ev.target.checked });
         note(camId, `${label.toLowerCase()} = ${r[key]}` +
+                    (r.rebased ? ` — ${r.rebased}` : "") +
                     (r.warning ? ` — ${r.warning}` : ""), r.warning ? "err" : "ok");
         refreshSubaps(camId);
       } catch (e) {

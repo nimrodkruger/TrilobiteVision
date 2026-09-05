@@ -22,6 +22,7 @@ from .cameras.base import CameraSource
 from .cameras.registry import build_camera
 from .config import AppConfig, CameraConfig
 from .health import host_health
+from .optics.orientation import Orientation
 from .processing.pipeline import Pipeline
 from .state import StateStore
 from .storage.writer import SessionWriter
@@ -50,9 +51,21 @@ class RateMeter:
 class CameraRuntime:
     """A camera, its preview pipeline, its capture thread and its output slot."""
 
-    def __init__(self, cfg: CameraConfig, writer: SessionWriter) -> None:
+    def __init__(
+        self,
+        cfg: CameraConfig,
+        writer: SessionWriter,
+        process_fps: float | None = None,
+    ) -> None:
         self.cfg = cfg
         self.cam_id = cfg.cam_id
+        # How often the PIPELINE runs, which is not how often the sensor is
+        # read. See CameraConfig.process_fps: the per-camera setting wins, then
+        # the server's preview rate (the only rate anything consumes); 0 or
+        # None anywhere in that chain means "every frame", the old behaviour.
+        rate = cfg.process_fps if cfg.process_fps is not None else process_fps
+        self.process_interval = 1.0 / rate if rate and rate > 0 else 0.0
+        self.skipped = 0
         self.label = cfg.label or cfg.cam_id.replace("_", " ").title()
         self.source: CameraSource = build_camera(cfg)
         self.pipeline = Pipeline.from_config(cfg.pipeline)
@@ -79,7 +92,7 @@ class CameraRuntime:
         mla = self.mla_stage()
         if mla is not None:
             w, h = self.source.describe().full_resolution
-            mla.bind_sensor(int(w), int(h))
+            mla.bind_sensor(int(w), int(h), Orientation.of(self.cfg))
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._run, name=f"capture-{self.cam_id}", daemon=True
@@ -95,9 +108,39 @@ class CameraRuntime:
         log.info("%s: stopped", self.cam_id)
 
     def _run(self) -> None:
+        """Read, process, publish -- with the middle step rate-limited.
+
+        The sensor must be drained at its own rate: a picamera2 request left
+        unreleased starves a four-deep pool and stalls capture. The *pipeline*
+        need only run as often as something reads the result, which is the
+        browser at `server.preview_fps`. Running it on every frame instead --
+        stats, levels, the grid overlay and a ~3 ms presence map, twice over
+        for two cameras -- is 60 passes a second on four cores that also have
+        to encode JPEG and answer the web API, which is why editing a parameter
+        felt slow while the preview itself looked fine.
+
+        So a frame arriving early is released without being decoded, and the
+        count of those is reported in status(): if `skipped` is not roughly
+        (sensor fps - process fps) x uptime, the cap is not doing what it says.
+        """
         backoff = 0.1
+        due = 0.0
         while not self._stop.is_set():
             try:
+                if self.process_interval > 0:
+                    now = time.monotonic()
+                    if now < due:
+                        self.source.skip_preview()
+                        self.skipped += 1
+                        continue
+                    # Advance the deadline by exactly one interval rather than
+                    # restarting it from now. 12 Hz does not divide 30 Hz, so a
+                    # "now + interval" deadline always lands just after a frame
+                    # and quantises down to 10 Hz; accumulating instead makes
+                    # the gaps alternate 100/67 ms and the mean come out at the
+                    # rate that was asked for. `max` drops the arrears after a
+                    # stall, so recovery is not a burst.
+                    due = max(now, due + self.process_interval)
                 frame = self.source.read_preview()
                 if frame is None:
                     time.sleep(0.05)
@@ -206,7 +249,14 @@ class CameraRuntime:
             "label": self.label,
             "backend": self.cfg.backend,
             "open": self.source.is_open,
+            # `fps` is the PIPELINE rate, not the sensor rate: it is measured
+            # where the pipeline runs, so with a cap in place it should read
+            # close to process_fps while the sensor keeps running at cfg.fps.
             "fps": round(self.rate.fps, 2),
+            "process_fps": (round(1.0 / self.process_interval, 2)
+                            if self.process_interval > 0 else None),
+            "sensor_fps": float(self.cfg.fps),
+            "skipped": self.skipped,
             "frames": version,
             "errors": self.errors,
             "last_error": self.last_error,
@@ -244,6 +294,14 @@ class CameraRuntime:
         return {
             "pipeline": self.pipeline.settings_snapshot(),
             "controls": self.source.requested_controls(),
+            # Orientation belongs here as much as the controls do. It describes
+            # how the camera is bolted down, which does not change when the
+            # process restarts -- and leaving it out is worse than merely
+            # forgetting a setting: the saved pipeline carries the MLA
+            # alignment's `reference_rotate_deg`, so a restart would find a
+            # portrait-referenced grid on a camera the config says is
+            # landscape, rebase it back, and undo the turn silently.
+            "orientation": self.source.orientation,
         }
 
     def apply_state(self, state: dict[str, Any]) -> list[str]:
@@ -251,6 +309,30 @@ class CameraRuntime:
         anything that could not be applied, rather than raising -- a state file
         written before a config change must not stop the rig from starting."""
         notes: list[str] = []
+        # Orientation before the pipeline, for reading rather than for
+        # correctness: what actually matters is that both are in place before
+        # bind_sensor runs, and Application._restore_state calls that
+        # afterwards. What is NOT optional is that orientation is restored at
+        # all -- the saved pipeline carries the alignment's
+        # `reference_rotate_deg`, so without it a restart finds a
+        # portrait-referenced grid on a camera the config calls landscape,
+        # rebases it back, and undoes the turn with a warning that reads like
+        # the 728->1456 migration it is not.
+        orientation = state.get("orientation") or {}
+        if orientation:
+            try:
+                deg = int(orientation.get("rotate_deg", self.cfg.rotate_deg) or 0)
+                if deg in (0, 90, 180, 270):
+                    self.cfg.rotate_deg = deg
+                else:
+                    notes.append(f"{self.cam_id}: saved rotate_deg {deg} is not a "
+                                 f"quarter turn, ignored")
+                for key in ("flip_horizontal", "flip_vertical"):
+                    if key in orientation:
+                        setattr(self.cfg, key, bool(orientation[key]))
+            except (TypeError, ValueError) as exc:
+                notes.append(f"{self.cam_id}: orientation not restored ({exc})")
+
         for stage_name, values in (state.get("pipeline") or {}).items():
             values = {k: v for k, v in values.items() if k != "type"}
             try:
@@ -278,7 +360,8 @@ class Application:
         self.cfg = cfg
         self.writer = SessionWriter(cfg.storage, cfg.storage_root)
         self.cameras: dict[str, CameraRuntime] = {
-            c.cam_id: CameraRuntime(c, self.writer) for c in cfg.cameras
+            c.cam_id: CameraRuntime(c, self.writer, process_fps=cfg.server.preview_fps)
+            for c in cfg.cameras
         }
         self.started_at = time.time()
         # Declared before a session, frozen once one starts. Persisted with
@@ -492,7 +575,7 @@ class Application:
             mla = cam.mla_stage()
             if mla is not None and cam.source.is_open:
                 w, h = cam.source.describe().full_resolution
-                mla.bind_sensor(int(w), int(h))
+                mla.bind_sensor(int(w), int(h), Orientation.of(cam.cfg))
         if self.state:
             self.state.start_autosave()
 

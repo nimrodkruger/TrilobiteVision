@@ -93,6 +93,14 @@ class Capture:
     # Columns of raw row-stride padding removed on load. Non-zero means the
     # file was written before the capture path started trimming them.
     trimmed_padding: int = 0
+    # How the frame was turned and mirrored at ACQUISITION. Already applied to
+    # `image` and to the geometry above -- provenance, not a correction to
+    # undo. Recorded because it is the one thing you cannot recover by looking:
+    # a turned landscape sensor and a portrait one produce the same shaped
+    # array, and the difference decides whether the offsets have swapped axes.
+    rotate_deg: int = 0
+    flip_horizontal: bool = False
+    flip_vertical: bool = False
 
     @property
     def has_geometry(self) -> bool:
@@ -164,6 +172,36 @@ def _trim_stride(image: np.ndarray, meta: dict) -> tuple[np.ndarray, int]:
     return image, 0
 
 
+def _isotropic_scale(ref_w: int, ref_h: int, w: int, h: int, what: str) -> float:
+    """The single factor taking a ref_w x ref_h alignment onto a w x h frame.
+
+    Both axes, or nothing. A width-only ratio is correct exactly while the two
+    frames share an aspect ratio and quietly wrong the moment they do not --
+    and "do not" is not hypothetical here. A raw frame with its row-stride
+    padding still on is 2.022x the reference across and 2.000x down; a frame
+    from a camera turned a quarter turn since the alignment was made is
+    0.747x and 1.338x. Neither raises under a width ratio. Both produce a
+    plausible pitch, every crop between micro-images, and nothing ever
+    detected -- which from the outside looks exactly like an optics problem.
+    """
+    sx = w / float(ref_w)
+    sy = h / float(ref_h)
+    if abs(sx - sy) > 1e-6 * max(sx, sy):
+        turned = abs(w / float(ref_h) - h / float(ref_w)) < 1e-6 * max(sx, sy)
+        hint = (" The frame is the transpose of the reference, so the camera "
+                "was rotated a quarter turn after this alignment was made; "
+                "re-align, or re-record with the orientation it was made under."
+                if turned else
+                " If they differ by only a few columns it is raw row-stride "
+                "padding, and the capture path should be trimming it.")
+        raise SystemExit(
+            f"{what}: aligned on a {ref_w}x{ref_h} frame, capture is {w}x{h} "
+            f"(x{sx:.4f} across, x{sy:.4f} down). Pitch has no single value "
+            f"under an anisotropic rescale.{hint}"
+        )
+    return sx
+
+
 def load(npy_path: Path) -> Capture:
     path = Path(npy_path)
     if not path.exists():
@@ -177,6 +215,10 @@ def load(npy_path: Path) -> Capture:
     image, trimmed = _trim_stride(image, meta)
     cap = Capture(path=path, image=image, meta=meta, kind="bare")
     cap.trimmed_padding = trimmed
+    sensor = meta.get("sensor_metadata") or {}
+    cap.rotate_deg = int(sensor.get("rotate_deg") or 0)
+    cap.flip_horizontal = bool(sensor.get("flip_horizontal"))
+    cap.flip_vertical = bool(sensor.get("flip_vertical"))
     h, w = image.shape[:2]
 
     if "geometry" in meta:
@@ -192,7 +234,8 @@ def load(npy_path: Path) -> Capture:
         if g.get("width") and int(g["width"]) != w:
             print(f"warning: sidecar geometry is for {g['width']} px wide, this "
                   f"frame is {w} — rescaling", file=sys.stderr)
-            s = w / float(g["width"])
+            s = _isotropic_scale(int(g["width"]), int(g.get("height") or h), w, h,
+                                 what=f"{path.name} geometry")
             cap.pitch *= s
             cap.offset_x *= s
             cap.offset_y *= s
@@ -211,10 +254,13 @@ def load(npy_path: Path) -> Capture:
                     break
         if mla:
             ref_w = int(mla.get("reference_width") or 0)
-            scale = (w / ref_w) if ref_w else 1.0
+            ref_h = int(mla.get("reference_height") or 0) or h
+            scale = 1.0
             if ref_w and ref_w != w:
-                print(f"note: MLA parameters recorded against a {ref_w} px wide "
-                      f"frame, scaling by {scale:.3f} for this {w} px one")
+                scale = _isotropic_scale(ref_w, ref_h, w, h,
+                                         what=f"{path.name} pipeline.mla")
+                print(f"note: MLA parameters recorded against a {ref_w}x{ref_h} "
+                      f"frame, scaling by {scale:.3f} for this {w}x{h} one")
             cap.pitch = float(mla["pitch_px"]) * scale or None
             cap.rotation_deg = float(mla.get("rotation_deg", 0.0))
             cap.offset_x = float(mla.get("offset_x", 0.0)) * scale
@@ -258,6 +304,14 @@ def describe(cap: Capture) -> None:
              "SensorTimestamp") if k in sensor}
     if keep:
         print("sensor      : " + "  ".join(f"{k}={v}" for k, v in keep.items()))
+
+    if cap.rotate_deg or cap.flip_horizontal or cap.flip_vertical:
+        bits = [f"rotated {cap.rotate_deg}° CW"] if cap.rotate_deg else []
+        bits += [n for n, on in (("flipped horizontally", cap.flip_horizontal),
+                                 ("flipped vertically", cap.flip_vertical)) if on]
+        print("orientation : " + ", ".join(bits)
+              + "  <-- applied at capture; the pixels and the MLA numbers above "
+                "are already in this frame")
 
     if cap.has_geometry:
         print(f"MLA         : pitch {cap.pitch:.2f} px  rot {cap.rotation_deg:g}°  "

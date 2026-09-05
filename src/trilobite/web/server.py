@@ -42,6 +42,7 @@ from ..app import Application, CameraRuntime
 from ..calibration import CalibrationSettings
 from ..config import StageConfig
 from ..optics.mla import UI_SUBAPERTURES
+from ..optics.orientation import Orientation
 from ..processing.registry import catalogue
 from ..sinks.jpeg import encode_jpeg
 
@@ -333,33 +334,64 @@ def create_app(application: Application) -> FastAPI:
 
     @api.post("/api/orientation/{cam_id}")
     def write_orientation(cam_id: str, body: dict[str, Any]) -> dict[str, Any]:
-        """Mirror the sensor image, for the preview AND the saved data.
+        """Rotate and mirror the sensor image, for the preview AND the saved data.
 
         A separate endpoint from the sensor controls because it is neither a
         driver control nor a pipeline parameter: it is applied at acquisition,
         before either. See CameraSource._orient.
 
-        Changing this invalidates an MLA alignment -- the grid offsets are
-        measured from the frame centre and a flip negates the axis they run
-        along -- so the response says so and the caller is expected to pass it
-        on rather than swallow it.
+        A quarter turn swaps width and height, so the MLA grid's reference
+        frame has to move with it. That happens here rather than at the next
+        restart: `bind_sensor` is handed the new orientation and carries the
+        alignment across exactly -- offsets transformed, pitch untouched,
+        because a turn moves no lenslets. The response still says to re-check
+        by eye: the transform is exact, but "nothing else moved" is the
+        operator's claim to confirm, not this endpoint's.
         """
         cam = _cam(cam_id)
         changed = []
+        if "rotate_deg" in body:
+            try:
+                deg = int(body["rotate_deg"]) % 360
+            except (TypeError, ValueError):
+                raise HTTPException(422, "rotate_deg must be a whole number") from None
+            if deg not in (0, 90, 180, 270):
+                raise HTTPException(
+                    422,
+                    f"rotate_deg must be 0, 90, 180 or 270 (clockwise), not {deg}. "
+                    f"Anything else is a resample rather than a relabelling of "
+                    f"pixels, and would cost resolution on every frame.",
+                )
+            if deg != int(cam.cfg.rotate_deg):
+                cam.cfg.rotate_deg = deg
+                changed.append("rotate_deg")
         for key in ("flip_horizontal", "flip_vertical"):
             if key in body:
                 new_value = bool(body[key])
                 if new_value != bool(getattr(cam.cfg, key)):
                     setattr(cam.cfg, key, new_value)
                     changed.append(key)
+
         mla = cam.mla_stage()
         aligned = bool(mla is not None and mla.params.enabled)
+        rebased = ""
+        if changed and mla is not None and cam.source.is_open:
+            before = (float(mla.params.offset_x), float(mla.params.offset_y))
+            w, h = cam.source.describe().full_resolution
+            mla.bind_sensor(int(w), int(h), Orientation.of(cam.cfg))
+            rebased = (
+                f"grid rebased onto the {w}x{h} frame: offsets "
+                f"({before[0]:.1f}, {before[1]:.1f}) -> "
+                f"({mla.params.offset_x:.1f}, {mla.params.offset_y:.1f})"
+            )
         return {
             **cam.source.orientation,
             "changed": changed,
+            "rebased": rebased,
             "warning": (
-                "the MLA grid is aligned against the un-flipped image; "
-                "re-check pitch and offsets before calibrating"
+                "the MLA grid was aligned against a differently-oriented image; "
+                "its offsets have been carried across, but re-check the overlay "
+                "by eye before calibrating"
                 if changed and aligned else ""
             ),
         }

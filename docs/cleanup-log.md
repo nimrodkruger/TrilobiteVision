@@ -12,6 +12,137 @@ git checkout .              # everything back to HEAD
 
 ---
 
+## 2026-09-05 (l) — a quarter turn, a rate cap, and a line diagnostic
+
+Three requests, of which the first was much the largest because it was asked in
+the right way: *"the effect will trickle down the entire chain with width and
+height being swapped. If at any stage there is an assumption on width and
+height being non parametric, this we will be fixing many bugs in the future."*
+So the audit came before the code.
+
+### The audit, and what it found
+
+A read-only sweep of `src/`, `scripts/`, `matlab/` and `tests/` for places
+assuming a landscape frame. The framing finding was not any individual line:
+
+> `CameraInfo.full_resolution` and `preview_resolution` are echoed verbatim
+> from the config and never measured from a delivered array.
+
+Every consumer wants the post-rotation size, and every consumer was reading a
+figure that could not know about rotation. Nine call sites would have been
+**silently wrong** — no exception, a plausible number, and a grid landing
+between micro-images. The worst was `MLAGridOverlay.bind_sensor`, whose handler
+for an anisotropic rescale caught the `ValueError`, stamped the new frame size
+and left pitch and both offsets verbatim. A 1456×1088 alignment meeting a
+1088×1456 frame took exactly that path.
+
+### What was done instead of patching nine sites
+
+**One place decides the size.** `CameraSource.oriented_size()` is the only
+function that knows a quarter turn swaps the axes, and every backend's
+`describe()` runs its resolutions through it. The nine consumers then need no
+change at all, because they were already reading from `describe()`. The
+sensor-native size stays where it is genuinely needed and nowhere else: the
+stream configuration, and `_trim_stride`, which must see the buffer as the
+sensor delivers it — padding is on the right pre-rotation and along an edge
+cropping would not touch after, so trimming a turned frame would remove real
+image.
+
+**An alignment survives the turn.** A quarter turn moves no lenslets, so
+invalidating the grid would be wrong; but carrying it across needs to know
+*which way* it turned, and a swapped reference frame does not say. So
+`MLAParams` records the orientation an alignment was made under alongside the
+frame size, and `optics/orientation.py` computes the change as an element of
+D4 — offsets transform as the vector they are, the reference swaps on an odd
+turn, the lattice tilt negates under a reflection and is otherwise untouched
+because a square lattice cannot tell quarter turns apart, and pitch is
+invariant because every element of the group is an isometry. `bind_sensor`
+handles orientation *before* size, so the anisotropic path is now reached only
+by a genuine resample.
+
+**The two width-only ratios in `settings.py` are gone**, replaced by
+`geometry_for`, which checks both axes and raises. They were correct until the
+day the two frames stopped sharing an aspect ratio, which is the day this
+change arrives.
+
+`ReplaySource.describe()` now reports the size of the frame it last produced
+rather than the config's guess — the one backend where the config figure is not
+authoritative, since the files on disk have whatever size they have.
+
+### Verifying it rather than asserting it
+
+The rotation has two halves — the pixels, and the matrix that claims to say
+where they went — and the grid rebase trusts the second completely. Nothing
+else compares them, so a sign error in each would cancel in every other test.
+There is now one that follows a marked pixel through the real `_orient` and
+checks it against the matrix acting on its centred coordinates, for all sixteen
+settings. Mutation-tested; all four caught:
+
+| mutation | caught by |
+|---|---|
+| 90° and 270° matrices swapped | 3 tests |
+| mirrors applied before the rotation | the order test |
+| `quarter_turns` sign flipped | 4 tests |
+| matrix composed as `R·F` instead of `F·R` | the seam test, 4 orientations |
+
+End to end: a synthesised 90° capture reads 20/20 under Octave, and the tiles
+`tv_micro_images` extracts from it were compared pixel for pixel against
+`MLAGeometry.crop` in Python on the same file — **max difference 0**, with the
+tile centres agreeing to 1e-13 px.
+
+### The frame rate (request 2)
+
+The browser stream was **already** capped at 12 Hz; `server.preview_fps` has
+been 12 in `config/pi.yaml` throughout. What was not capped was the *pipeline*,
+which ran on every sensor frame: 30 Hz × two cameras × (stats, levels, overlay,
+~3 ms presence map) on four cores that also encode JPEG and answer the API. The
+web thread lost, and that is what "updating parameters lags" was.
+
+`CameraConfig.process_fps` (default: follow `server.preview_fps`) now gates the
+pipeline, and `CameraSource.skip_preview()` releases an early frame without
+decoding it — the sensor must still be drained at its own rate or the four-deep
+request pool starves, so the cap could not be applied by reading more slowly.
+`GET /api/status` reports `fps`, `sensor_fps` and `skipped`, so the cap can be
+seen working rather than assumed. The deadline accumulates rather than
+restarting from now: 12 does not divide 30, and a restarting deadline quantises
+down to 10 Hz.
+
+### The lines (request 3)
+
+`scripts/diagnose_lines.py`. The symptom has four causes that look identical on
+screen and want different responses, and changing the cable tests one of them.
+The measurement that separates the link from the sensor is that a dropped byte
+does not corrupt a row's values, it **moves** them — so a bad row still looks
+like the scene and simply sits a few pixels to one side. That is invisible to
+any measure of row brightness, obvious to a cross-correlation against the rows
+above and below, and something no sensor does.
+
+Two probes, because one is not enough: row *offset* finds noise and misses
+displacement (a displaced row has very nearly the right mean); row *roughness*
+finds displacement and misses offsets (each row's mean is removed first). A
+test asserts that the offset probe does **not** find the displaced rows, so the
+reason for having two cannot quietly stop being true.
+
+The verdict is ordered by how decisive the evidence is rather than by how
+common the cause is: kernel-counted CSI errors first, then a measured
+displacement, then a statistic about offsets — and a statement about offsets is
+only made when they are large enough to see.
+
+### Verification
+
+```
+pytest -q                  → 247 passed  (was 178)
+ruff check .               → clean
+octave tv_selftest         → 20/20 on a synthesised 90° capture
+```
+
+Nothing is committed. To undo any part: `git checkout -- <path>`. The new files
+are `src/trilobite/optics/orientation.py`, `scripts/diagnose_lines.py`,
+`tests/test_rotation.py` and `tests/test_line_artifacts.py`; deleting those four
+and reverting the rest leaves the tree as it was.
+
+---
+
 ## 2026-09-05 (k) — the second half of the raw buffer story
 
 Fixing the compressed format in (j) moved the symptom rather than removing it.

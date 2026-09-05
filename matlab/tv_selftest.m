@@ -68,8 +68,22 @@ function ok = tv_selftest(path)
           sprintf('range %d..%d', min(cap.image(:)), max(cap.image(:))));
   end
 
-  check('not transposed (wider than tall)', cap.width >= cap.height, ...
-        sprintf('%dx%d', cap.width, cap.height));
+  % The C-order/Fortran-order trap shows up as a transposed array, and on a
+  % landscape sensor "wider than tall" catches it. On a rig with the camera
+  % turned a quarter turn the frame is legitimately portrait, so the invariant
+  % has to be stated against the recorded orientation rather than against the
+  % shape alone -- otherwise this check fires on a correct file and, worse,
+  % would pass on a transposed one from a turned camera.
+  turned = mod(cap.orientation.rotate_deg / 90, 2) == 1;
+  if turned
+    check('portrait, as the recorded quarter turn requires', ...
+          cap.height >= cap.width, ...
+          sprintf('%dx%d with rotate_deg=%d', cap.width, cap.height, ...
+                  cap.orientation.rotate_deg));
+  else
+    check('not transposed (wider than tall)', cap.width >= cap.height, ...
+          sprintf('%dx%d', cap.width, cap.height));
+  end
 
   % -- the rescale is exact ---------------------------------------------
   if cap.has_mla

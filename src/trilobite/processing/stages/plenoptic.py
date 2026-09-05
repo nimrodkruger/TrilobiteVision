@@ -48,6 +48,8 @@ import numpy as np
 from pydantic import Field
 
 from ...optics.mla import UI_SUBAPERTURES, MLAGeometry
+from ...optics.orientation import Orientation
+from ...optics.orientation import rebase as orientation_rebase
 from ...types import Frame
 from ..base import Stage, StageParams
 from ..registry import register
@@ -120,6 +122,24 @@ class MLAParams(StageParams):
         0, ge=0, description="Sensor height these parameters are in (0 = not bound yet)",
         json_schema_extra={"widget": "hidden"},
     )
+    # ...and the ORIENTATION they are expressed in, for the same reason and
+    # recorded the same way. Without these three, a 1456x1088 reference meeting
+    # a 1088x1456 frame is indistinguishable from a sensor-mode change, and the
+    # only options left are to refuse or to keep numbers that are now wrong. A
+    # quarter turn does not move a single lenslet, so with them the alignment
+    # transfers exactly -- see optics/orientation.py.
+    reference_rotate_deg: int = Field(
+        0, ge=0, le=270, description="Frame rotation these parameters were aligned under",
+        json_schema_extra={"widget": "hidden"},
+    )
+    reference_flip_horizontal: bool = Field(
+        False, description="Horizontal mirror these parameters were aligned under",
+        json_schema_extra={"widget": "hidden"},
+    )
+    reference_flip_vertical: bool = Field(
+        False, description="Vertical mirror these parameters were aligned under",
+        json_schema_extra={"widget": "hidden"},
+    )
 
 
 @register("mla_grid_overlay")
@@ -184,41 +204,104 @@ class MLAGridOverlay(Stage):
         h = int(self.params.reference_height)
         return (w, h) if w > 0 and h > 0 else None
 
-    def bind_sensor(self, width: int, height: int) -> None:
+    @property
+    def reference_orientation(self) -> Orientation:
+        """The orientation the parameters were aligned under."""
+        return Orientation.reference_of(self.params)
+
+    def _stamp(self, width: int, height: int, orientation: Orientation) -> None:
+        """Record the frame these parameters are now expressed in."""
+        self.params.reference_width = int(width)
+        self.params.reference_height = int(height)
+        self.params.reference_rotate_deg = int(orientation.rotate_deg)
+        self.params.reference_flip_horizontal = bool(orientation.flip_horizontal)
+        self.params.reference_flip_vertical = bool(orientation.flip_vertical)
+
+    def bind_sensor(
+        self, width: int, height: int, orientation: Orientation | None = None
+    ) -> None:
         """Declare the sensor frame these parameters are expressed in.
 
-        Called ONCE, at camera start, with the camera's full resolution --
-        never from a frame flowing through the pipeline. That is the whole
-        difference between this and what it replaced: the old version took its
-        reference from whatever frame it first saw, which was always the
-        preview, so the stored pitch silently meant preview pixels and every
-        consumer needed a conversion it could forget.
+        Called ONCE, at camera start, with the camera's full resolution **after
+        orientation** -- never from a frame flowing through the pipeline. That
+        is the whole difference between this and what it replaced: the old
+        version took its reference from whatever frame it first saw, which was
+        always the preview, so the stored pitch silently meant preview pixels
+        and every consumer needed a conversion it could forget.
 
-        Three cases:
+        Four cases, in the order they are tried:
 
-          * not bound yet -- adopt the sensor size. First run, or a config
-            written before the parameters were sensor-native.
-          * already bound to this sensor -- nothing to do, the common case.
-          * bound to something else -- either an older alignment stored in
-            preview pixels, or a genuine sensor-mode change. **Rescale the
-            parameters** so the grid stays on the same physical lenslets, and
-            say so loudly. This is the migration path: a config carrying
-            `pitch_px: 50, reference_width: 728` becomes `pitch_px: 100,
-            reference_width: 1456` the first time it meets the camera, once.
+          * not bound yet -- adopt the sensor size and orientation. First run,
+            or a config written before the parameters were sensor-native.
+          * already bound to this frame and orientation -- the common case,
+            nothing to do.
+          * bound under a different ORIENTATION -- a quarter turn or a mirror.
+            Nothing physical has moved: the same lenslets are being labelled
+            differently, so the alignment carries across exactly. The offsets
+            are transformed, the reference size swaps if the turn was odd, and
+            pitch is untouched because every element of D4 is an isometry. See
+            optics/orientation.py for the arithmetic and its sign conventions.
+          * bound to a different SIZE -- an older alignment stored in preview
+            pixels, or a genuine sensor-mode change. **Rescale** so the grid
+            stays on the same physical lenslets, and say so loudly. This is the
+            migration path: `pitch_px: 50, reference_width: 728` becomes
+            `pitch_px: 100, reference_width: 1456` the first time it meets the
+            camera, once.
+
+        Orientation is handled before size deliberately. Taken the other way
+        round, a rotated frame reaches `rescaled` as a 1456x1088 reference
+        against a 1088x1456 frame, which is anisotropic, which raises -- and
+        the old handler for that swallowed the error, stamped the new size and
+        left pitch and both offsets verbatim. The grid then looked bound,
+        reported a plausible tile count, and put every crop in the wrong place.
+        Silent and confident is the worst of the available failures, so that
+        path now only survives for a genuinely anisotropic *resample*.
         """
+        now = orientation or self.reference_orientation
+        was = self.reference_orientation
         ref = self.reference_shape
+
+        if ref is None:
+            self._stamp(width, height, now)
+            return
+
+        if was != now:
+            r = orientation_rebase(
+                was, now,
+                offset_x=float(self.params.offset_x),
+                offset_y=float(self.params.offset_y),
+                rotation_deg=float(self.params.rotation_deg),
+                reference_width=ref[0],
+                reference_height=ref[1],
+            )
+            log.warning(
+                "%s: the frame orientation changed (rotate %d->%d, flip h %s->%s, "
+                "v %s->%s). Carrying the alignment across: offsets (%.2f, %.2f) -> "
+                "(%.2f, %.2f), lattice rotation %.3f -> %.3f deg, reference "
+                "%dx%d -> %dx%d. Pitch is unchanged -- a turn or a mirror moves no "
+                "lenslets. Re-check the grid by eye all the same.",
+                self.name, was.rotate_deg, now.rotate_deg,
+                was.flip_horizontal, now.flip_horizontal,
+                was.flip_vertical, now.flip_vertical,
+                self.params.offset_x, self.params.offset_y, r.offset_x, r.offset_y,
+                self.params.rotation_deg, r.rotation_deg,
+                ref[0], ref[1], r.reference_width, r.reference_height,
+            )
+            self.params.offset_x = r.offset_x
+            self.params.offset_y = r.offset_y
+            self.params.rotation_deg = r.rotation_deg
+            ref = (r.reference_width, r.reference_height)
+            self._stamp(*ref, now)
+            self.reset()
+
         if ref == (width, height):
             return
-        if ref is None:
-            self.params.reference_width = int(width)
-            self.params.reference_height = int(height)
-            return
+
         try:
             g = self.geometry(*ref).rescaled(width, height)
         except ValueError as exc:
             log.warning("%s: cannot rebase the grid onto the sensor frame: %s", self.name, exc)
-            self.params.reference_width = int(width)
-            self.params.reference_height = int(height)
+            self._stamp(width, height, now)
             return
         log.warning(
             "%s: rebasing the grid from a %dx%d reference onto the %dx%d sensor "
@@ -229,8 +312,7 @@ class MLAGridOverlay(Stage):
         self.params.pitch_px = g.pitch
         self.params.offset_x = g.offset_x
         self.params.offset_y = g.offset_y
-        self.params.reference_width = int(width)
-        self.params.reference_height = int(height)
+        self._stamp(width, height, now)
         self.reset()
 
     def geometry_for(self, width: int, height: int) -> MLAGeometry:

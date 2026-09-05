@@ -213,8 +213,11 @@ class SyntheticSource(CameraSource):
             cam_id=self.cam_id,
             model="synthetic",
             backend="synthetic",
-            full_resolution=self._full,
-            preview_resolution=self._prev,
+            # Post-rotation, like the real backend: the scene is rendered at
+            # the sensor-native size and turned by _orient, so what a consumer
+            # holds is the oriented size and that is what must be advertised.
+            full_resolution=self.oriented_size(self._full),
+            preview_resolution=self.oriented_size(self._prev),
             mono=True,
         )
 
@@ -307,6 +310,7 @@ class ReplaySource(CameraSource):
             raise ValueError(f"{cfg.cam_id}: replay backend requires source_dir")
         self._dir = Path(cfg.source_dir).expanduser()
         self._files: list[Path] = []
+        self._measured: tuple[int, int] | None = None
         self._idx = 0
         self._period = 1.0 / max(cfg.fps, 1e-3)
         self._last = 0.0
@@ -349,7 +353,13 @@ class ReplaySource(CameraSource):
         self._idx += 1
         data = self._load(path)
         space = "rgb8" if data.ndim == 3 else ("mono16" if data.dtype == np.uint16 else "mono8")
-        frame = Frame.now(data, self.cam_id, self._next_seq(), space=space, source_file=str(path))
+        # Oriented like any other source. Replayed files were usually written
+        # already oriented, so the config normally leaves this alone -- but if
+        # it does not, the frame and what describe() advertises have to agree.
+        data = self._orient(data)
+        self._measured = (int(data.shape[1]), int(data.shape[0]))
+        frame = Frame.now(data, self.cam_id, self._next_seq(), space=space,
+                          source_file=str(path), **self.orientation)
         if self.full_frame_pending:
             # Replay has one resolution, so the "full" frame is the same frame.
             self._serve_full_frame(self._to_mono(frame))
@@ -366,8 +376,18 @@ class ReplaySource(CameraSource):
             cam_id=self.cam_id,
             model=f"replay:{self._dir.name}",
             backend="replay",
-            full_resolution=tuple(self.cfg.full_resolution or (0, 0)),
-            preview_resolution=tuple(self.cfg.preview_resolution),
+            # MEASURED from the last frame actually produced, in preference to
+            # the config. Replay is the one backend where the config figure is
+            # a guess: the files on disk have whatever size they have, and a
+            # grid bound to a config number that the files contradict fails in
+            # the silent way -- every crop between micro-images, nothing ever
+            # detected. Falls back to the config before the first frame.
+            # `_measured` is taken after _orient, so it is already the oriented
+            # size; only the config fallbacks need turning.
+            full_resolution=(self._measured
+                             or self.oriented_size(self.cfg.full_resolution or (0, 0))),
+            preview_resolution=(self._measured
+                                or self.oriented_size(self.cfg.preview_resolution)),
             mono=True,
             detail={"files": str(len(self._files)), "dir": str(self._dir)},
         )

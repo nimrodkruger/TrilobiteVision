@@ -142,37 +142,88 @@ class CameraSource(ABC):
             return None
         return self.take_full_frame()
 
+    # -- orientation -----------------------------------------------------
+    #
+    # Rotation and mirroring are applied ONCE, here, at acquisition, before
+    # anything else sees the pixels -- so the preview, the saved raw, the
+    # sub-aperture crops and the recorded corners cannot disagree about which
+    # way round the image is. An orientation that lived in the display pipeline
+    # would turn what you look at and not what you measure, which is a
+    # difference nobody notices until the calibration is finished and mirrored.
+    #
+    # Order: rotate, THEN mirror. That makes the two flip checkboxes mean "flip
+    # the image I am looking at", which is the only reading an operator can
+    # verify by eye. The other order would make them mean "flip the sensor",
+    # and which screen axis that corresponds to would depend on the rotation.
+
+    @property
+    def quarter_turns(self) -> int:
+        """Rotation as a count of 90-degree steps for np.rot90 (0-3).
+
+        `rotate_deg` is clockwise on screen; np.rot90's positive direction on
+        an image whose rows run downward is counter-clockwise, so the sign
+        flips exactly here and nowhere else.
+        """
+        return (-int(getattr(self.cfg, "rotate_deg", 0) or 0) // 90) % 4
+
+    def oriented_size(self, size: tuple[int, int]) -> tuple[int, int]:
+        """(width, height) as delivered, given a sensor-native (width, height).
+
+        The one function that knows a quarter turn swaps the axes. Every
+        `describe()` runs its resolutions through this, which is what keeps the
+        MLA reference frame, the readiness arithmetic and the session manifest
+        from having to know about rotation at all.
+        """
+        w, h = int(size[0]), int(size[1])
+        return (h, w) if self.quarter_turns % 2 else (w, h)
+
     def _orient(self, data: np.ndarray) -> np.ndarray:
-        """Apply the configured mirroring. Every frame passes through here.
+        """Apply the configured rotation and mirroring. Every frame passes here.
 
-        Applied once, at acquisition, before anything else sees the pixels --
-        so the preview, the saved raw, the sub-aperture crops and the recorded
-        corners cannot disagree about which way round the image is. A flip that
-        lived in the display pipeline would have flipped what you look at and
-        not what you measure, which is a difference nobody notices until the
-        calibration is finished and mirrored.
-
-        np.flip returns a view with negative strides; the copy back to
-        contiguous is what makes it a real array again, and costs about
-        0.3 ms for a 1456x1088 uint8 frame.
+        np.rot90 and np.flip both return views with permuted or negative
+        strides; the copy back to contiguous is what makes the result a real
+        array again, and costs about 0.3 ms for a 1456x1088 uint8 frame (0.9 ms
+        for a quarter turn, which cannot be done by striding alone).
         """
         if data is None or data.ndim < 2:
             return data
+        turns = self.quarter_turns
+        if turns:
+            data = np.rot90(data, k=turns)
         if self.cfg.flip_horizontal:
             data = np.flip(data, axis=1)
         if self.cfg.flip_vertical:
             data = np.flip(data, axis=0)
-        if self.cfg.flip_horizontal or self.cfg.flip_vertical:
+        if turns or self.cfg.flip_horizontal or self.cfg.flip_vertical:
             return np.ascontiguousarray(data)
         return data
 
     @property
-    def orientation(self) -> dict[str, bool]:
-        """Recorded in every sidecar: a frame has to say which way round it is."""
+    def orientation(self) -> dict[str, Any]:
+        """Recorded in every sidecar: a frame has to say which way round it is.
+
+        `rotate_deg` is here as well as the flips because a reader holding a
+        portrait .npy cannot otherwise tell a rotated landscape sensor from a
+        portrait one, and the difference decides whether the recorded MLA
+        offsets need their axes swapped.
+        """
         return {
             "flip_horizontal": bool(self.cfg.flip_horizontal),
             "flip_vertical": bool(self.cfg.flip_vertical),
+            "rotate_deg": int(getattr(self.cfg, "rotate_deg", 0) or 0),
         }
+
+    def skip_preview(self) -> None:
+        """Consume one frame's worth of the source without processing it.
+
+        The capture loop calls this when the pipeline is already up to rate.
+        The frame still has to be taken -- a picamera2 request left unreleased
+        starves a four-deep pool and stalls the sensor -- but nothing needs to
+        be decoded, oriented or copied. The default is the honest slow version;
+        backends that can release a request without converting it override
+        this and save the copy.
+        """
+        self.read_preview()
 
     @staticmethod
     def _to_mono(frame: Frame) -> Frame:

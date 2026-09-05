@@ -229,6 +229,27 @@ class Picamera2Source(CameraSource):
         return Frame.now(self._orient(luma), self.cam_id, seq, space="mono8",
                          **self.orientation, **meta)
 
+    def skip_preview(self) -> None:
+        """Take a request and release it, decoding nothing.
+
+        The pool has to be drained at sensor rate whatever the pipeline is
+        doing, but `make_array` on the lores plane is a copy and the orient is
+        another, and neither is wanted for a frame that is about to be thrown
+        away. Metadata is still kept: auto-exposure state should not go stale
+        just because the pipeline is running slower than the sensor.
+        """
+        if not self._open:
+            return
+        if self.full_frame_pending:
+            # Somebody is waiting on this exposure. Take the slow path.
+            self.read_preview()
+            return
+        with self._lock:
+            request = self._picam.capture_request()
+            try:
+                self._last_meta = dict(request.get_metadata())
+            finally:
+                request.release()
 
     def capture_full(self, raw: bool = True) -> Frame:
         if not self._open:
@@ -271,9 +292,12 @@ class Picamera2Source(CameraSource):
         meta["raw_format"] = self._raw_format_name()
         meta["raw_format_choice"] = getattr(self, "_raw_choice", "unknown")
         if raw:
-            # Trim BEFORE orienting. The stride padding is on the right of the
-            # buffer as it comes off the sensor; flip first and it would be on
-            # the left, and cropping the right would then remove real image.
+            # Trim BEFORE orienting, and this order is load-bearing. The stride
+            # padding is on the right of the buffer as it comes off the sensor;
+            # flip first and it would be on the left, rotate first and it would
+            # be along the bottom -- and cropping the right would then remove
+            # real image. So padding is removed against the NATIVE sensor width
+            # and the frame is turned afterwards.
             data, pad = self._trim_stride(data)
             meta.update(pad)
         meta.update(self.orientation)
@@ -399,7 +423,11 @@ class Picamera2Source(CameraSource):
         if data.ndim < 2:
             return data, {}
         h, w = data.shape[:2]
-        note: dict[str, Any] = {"image_width": int(full_w), "image_height": int(full_h)}
+        # image_* describes the frame the caller will end up holding, so it is
+        # the post-rotation size; the raw_* keys below stay in the sensor's own
+        # terms, because that is the frame the padding lives in.
+        out_w, out_h = self.oriented_size((full_w, full_h))
+        note: dict[str, Any] = {"image_width": int(out_w), "image_height": int(out_h)}
 
         if w == full_w and h == full_h:
             return data, note
@@ -455,8 +483,13 @@ class Picamera2Source(CameraSource):
             cam_id=self.cam_id,
             model=str(self._info.get("Model", "unknown")),
             backend="picamera2",
-            full_resolution=self._full_res,
-            preview_resolution=tuple(self.cfg.preview_resolution),
+            # POST-rotation, deliberately. `self._full_res` is what the sensor
+            # delivers and is what the stream is configured with; this is what
+            # every consumer of a frame is actually holding. A quarter turn
+            # makes them different, and the MLA reference frame, the readiness
+            # checks and the session manifest all read from here.
+            full_resolution=self.oriented_size(self._full_res),
+            preview_resolution=self.oriented_size(tuple(self.cfg.preview_resolution)),
             mono=self._mono,
             detail={
                 **{k: str(v) for k, v in self._info.items()},

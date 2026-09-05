@@ -70,6 +70,43 @@ class CameraConfig(BaseModel):
     flip_horizontal: bool = False
     flip_vertical: bool = False
 
+    # Quarter-turn rotation of the whole frame, CLOCKWISE as you look at the
+    # image, applied at acquisition BEFORE the two mirrors above -- so the
+    # mirrors mean "flip what I am looking at", not "flip the sensor".
+    #
+    # 90 and 270 SWAP WIDTH AND HEIGHT, and that swap is the whole reason this
+    # is a camera setting rather than a display one. Everything downstream --
+    # the MLA reference frame, the readiness arithmetic, the session manifest,
+    # the .npy on disk -- takes its geometry from CameraInfo.full_resolution
+    # and CameraInfo.preview_resolution, and those report the size AFTER this
+    # rotation. `describe()` is the single place the post-rotation size is
+    # decided; nothing else may assume a landscape frame.
+    #
+    # The raw stride trim is the one thing that must NOT see the rotation: row
+    # padding is a property of the buffer as the sensor delivers it, so it is
+    # removed against the native sensor width first and the frame is turned
+    # afterwards. See PiCamera2Source._trim_stride.
+    #
+    # Like the mirrors, changing this invalidates an MLA alignment: pitch is
+    # unchanged by a quarter turn but the offsets swap axes and one changes
+    # sign.
+    rotate_deg: Literal[0, 90, 180, 270] = 0
+
+    # Frames per second the preview PIPELINE runs at. Not the sensor rate, and
+    # not the browser rate.
+    #
+    # The sensor is drained at `fps` because it must be -- an unreleased
+    # request starves the pool -- but running stats, levels, the grid overlay
+    # and the presence map on every one of those frames, twice over for two
+    # cameras, is what makes parameter edits feel slow: the web thread competes
+    # with 60 pipeline passes a second for the same cores. Frames arriving
+    # faster than this are released without being decoded or processed.
+    #
+    # null means "match server.preview_fps", which is the only rate anything
+    # actually consumes. Raise it only if something other than the browser
+    # starts reading the preview bus.
+    process_fps: float | None = None
+
     # Force a specific raw stream format, e.g. "R10" or "R12".
     #
     # Leave null and libcamera picks for you -- on a Pi 5 that is

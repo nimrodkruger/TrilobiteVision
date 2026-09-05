@@ -26,9 +26,26 @@ cameras:
     label: Left camera
     backend: picamera2
     index: 0
-    full_resolution: [1456, 1088]     # IMX296 native
+    full_resolution: [1456, 1088]     # IMX296 native, BEFORE any rotation
     preview_resolution: [728, 544]
-    fps: 30
+    fps: 30                           # what the SENSOR produces
+    # Orientation, applied at acquisition to the preview AND to every saved
+    # frame. rotate_deg is clockwise on screen, 0/90/180/270 only, and is
+    # applied before the two mirrors, so the mirrors always mean "flip what I
+    # see". 90 and 270 swap width and height everywhere downstream; the sizes
+    # above stay sensor-native and describe() reports the turned ones. An MLA
+    # alignment is carried across a change here rather than invalidated -- a
+    # turn moves no lenslets -- but re-check the overlay by eye.
+    rotate_deg: 0
+    flip_horizontal: false
+    flip_vertical: false
+    # How often the PIPELINE runs. null follows server.preview_fps (12 here),
+    # which is the only rate anything consumes. The sensor is still drained at
+    # `fps` -- it has to be, or the request pool starves -- but stats, levels,
+    # the overlay and the ~3 ms presence map are not run on every one of those
+    # frames. 0 processes all of them, which is what made parameter edits feel
+    # a second late.
+    process_fps: null
     controls:
       # Fixed exposure and gain. Auto-exposure makes frames incomparable,
       # which defeats the purpose of a calibration rig.
@@ -71,9 +88,26 @@ cameras:
     label: Right camera
     backend: picamera2
     index: 1
-    full_resolution: [1456, 1088]
+    full_resolution: [1456, 1088]     # IMX296 native, BEFORE any rotation
     preview_resolution: [728, 544]
-    fps: 30
+    fps: 30                           # what the SENSOR produces
+    # Orientation, applied at acquisition to the preview AND to every saved
+    # frame. rotate_deg is clockwise on screen, 0/90/180/270 only, and is
+    # applied before the two mirrors, so the mirrors always mean "flip what I
+    # see". 90 and 270 swap width and height everywhere downstream; the sizes
+    # above stay sensor-native and describe() reports the turned ones. An MLA
+    # alignment is carried across a change here rather than invalidated -- a
+    # turn moves no lenslets -- but re-check the overlay by eye.
+    rotate_deg: 0
+    flip_horizontal: false
+    flip_vertical: false
+    # How often the PIPELINE runs. null follows server.preview_fps (12 here),
+    # which is the only rate anything consumes. The sensor is still drained at
+    # `fps` -- it has to be, or the request pool starves -- but stats, levels,
+    # the overlay and the ~3 ms presence map are not run on every one of those
+    # frames. 0 processes all of them, which is what made parameter edits feel
+    # a second late.
+    process_fps: null
     controls:
       AeEnable: false
       ExposureTime: 8000

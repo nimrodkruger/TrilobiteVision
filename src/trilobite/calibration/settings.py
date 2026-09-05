@@ -357,6 +357,29 @@ MAX_SANE_TILES = 1200
 MIN_PREVIEW_TILE_PX = 24.0
 
 
+def _pitch_in(stage: Any, size: tuple[int, int], fallback: float) -> float:
+    """Micro-image pitch expressed in a frame of `size`, both axes checked.
+
+    The readiness checks kept doing this by hand as `pitch * width / ref_width`,
+    which is correct exactly while the two frames share an aspect ratio and
+    quietly wrong the moment they do not -- and "do not" is not hypothetical:
+    a raw frame with its row-stride padding still on is 2.022x the reference
+    horizontally and 2.000x vertically, and a width-only ratio reports a
+    plausible pitch for it instead of refusing.
+
+    `geometry_for` is the one conversion that checks both axes and raises, so
+    it is the one used. The fallback is the unconverted pitch, which is right
+    when there is no geometry to convert (no stage, or a degenerate reference)
+    and is in any case only ever used to phrase a message.
+    """
+    if stage is None:
+        return fallback
+    try:
+        return float(stage.geometry_for(int(size[0]), int(size[1])).pitch)
+    except (ValueError, ZeroDivisionError, AttributeError):
+        return fallback
+
+
 def _preview_resolution(cam: Any) -> tuple[int, int] | None:
     """(width, height) of the stream the MLA parameters were set against.
 
@@ -588,8 +611,12 @@ def readiness_report(
         # too small is noise about a feature it is not using.
         if presence is not None and presence.params.enabled:
             prev = _preview_resolution(cam) or (full_w, full_h)
-            prev_pitch = float(p.pitch_px) * (
-                prev[0] / ref[0] if ref[0] else 1.0)
+            # Through geometry_for, not a width ratio. A width-only scaling is
+            # right until the day the two frames stop sharing an aspect ratio,
+            # and then it silently reports a plausible number instead of
+            # refusing -- which is exactly how raw stride padding hid for a
+            # session. geometry_for checks both axes and raises.
+            prev_pitch = _pitch_in(stage, prev, fallback=float(p.pitch_px))
             ok_res = prev_pitch >= MIN_PREVIEW_TILE_PX
             checks.append(Check(
                 id=f"{cid}.preview_resolves", ok=ok_res, blocking=True,
@@ -637,10 +664,12 @@ def readiness_report(
         # detection runs -- see MLAGridOverlay.geometry_for.
         if settings is not None:
             full_w, full_h = _full_resolution(cam)
-            ref = (getattr(stage, "reference_shape", None)
-               or _preview_resolution(cam) or (full_w, full_h))
-            factor = (full_w / ref[0]) if ref[0] else 1.0
-            tile_px = float(p.pitch_px) * factor * scale
+            # Same reasoning as the preview check above: both axes, or nothing.
+            # `det_geom` is this exact conversion and is usually already in
+            # hand, so reuse it and only recompute if that attempt failed.
+            tile_px = (det_geom.pitch if det_geom is not None
+                       else _pitch_in(stage, (full_w, full_h),
+                                      fallback=float(p.pitch_px))) * scale
             derived = DerivedOptics.compute(settings.optics, settings.board, tile_px)
             need_w = (settings.board.cols + 1) * derived.square_px
             need_h = (settings.board.rows + 1) * derived.square_px

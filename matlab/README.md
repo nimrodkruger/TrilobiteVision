@@ -103,6 +103,22 @@ against the Python extractor on the same file (mean difference 83.7 of 255).
 `tv_selftest` now pins it with a coordinate-ramp assertion that has a known
 closed form.
 
+## Orientation
+
+`cap.orientation` carries `.rotate_deg` (clockwise), `.flip_horizontal` and
+`.flip_vertical` as the rig recorded them. All three were applied at
+acquisition, before anything else touched the pixels, so `cap.image`,
+`cap.mla` and `grid.centres` are already in the turned frame. They are
+provenance, not a correction to apply — do not undo them.
+
+They are recorded because they are the one thing you cannot recover by looking.
+A landscape sensor turned a quarter turn and a portrait sensor produce the same
+shaped array, and the difference decides whether the recorded MLA offsets have
+had their axes swapped. `tv_selftest` reads `rotate_deg` for exactly this: its
+"not transposed" check is `width >= height` on an unturned rig and
+`height >= width` on a turned one, and without the recorded angle it would fire
+on a correct file and pass on a transposed one.
+
 ## Coordinates
 
 `.mla` and `grid.centres` are in the **Python convention**: pixel centres at
@@ -114,7 +130,12 @@ inside `tv_micro_images`, and nowhere else.
 
 ## Verification
 
-`tv_selftest` passes 19 of 19 on both cameras of a real capture pair, including
+`tv_selftest` passes 20 of 20 on a capture from a camera turned 90° clockwise
+(1088 × 1456, 2° lattice rotation), where the extracted tiles were also compared
+pixel for pixel against `MLAGeometry.crop` in Python on the same file: **max
+difference 0**, and the tile centres agree to 1e-13 px.
+
+It passes 19 of 19 on both cameras of a real capture pair, including
 the rotated one (2°, crop scale 0.9), and 20 of 20 on a stride-padded frame
 (the extra check is the padding), and 22 of 22 on a 10-bit R10 buffer
 delivered as 2944-wide uint8 — where the values are recovered exactly, verified

@@ -18,6 +18,10 @@ function cap = tv_read_capture(path)
 %     .info         the whole sidecar, unmodified
 %     .has_mla      true if an MLA grid stage was present AND enabled
 %     .mla          the grid geometry, RESCALED TO THIS FRAME (see below)
+%     .orientation  how the frame was turned/mirrored at acquisition:
+%                   .rotate_deg (clockwise), .flip_horizontal, .flip_vertical.
+%                   Already applied to .image and to .mla -- provenance, not a
+%                   correction to undo.
 %     .files        the paths it read
 %
 %     .trimmed_padding  columns of raw row-stride padding removed on load
@@ -113,6 +117,19 @@ function cap = tv_read_capture(path)
   cap.sensor   = i_get(info, 'sensor_metadata', struct());
   cap.pipeline = i_get(info, 'pipeline', struct());
   cap.camera   = i_get(info, 'camera', struct());
+
+  % How the frame was turned and mirrored at acquisition. Lifted out of the
+  % sensor metadata because it is the one thing you cannot recover by looking:
+  % a turned landscape sensor and a portrait one give the same shaped array,
+  % and the difference decides whether the recorded MLA offsets have had their
+  % axes swapped. The rig applies this BEFORE anything else touches the pixels,
+  % so .image, .mla and grid.centres are all already in the turned frame and
+  % nothing here needs to undo it -- these fields are provenance, not a
+  % correction to apply.
+  cap.orientation = struct( ...
+      'rotate_deg',      double(i_get(cap.sensor, 'rotate_deg', 0)), ...
+      'flip_horizontal', logical(i_get(cap.sensor, 'flip_horizontal', false)), ...
+      'flip_vertical',   logical(i_get(cap.sensor, 'flip_vertical', false)));
 
   [cap.mla, cap.has_mla] = i_geometry(cap.pipeline, cap.width, cap.height);
 end
