@@ -97,6 +97,20 @@
   .row.auto > label::after { content:" (auto)"; color:var(--warn); }
   .row input[type=checkbox] { accent-color:var(--accent); justify-self:start;
                               width:15px; height:15px; }
+  /* Dropdowns were unstyled, which on this dark theme meant a native control
+     rendering light-on-light -- present in the DOM and effectively invisible.
+     `color-scheme:dark` is what makes the browser draw its own widget dark;
+     the rest matches the number boxes beside it. */
+  .row select { width:100%; background:var(--bg); color:var(--ink); color-scheme:dark;
+        border:1px solid var(--line); border-radius:4px; padding:3px 5px;
+        font-size:11px; font-family:inherit; }
+  .row select:focus { outline:1px solid var(--accent); border-color:var(--accent); }
+  /* A setup control that is settled for the rest of the session. Greyed, not
+     hidden: the operator should be able to see that the decision exists and
+     that it has been made. */
+  .row.locked > label { opacity:.55; }
+  .row.locked > label::after { content:" 🔒"; opacity:.7; }
+  .row select:disabled, .row input:disabled { opacity:.45; cursor:not-allowed; }
   .empty { color:var(--muted); font-size:11px; padding:4px 0; }
 
   /* --- mode switch ------------------------------------------------------ */
@@ -158,7 +172,23 @@
   .frozen { font-size:11px; color:var(--muted); font-family:ui-monospace,monospace;
             line-height:1.6; }
 
-  /* --- storage devices --------------------------------------------------- */
+  /* --- storage devices ---------------------------------------------------
+     Collapsed by default, and collapsed it is a full-width strip rather than a
+     column: the device list is something you touch once, when a disk goes in,
+     and for the rest of the session it costs a whole camera-sized column of a
+     two-column layout. The strip keeps the one fact that matters visible --
+     where output is going, and how much room is left. */
+  .cam.strip { grid-column:1 / -1; grid-template-rows:auto; }
+  .cam.strip > .controls { display:none; }
+  .cam.strip .viewport { border-bottom:0; }
+  #storage-card .viewport h2 { cursor:pointer; }
+  #storage-card .chev { color:var(--muted); font-size:10px; width:10px; }
+  /* A removable disk is present that is not the one being written to. This is
+     the moment the panel exists for, so the collapsed strip says so instead of
+     waiting to be opened. */
+  #storage-card.attention .viewport h2 .ttl { color:var(--accent); }
+  #storage-card.attention .chev { color:var(--accent); }
+
   .dev { border:1px solid var(--line); border-radius:7px; background:var(--bg);
          padding:7px 9px; margin:6px 0; display:grid; gap:5px; }
   .dev.active { border-color:var(--accent); }
@@ -252,6 +282,13 @@
   <span class="meta" id="health"></span>
   <span class="meta" id="health-warn" hidden
         style="color:var(--err);font-weight:650"></span>
+  <!-- Substituted by the server from a hash of this file on disk. Deployment
+       is `git pull` with the browser left open, and a cached page missing
+       controls the server already has is indistinguishable from a broken
+       feature. This is how the page notices. -->
+  <span class="meta" id="stale" hidden
+        style="color:var(--warn);font-weight:650;cursor:pointer"
+        title="Click to reload">⟳ page is out of date — reload</span>
   <span class="spacer"></span>
   <span class="modes">
     <button id="mode-live" class="on">Imaging</button>
@@ -523,79 +560,105 @@ async function buildSensorPanel(camId) {
 /* Rotation and mirroring. Deliberately in the Sensor panel rather than the
    pipeline: they are applied at ACQUISITION, so they affect the saved raw data
    and the calibration corners, not only what you are looking at. An
-   orientation that changed the preview and not the file would be a trap. */
+   orientation that changed the preview and not the file would be a trap.
+
+   These are SETUP controls. The calibration they precede assumes a fixed
+   frame, so they lock as soon as the MLA grid is enabled, and the whole group
+   is re-rendered whenever that changes -- see refreshOrientation. Greying them
+   out rather than hiding them is the point: the operator can see the decision
+   exists, see that it is settled, and read why from the tooltip. */
+const ORIENT_HOSTS = {};
+
 async function buildOrientationRows(camId) {
   const wrap = document.createElement("div");
-  let state = { flip_horizontal: false, flip_vertical: false, rotate_deg: 0 };
-  try { state = await jget(`/api/orientation/${camId}`); } catch { /* backend without it */ }
+  ORIENT_HOSTS[camId] = wrap;
+  await renderOrientation(camId);
+  return wrap;
+}
+
+/* Called after any change to the MLA stage's `enabled`, because that is what
+   the lock hangs off. Cheap: three rows and one GET. */
+async function refreshOrientation(camId) {
+  if (ORIENT_HOSTS[camId]) await renderOrientation(camId);
+}
+
+async function renderOrientation(camId) {
+  const wrap = ORIENT_HOSTS[camId];
+  let s = { flip_horizontal: false, flip_vertical: false, rotate_deg: 0,
+            locked: false, lock_reason: "" };
+  try { s = await jget(`/api/orientation/${camId}`); } catch { /* older backend */ }
+  wrap.innerHTML = "";
+
+  const why = s.locked
+    ? "Locked: " + s.lock_reason
+    : "Applied at acquisition, to the preview AND to every saved frame. " +
+      "Set it before aligning the MLA grid — turning it on locks these, and " +
+      "changing them beforehand resets the alignment (pitch is kept).";
 
   /* Rotation first in the panel because it is applied first: the two flips
      below mirror the image as you see it AFTER the turn. A quarter turn swaps
-     width and height everywhere downstream, so this is a restart-grade change
-     wearing a dropdown -- the note it prints says what became of the grid. */
-  {
-    const row = document.createElement("div");
-    row.className = "row";
-    const name = document.createElement("label");
-    name.textContent = "Rotate";
-    name.title = "Clockwise, applied at acquisition to the preview AND to every " +
-                 "saved frame. 90 and 270 swap width and height. The MLA grid " +
-                 "offsets are carried across automatically; pitch does not change.";
-    const sel = document.createElement("select");
-    for (const [v, text] of [[0, "0°"], [90, "90° CW"], [180, "180°"], [270, "270° CW"]]) {
-      const o = document.createElement("option");
-      o.value = String(v);
-      o.textContent = text;
-      o.selected = Number(state.rotate_deg || 0) === v;
-      sel.appendChild(o);
-    }
-    let previous = Number(state.rotate_deg || 0);
-    sel.onchange = async ev => {
-      ev.target.blur();
-      try {
-        const r = await jsend(`/api/orientation/${camId}`, { rotate_deg: Number(ev.target.value) });
-        previous = Number(r.rotate_deg);
-        note(camId, `rotate = ${r.rotate_deg}° CW` +
-                    (r.rebased ? ` — ${r.rebased}` : "") +
-                    (r.warning ? ` — ${r.warning}` : ""), r.warning ? "err" : "ok");
-        refreshSubaps(camId);
-      } catch (e) {
-        ev.target.value = String(previous);
-        note(camId, `rotate: ${e.message}`, "err");
-      }
-    };
-    row.append(name, sel);
-    wrap.appendChild(row);
+     width and height for everything downstream. */
+  const rotRow = document.createElement("div");
+  rotRow.className = "row" + (s.locked ? " locked" : "");
+  const rotName = document.createElement("label");
+  rotName.textContent = "Rotate";
+  rotName.title = why;
+  const sel = document.createElement("select");
+  sel.disabled = !!s.locked;
+  sel.title = why;
+  for (const [v, text] of [[0, "0°"], [90, "90° CW"], [180, "180°"], [270, "270° CW"]]) {
+    const o = document.createElement("option");
+    o.value = String(v);
+    o.textContent = text;
+    o.selected = Number(s.rotate_deg || 0) === v;
+    sel.appendChild(o);
   }
+  sel.onchange = ev => sendOrientation(camId, { rotate_deg: Number(ev.target.value) },
+                                       `rotate = ${ev.target.value}° CW`);
+  rotRow.append(rotName, sel);
+  wrap.appendChild(rotRow);
 
   for (const [key, label] of [["flip_horizontal", "Flip horizontal"],
                               ["flip_vertical", "Flip vertical"]]) {
     const row = document.createElement("div");
-    row.className = "row";
+    row.className = "row" + (s.locked ? " locked" : "");
     const name = document.createElement("label");
     name.textContent = label;
-    name.title = "Applied to the preview AND to every saved frame. " +
-                 "Changing it after aligning the MLA grid invalidates the alignment.";
+    name.title = why;
     const box = document.createElement("input");
     box.type = "checkbox";
-    box.checked = !!state[key];
-    box.onchange = async ev => {
-      ev.target.blur();
-      try {
-        const r = await jsend(`/api/orientation/${camId}`, { [key]: ev.target.checked });
-        note(camId, `${label.toLowerCase()} = ${r[key]}` +
-                    (r.rebased ? ` — ${r.rebased}` : "") +
-                    (r.warning ? ` — ${r.warning}` : ""), r.warning ? "err" : "ok");
-        refreshSubaps(camId);
-      } catch (e) {
-        ev.target.checked = !ev.target.checked;
-        note(camId, `${label}: ${e.message}`, "err");
-      }
-    };
+    box.checked = !!s[key];
+    box.disabled = !!s.locked;
+    box.title = why;
+    box.onchange = ev => sendOrientation(camId, { [key]: ev.target.checked },
+                                         `${label.toLowerCase()} = ${ev.target.checked}`);
     row.append(name, box);
     wrap.appendChild(row);
   }
-  return wrap;
+
+  if (s.locked) {
+    const hint = document.createElement("div");
+    hint.className = "empty";
+    hint.textContent = "Orientation locked while the MLA grid is on.";
+    wrap.appendChild(hint);
+  }
+}
+
+/* One writer for all three controls, so success and failure are handled the
+   same way. On any outcome the group is re-rendered from the server rather
+   than patched in place: the server may have reset the grid, and a control
+   that reverts itself from a local guess is how a UI comes to disagree with
+   the rig. */
+async function sendOrientation(camId, body, said) {
+  try {
+    const r = await jsend(`/api/orientation/${camId}`, body);
+    note(camId, said + (r.rebased ? ` — ${r.rebased}` : ""), "ok");
+    refreshSubaps(camId);
+    refreshPipeline(camId);
+  } catch (e) {
+    note(camId, `orientation: ${e.message}`, "err");
+  }
+  await renderOrientation(camId);
 }
 
 async function buildPipelinePanels(camId, host) {
@@ -607,7 +670,13 @@ async function buildPipelinePanels(camId, host) {
       try {
         const got = await jsend(`/api/pipeline/${camId}/${st.name}`, { values: { [key]: v } });
         note(camId, `${st.name}.${key} = ${got[key]}`, "ok");
-        if (st.type === "mla_grid_overlay") refreshSubaps(camId);
+        if (st.type === "mla_grid_overlay") {
+          refreshSubaps(camId);
+          // Enabling the grid locks the orientation, disabling it unlocks it.
+          // The lock lives on the server; this is what makes the page agree
+          // with it without a reload.
+          if (key === "enabled") refreshOrientation(camId);
+        }
         return got[key];
       } catch (e) {
         note(camId, `${st.name}.${key}: ${e.message}`, "err");
@@ -627,6 +696,21 @@ async function buildPipelinePanels(camId, host) {
     panel.dataset.cam = camId;
     host.appendChild(panel);
   }
+}
+
+/* Rebuild one camera's stage panels from the server.
+
+   Needed because the server can change pipeline parameters on its own: a
+   change of orientation resets the grid's offsets and lattice rotation, and a
+   page still showing the old numbers is a page that will write them back the
+   next time anything is nudged. Rebuilding rather than patching keeps this to
+   one code path -- the same one that built the panels in the first place. */
+async function refreshPipeline(camId) {
+  const existing = [...document.querySelectorAll(`.panel[data-cam="${camId}"]`)];
+  if (!existing.length) return;
+  const host = existing[0].parentElement;
+  for (const p of existing) p.remove();
+  await buildPipelinePanels(camId, host);
 }
 
 async function refreshSubaps(camId) {
@@ -778,24 +862,80 @@ function renderStorage(s) {
 
   host.innerHTML = "";
   host.appendChild(el);
+  renderStorageStrip(s);
+}
+
+/* What the collapsed strip says. It has one job: make it unnecessary to open
+   the panel unless something needs doing. So it carries where output is going
+   and how much room is left, and it turns accent-coloured when a removable
+   disk is present that is not the one being written to -- the one moment the
+   panel exists for. */
+function renderStorageStrip(s) {
+  const card = $("#storage-card");
+  const stat = $("#storage-stat");
+  if (!card || !stat || !s) return;
+  const a = s.active;
+  const waiting = (s.devices || []).filter(d => d.removable && !d.active);
+  const unmounted = waiting.filter(d => !d.mounted).length;
+
+  card.classList.toggle("attention", waiting.length > 0 || a.present === false);
+  const bits = [];
+  if (a.present === false) bits.push("⚠ OUTPUT DEVICE MISSING");
+  bits.push(`${a.removable ? "external" : "internal"} · ${gb(a.free_bytes)} free`);
+  if (waiting.length) {
+    bits.push(unmounted
+      ? `${waiting.length} disk${waiting.length > 1 ? "s" : ""} attached, `
+        + `${unmounted} not mounted — open to mount`
+      : `${waiting.length} other disk${waiting.length > 1 ? "s" : ""} — open to switch`);
+  }
+  stat.textContent = bits.join("   ");
+  stat.style.color = a.present === false ? "var(--err)"
+                   : waiting.length ? "var(--accent)" : "";
+  const sub = card.querySelector(".viewport .sub");
+  if (sub) sub.textContent = a.session_dir || "output device";
 }
 
 async function refreshStorage() {
   try { renderStorage(await jget("/api/storage")); } catch { /* transient */ }
 }
 
+/* Collapsed unless the operator says otherwise, and the choice is remembered
+   per browser. localStorage and not the server: which panels one person has
+   open on one screen is not rig state, and syncing it between two browsers
+   looking at the same Pi would be worse than not remembering at all. Wrapped
+   because a private window can make the accessor itself throw. */
+const STORAGE_OPEN_KEY = "tv.storage.open";
+function storageOpen() {
+  try { return localStorage.getItem(STORAGE_OPEN_KEY) === "1"; } catch { return false; }
+}
+function setStorageOpen(open) {
+  try { localStorage.setItem(STORAGE_OPEN_KEY, open ? "1" : "0"); } catch { /* fine */ }
+}
+
 function buildStorageCard() {
   const card = document.createElement("section");
   card.className = "cam";
+  card.id = "storage-card";
   card.innerHTML = `
     <div class="viewport">
-      <h2><span class="ttl">Storage</span>
+      <h2><span class="chev"></span><span class="ttl">Storage</span>
         <span class="sub">output device</span>
         <span class="stat" id="storage-stat">&mdash;</span></h2>
     </div>
     <div class="controls"><div class="panel"><div class="body" id="storage-body">
       <div class="empty">reading devices…</div>
     </div></div></div>`;
+
+  applyStorageCollapse(card, storageOpen());
+  card.querySelector(".viewport h2").addEventListener("click", ev => {
+    // Not on the buttons inside the header -- there are none today, but the
+    // header is also where the free-space readout lives and a stray click on
+    // a number should not be a toggle by accident of markup.
+    if (ev.target.closest("button")) return;
+    const open = card.classList.contains("strip");
+    setStorageOpen(open);
+    applyStorageCollapse(card, open);
+  });
 
   card.addEventListener("click", async ev => {
     const use = ev.target.closest("[data-use]");
@@ -826,6 +966,12 @@ function buildStorageCard() {
     }
   });
   return card;
+}
+
+function applyStorageCollapse(card, open) {
+  card.classList.toggle("strip", !open);
+  const chev = card.querySelector(".chev");
+  if (chev) chev.textContent = open ? "▾" : "▸";
 }
 
 async function buildLive() {
@@ -1606,6 +1752,23 @@ function pollTiles() {
   setTimeout(pollTiles, 1000 / TILE_HZ);
 }
 
+/* The build this copy of the page was served as. The server substitutes it
+   into the HTML; if the literal survives, an older server is serving the file
+   verbatim and there is nothing to compare against. */
+const UI_BUILD = "__UI_BUILD__";
+
+async function checkStale() {
+  if (UI_BUILD.startsWith("__")) return;
+  try {
+    const r = await jget("/api/ui-build");
+    const el = $("#stale");
+    if (el) el.hidden = !r.build || r.build === UI_BUILD;
+  } catch { /* an older server has no such endpoint; nothing to say */ }
+}
+document.addEventListener("click", ev => {
+  if (ev.target.closest("#stale")) location.reload();
+});
+
 let tick = 0;
 async function poll() {
   try {
@@ -1652,6 +1815,9 @@ async function poll() {
     // Devices appear and disappear on their own schedule, so the panel is
     // re-read on a timer rather than only when something is clicked.
     if (MODE === "live" && tick % 5 === 0) refreshStorage();
+    // Every ~15 s. Cheap, and the alternative is an operator concluding a
+    // feature is broken when the page is simply the one from before the pull.
+    if (tick % 15 === 0) checkStale();
   } catch (e) { /* transient; the streams themselves show a stall */ }
   setTimeout(poll, 1000);
 }

@@ -319,12 +319,32 @@ python -m trilobite [options]
                        (the state file is still written on exit)
 ```
 
-Parameters dialled in through the UI are saved on exit and restored on start.
-The state file is a JSON overlay on the config, kept separate so the commented
-YAML stays the readable record of intent. It is gitignored.
+Everything dialled in through the UI is saved and restored: pipeline
+parameters, the sensor controls (exposure, gain, auto-exposure), and the
+camera's orientation. Saving is debounced a few seconds and also happens on
+exit, so a power cut costs at most the last few seconds rather than the
+afternoon. The state file is a JSON overlay on the config, kept separate so the
+commented YAML stays the readable record of intent. It is gitignored.
+
+`GET /api/controls/{cam}` reports `requested` — what the camera has actually
+been asked for, restored values included — alongside `config`, the value the
+YAML shipped with. Those are different things after a restore, and the UI
+shows the first. Reading the second is what once made a restored exposure look
+unrestored: the sensor was at the saved value, the box showed the YAML one, and
+the first nudge of the slider sent the sensor back to the config.
 
 Use Ctrl-C, not `kill -9`: libcamera does not always recover from a process
 that dies holding a sensor, and the fix is a reboot.
+
+**After a `git pull`, reload the page.** The dashboard is one HTML file and the
+browser caches it; it is served `Cache-Control: no-cache` so it revalidates
+every load, but a tab that has been open across the pull is still running the
+old code. The page notices this on its own — it carries a hash of the file it
+was served as, compares it against the file on disk every fifteen seconds, and
+puts **⟳ page is out of date — reload** in the header when they differ. If a
+control described here is not on screen, check the header before assuming the
+feature is broken: that is how a rotate dropdown that existed came to be
+reported missing.
 
 ### Configurations
 
@@ -482,6 +502,15 @@ it out — and the right USB SSD is usually not plugged in when the application
 starts. The output directory is therefore movable while the rig is running,
 from the Storage panel in imaging mode.
 
+The panel is **collapsed by default**, to a single strip across the bottom of
+the imaging view — it is something you touch once, when a disk goes in, and
+expanded it costs a whole camera-sized column of a two-column layout. Collapsed
+it still carries the two facts worth having on screen: where output is going,
+and how much room is left. It turns accent-coloured, and says so, when a
+removable disk is present that is not the one being written to — the one moment
+the panel exists for. Click the header to open it; the choice is remembered per
+browser.
+
 - **A plugged-in disk is not necessarily a mounted disk**, and this is the part
   that catches people out. A headless Pi runs no desktop session, so nothing
   auto-mounts removable media: a USB SSD plugged into a running rig is visible
@@ -562,22 +591,33 @@ rotation is the raw stride trim — row padding is a property of the buffer as
 the sensor delivers it, so it is removed against the native sensor width first
 and the frame is turned afterwards.
 
-An MLA alignment **survives** a change of orientation. Turning or mirroring the
-camera moves no lenslets; it relabels the pixels. So the grid is carried across
-rather than invalidated: the offsets are transformed, the reference frame swaps
-if the turn was odd, the lattice tilt negates under a mirror, and pitch is
-untouched, because all eight orientations are isometries. The arithmetic is in
-`src/trilobite/optics/orientation.py` — the eight being the dihedral group of a
-rectangle — and an alignment records which orientation it was made under, so
-the change is computed rather than guessed. The UI prints what became of the
-offsets when you change it.
+**Orientation is a setup step, and it is locked once the grid is on.** The
+order for a calibration is: mount the camera, set the orientation, align the
+grid against the frame you are then looking at, and leave the frame alone for
+the rest of the session. So:
 
-Re-check the overlay by eye afterwards all the same. The transform is exact,
-but "nothing else moved when I turned the camera" is a claim about the bench,
-not about the software.
+- with the MLA stage **enabled**, the three controls are greyed out and the
+  endpoint returns 409. Turn the grid off to change them;
+- changing them with the grid **off** resets the alignment — offsets and
+  lattice rotation to zero — because it was made by eye against a frame that no
+  longer exists;
+- `pitch_px` survives the reset. It is `pitch_um / pixel_pitch_um`: a property
+  of the lens array and the pixel size, the same number whichever way the
+  camera is bolted, and the tedious one to re-enter;
+- the frame **size** carries forward to everything downstream, which is what a
+  quarter turn actually changes.
+
+An earlier version instead carried the alignment across, transforming the
+offsets as an element of the dihedral group. The arithmetic was right and the
+feature was wrong: it invited a change of frame mid-calibration, and it
+produced a grid that claimed to be aligned when nobody had looked at it. Every
+pose and the fit that follows assume a fixed frame; no amount of correct
+arithmetic about the grid fixes those. Hence a lock and a reset rather than a
+transform.
 
 Alignments made before the orientation was recorded are read as having been
-made at 0° with no mirrors, which is what they were.
+made at 0° with no mirrors, which is what they were — so no existing grid is
+reset by the upgrade.
 
 ### Quick-record
 
@@ -914,8 +954,10 @@ and the UI writes that number back into the box.
 one: pitch 100 means 100 px on the 1456-wide sensor and draws as 50 px on the
 728-wide preview. It was the other way round until a stored alignment turned out
 to mean something different from what every consumer of it assumed. A stored
-grid carrying an older preview-referenced reference is rebased once, at
-start-up, with a warning in the log.
+grid carrying an older preview-referenced reference is rescaled once, at
+start-up, with a warning in the log. A grid whose recorded *orientation* no
+longer matches the camera's is a different case and is reset rather than
+rescaled — see [Orientation](#orientation).
 
 **A raw buffer is not an image until two things are undone.** Its rows are
 padded to a 64-byte stride, and the array is shaped by that stride *in bytes*

@@ -27,6 +27,7 @@ camera would reintroduce the deadlock.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import time
@@ -35,7 +36,7 @@ from typing import Any
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ValidationError
 
 from ..app import Application, CameraRuntime
@@ -128,9 +129,41 @@ def create_app(application: Application) -> FastAPI:
 
     # -- pages ----------------------------------------------------------
 
+    def _ui_build() -> str:
+        """A short hash of the page as it currently sits on disk.
+
+        Deployment here is `git pull` on the Pi with the browser left open on
+        the dashboard, and a `FileResponse` carries an ETag but no
+        `Cache-Control` -- so a browser applies heuristic freshness and can
+        serve the page from cache for minutes without ever asking. The result
+        is a UI missing controls the server already implements, which is
+        indistinguishable from a bug in the feature and cost an exchange to
+        work out. `no-cache` below fixes the cause; this makes the symptom
+        self-diagnosing when it comes back in some other form.
+        """
+        try:
+            return hashlib.sha256((STATIC / "index.html").read_bytes()).hexdigest()[:8]
+        except OSError:                              # pragma: no cover - unreadable
+            return "unknown"
+
     @api.get("/")
-    def index() -> FileResponse:
-        return FileResponse(STATIC / "index.html")
+    def index() -> Response:
+        text = (STATIC / "index.html").read_text(encoding="utf-8")
+        # Stamped into the page so it knows which build it is, and can say so
+        # when the server has moved on. Substitution, not a header, because the
+        # comparison has to be made by the copy of the page that is running.
+        return Response(
+            text.replace("__UI_BUILD__", _ui_build()),
+            media_type="text/html",
+            # no-cache is "revalidate", not "do not store": the browser still
+            # keeps it and still gets a 304 when nothing changed.
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    @api.get("/api/ui-build")
+    def ui_build() -> dict[str, str]:
+        """What the page on disk hashes to now. Polled; see index()."""
+        return {"build": _ui_build()}
 
     @api.get("/favicon.ico")
     def favicon() -> Response:
@@ -326,11 +359,40 @@ def create_app(application: Application) -> FastAPI:
         slider useless over most of its travel.
         """
         cam = _cam(cam_id)
-        return {"spec": cam.source.control_spec(), "requested": dict(cam.cfg.controls)}
+        # `requested_controls()`, not `cfg.controls`. The config is the value
+        # the YAML shipped with; the source holds every value asked for since,
+        # including the ones the state file restored at start-up. Reading the
+        # config here is what made a restored exposure look unrestored: the
+        # camera really was at 12000 us and the box really did say 8000, and
+        # the first nudge of the slider sent the sensor back to the YAML.
+        return {
+            "spec": cam.source.control_spec(),
+            "requested": cam.source.requested_controls(),
+            "config": dict(cam.cfg.controls),
+        }
+
+    def _orientation_state(cam: CameraRuntime) -> dict[str, Any]:
+        """Orientation plus whether it may currently be changed, in one payload.
+
+        The lock and the values travel together so the page cannot render an
+        enabled control against a locked camera: one request, one truth.
+        """
+        mla = cam.mla_stage()
+        locked = bool(mla is not None and mla.params.enabled)
+        return {
+            **cam.source.orientation,
+            "locked": locked,
+            "lock_reason": (
+                "the MLA grid is enabled, and its alignment was made against "
+                "this frame. Turn the grid off to change the orientation; the "
+                "alignment will be reset when you do."
+                if locked else ""
+            ),
+        }
 
     @api.get("/api/orientation/{cam_id}")
     def read_orientation(cam_id: str) -> dict[str, Any]:
-        return _cam(cam_id).source.orientation
+        return _orientation_state(_cam(cam_id))
 
     @api.post("/api/orientation/{cam_id}")
     def write_orientation(cam_id: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -340,15 +402,32 @@ def create_app(application: Application) -> FastAPI:
         driver control nor a pipeline parameter: it is applied at acquisition,
         before either. See CameraSource._orient.
 
-        A quarter turn swaps width and height, so the MLA grid's reference
-        frame has to move with it. That happens here rather than at the next
-        restart: `bind_sensor` is handed the new orientation and carries the
-        alignment across exactly -- offsets transformed, pitch untouched,
-        because a turn moves no lenslets. The response still says to re-check
-        by eye: the transform is exact, but "nothing else moved" is the
-        operator's claim to confirm, not this endpoint's.
+        **This is a setup decision, and it is locked once the grid is on.** The
+        order of operations for a calibration is: mount the camera, set the
+        orientation, align the grid against the frame you are then looking at,
+        and leave the frame alone for the rest of the session. Changing it
+        later would invalidate the alignment, every recorded pose and the fit
+        that follows -- so with the grid enabled this returns 409 rather than
+        doing something clever.
+
+        With the grid off it is allowed, and `bind_sensor` then RESETS the
+        alignment: offsets and lattice rotation to zero, pitch kept. An earlier
+        version transformed the offsets instead, which was arithmetically right
+        and practically wrong -- it produced a grid that claimed to be aligned
+        when nobody had looked at it.
         """
         cam = _cam(cam_id)
+        wants = [k for k in ("rotate_deg", "flip_horizontal", "flip_vertical")
+                 if k in body]
+        state = _orientation_state(cam)
+        if wants and state["locked"] and any(
+            body[k] != state[k] for k in wants
+        ):
+            raise HTTPException(409, {
+                "error": f"{cam.cam_id}: orientation is locked",
+                "reason": state["lock_reason"],
+            })
+
         changed = []
         if "rotate_deg" in body:
             try:
@@ -373,27 +452,36 @@ def create_app(application: Application) -> FastAPI:
                     changed.append(key)
 
         mla = cam.mla_stage()
-        aligned = bool(mla is not None and mla.params.enabled)
         rebased = ""
         if changed and mla is not None and cam.source.is_open:
-            before = (float(mla.params.offset_x), float(mla.params.offset_y))
+            def alignment() -> tuple[float, float, float]:
+                return (float(mla.params.offset_x), float(mla.params.offset_y),
+                        float(mla.params.rotation_deg))
+
+            had = alignment()
             w, h = cam.source.describe().full_resolution
             mla.bind_sensor(int(w), int(h), Orientation.of(cam.cfg))
+            # Reported from what actually changed, not from what happened to be
+            # there beforehand. Those differ -- a grid that was never bound has
+            # nothing to reset -- and announcing a reset that did not happen
+            # would send the operator off to re-align a grid that is still fine.
             rebased = (
-                f"grid rebased onto the {w}x{h} frame: offsets "
-                f"({before[0]:.1f}, {before[1]:.1f}) -> "
-                f"({mla.params.offset_x:.1f}, {mla.params.offset_y:.1f})"
+                f"frame is now {w}x{h}"
+                + (f"; grid alignment reset (offsets were {had[0]:.1f}, {had[1]:.1f}, "
+                   f"rotation {had[2]:.2f}°), pitch kept at "
+                   f"{mla.params.pitch_px:.1f} px"
+                   if alignment() != had else "")
             )
+        if changed:
+            # Orientation is how the camera is BOLTED DOWN. It has to outlive
+            # the process, and it was the one setting the snapshot never marked
+            # dirty -- so a flip set in the UI survived until the next restart
+            # and then quietly reverted to the YAML.
+            application.mark_dirty()
         return {
-            **cam.source.orientation,
+            **_orientation_state(cam),
             "changed": changed,
             "rebased": rebased,
-            "warning": (
-                "the MLA grid was aligned against a differently-oriented image; "
-                "its offsets have been carried across, but re-check the overlay "
-                "by eye before calibrating"
-                if changed and aligned else ""
-            ),
         }
 
     @api.post("/api/controls/{cam_id}")

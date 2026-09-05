@@ -33,9 +33,17 @@ cameras:
     # frame. rotate_deg is clockwise on screen, 0/90/180/270 only, and is
     # applied before the two mirrors, so the mirrors always mean "flip what I
     # see". 90 and 270 swap width and height everywhere downstream; the sizes
-    # above stay sensor-native and describe() reports the turned ones. An MLA
-    # alignment is carried across a change here rather than invalidated -- a
-    # turn moves no lenslets -- but re-check the overlay by eye.
+    # above stay sensor-native and describe() reports the turned ones.
+    #
+    # This is a SETUP decision: mount the camera, set it here or in the UI,
+    # then align the grid against the frame you get. Enabling the MLA stage
+    # LOCKS it, and changing it beforehand RESETS the grid alignment -- offsets
+    # and lattice rotation to zero. pitch_px is kept: it is pitch_um divided by
+    # pixel_pitch_um, hardware rather than alignment.
+    #
+    # These are also the live values only until the UI changes them; the state
+    # file beside this config records what was actually set, and wins on the
+    # next start.
     rotate_deg: 0
     flip_horizontal: false
     flip_vertical: false
@@ -95,9 +103,17 @@ cameras:
     # frame. rotate_deg is clockwise on screen, 0/90/180/270 only, and is
     # applied before the two mirrors, so the mirrors always mean "flip what I
     # see". 90 and 270 swap width and height everywhere downstream; the sizes
-    # above stay sensor-native and describe() reports the turned ones. An MLA
-    # alignment is carried across a change here rather than invalidated -- a
-    # turn moves no lenslets -- but re-check the overlay by eye.
+    # above stay sensor-native and describe() reports the turned ones.
+    #
+    # This is a SETUP decision: mount the camera, set it here or in the UI,
+    # then align the grid against the frame you get. Enabling the MLA stage
+    # LOCKS it, and changing it beforehand RESETS the grid alignment -- offsets
+    # and lattice rotation to zero. pitch_px is kept: it is pitch_um divided by
+    # pixel_pitch_um, hardware rather than alignment.
+    #
+    # These are also the live values only until the UI changes them; the state
+    # file beside this config records what was actually set, and wins on the
+    # next start.
     rotate_deg: 0
     flip_horizontal: false
     flip_vertical: false

@@ -12,6 +12,128 @@ git checkout .              # everything back to HEAD
 
 ---
 
+## 2026-09-05 (m) — orientation becomes a setup step, and three UI fixes
+
+Three reports, one of which turned out to be about caching rather than code.
+
+### "There is no rotate button"
+
+There was. The control was in the page, styled, 240 px wide, and the server was
+plainly running the new code — the same message reported a log line only the
+new `plenoptic.py` emits. The page was the old one.
+
+`FileResponse` sends an ETag and a `Last-Modified` but no `Cache-Control`, so a
+browser applies **heuristic freshness** and may serve a cached copy without
+revalidating at all. Deployment here is `git pull` on the Pi with the dashboard
+left open in a tab, which is precisely the case that produces a UI missing
+controls the server already implements — indistinguishable from the feature
+being broken, and it cost an exchange to work out.
+
+Two changes. The index is now served with `Cache-Control: no-cache`, which
+means *revalidate*, not *do not store*: the browser still keeps it and still
+gets a 304 when nothing changed. And the server substitutes a hash of the file
+into the page, which polls `/api/ui-build` every fifteen seconds and puts
+**⟳ page is out of date — reload** in the header when the two differ. The first
+fixes the cause; the second makes the symptom self-diagnosing if it returns in
+another form.
+
+Separately, `.row select` had no CSS at all. It rendered, but as a native
+widget on a dark theme, which is worth fixing regardless: `color-scheme:dark`
+plus the same border and padding as the number boxes.
+
+### Orientation stops being clever
+
+Entry (l) added a D4 rebase: change the orientation and the MLA alignment was
+carried across, offsets transformed, pitch preserved. The arithmetic was right
+and mutation-tested. The feature was wrong, and the user's framing is the
+argument:
+
+> we only do the flip and rotate once at startup, and continue to work with
+> these fixed throughout all the following procedures.
+
+A grid alignment is a measurement made by eye against a particular image.
+Transforming it and calling it aligned asserts something nobody checked — and
+the alignment is the *least* of it: every recorded pose and the fit that
+follows assume a fixed frame, and no amount of correct arithmetic about the
+grid repairs those. Carrying it across therefore invited exactly the operation
+that cannot be made safe.
+
+So:
+
+- **locked while the grid is on.** The controls grey out (greyed, not hidden —
+  the operator should see the decision exists and that it is settled) and
+  `POST /api/orientation` returns 409. Asking for the orientation it already
+  has is not a change and is not refused, so a page re-rendering its own state
+  still works.
+- **changing it with the grid off resets the alignment**: offsets and lattice
+  rotation to zero.
+- **`pitch_px` survives.** It is `pitch_um / pixel_pitch_um` — hardware, not
+  alignment — and it is the tedious number to re-enter.
+- **the frame size carries forward**, which is what a quarter turn actually
+  changes, and was already handled by `describe()`.
+
+`optics/orientation.py` lost the group arithmetic and is now a value type: what
+an orientation is, whether two of them transpose the frame, and a phrase for a
+log line. The module docstring records why the deleted version was deleted,
+since it was correct code and someone will otherwise write it again.
+
+`tests/test_rotation.py` was rewritten to match — the closed-form grid tests and
+the D4 round trips went with the feature; the lock, the reset, and the pitch
+survival replace them. Five mutations, all caught:
+
+| mutation | caught by |
+|---|---|
+| the 409 lock removed | the lock test |
+| `mark_dirty` dropped from the orientation endpoint | the state-file test |
+| `bind_sensor` keeps the offsets | 4 tests |
+| `bind_sensor` also zeroes the pitch | 4 tests |
+| the reference frame not transposed on an odd turn | the compose-order test |
+
+Verified in a real browser as well as in pytest: the page driven headlessly
+through Playwright, the dropdown measured on screen at 240×23 px, the three
+rows going locked when the grid checkbox is ticked, and a `POST` while locked
+answering 409.
+
+### "Sensor parameters are not saved"
+
+Two separate causes behind one symptom.
+
+**Orientation was never marked dirty.** Autosave writes only when something
+asks it to, and `POST /api/orientation` was the one mutating endpoint that
+never called `application.mark_dirty()`. A flip set in the UI therefore lived
+until the next restart and then reverted to the YAML. It is also now in
+`state_snapshot` (added in (l)) — it describes how the camera is bolted down,
+which does not change when the process does.
+
+**Exposure and gain were saved and restored, but displayed from the config.**
+`GET /api/controls/{cam}` returned `cfg.controls` — the value the YAML shipped
+with — rather than `source.requested_controls()`, which is everything asked for
+since, restored values included. So the camera really was at the restored
+exposure and the box really did say the old one, and the first nudge of the
+slider sent the sensor back to the config. The endpoint now returns both, named
+`requested` and `config`.
+
+### The storage rail collapses
+
+It is a panel you touch once, when a disk goes in, and expanded it costs a
+whole camera-sized column of a two-column layout. Collapsed it is a full-width
+strip carrying the two facts worth having on screen — where output is going and
+how much room is left — and it turns accent-coloured, naming the count, when a
+removable disk is present that is not the current target. Collapsed by default;
+the choice is remembered in `localStorage`, because which panels one person has
+open on one screen is not rig state and syncing it between two browsers looking
+at the same Pi would be worse than not remembering.
+
+### Verification
+
+```
+pytest -q                  → 236 passed
+ruff check .               → clean
+headless Chromium          → dropdown visible, lock applies, 409 on a locked POST
+```
+
+---
+
 ## 2026-09-05 (l) — a quarter turn, a rate cap, and a line diagnostic
 
 Three requests, of which the first was much the largest because it was asked in

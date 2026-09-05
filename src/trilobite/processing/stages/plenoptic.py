@@ -49,7 +49,6 @@ from pydantic import Field
 
 from ...optics.mla import UI_SUBAPERTURES, MLAGeometry
 from ...optics.orientation import Orientation
-from ...optics.orientation import rebase as orientation_rebase
 from ...types import Frame
 from ..base import Stage, StageParams
 from ..registry import register
@@ -122,12 +121,13 @@ class MLAParams(StageParams):
         0, ge=0, description="Sensor height these parameters are in (0 = not bound yet)",
         json_schema_extra={"widget": "hidden"},
     )
-    # ...and the ORIENTATION they are expressed in, for the same reason and
+    # ...and the ORIENTATION they were aligned under, for the same reason and
     # recorded the same way. Without these three, a 1456x1088 reference meeting
-    # a 1088x1456 frame is indistinguishable from a sensor-mode change, and the
-    # only options left are to refuse or to keep numbers that are now wrong. A
-    # quarter turn does not move a single lenslet, so with them the alignment
-    # transfers exactly -- see optics/orientation.py.
+    # a 1088x1456 frame is indistinguishable from a sensor-mode change, and an
+    # alignment made against a mirrored image is indistinguishable from one
+    # made against the plain image -- so a change of orientation could not even
+    # be DETECTED, let alone acted on. With them, `bind_sensor` resets the
+    # alignment it can no longer vouch for and says so.
     reference_rotate_deg: int = Field(
         0, ge=0, le=270, description="Frame rotation these parameters were aligned under",
         json_schema_extra={"widget": "hidden"},
@@ -236,11 +236,13 @@ class MLAGridOverlay(Stage):
           * already bound to this frame and orientation -- the common case,
             nothing to do.
           * bound under a different ORIENTATION -- a quarter turn or a mirror.
-            Nothing physical has moved: the same lenslets are being labelled
-            differently, so the alignment carries across exactly. The offsets
-            are transformed, the reference size swaps if the turn was odd, and
-            pitch is untouched because every element of D4 is an isometry. See
-            optics/orientation.py for the arithmetic and its sign conventions.
+            **The alignment is discarded**: offsets and lattice rotation go to
+            zero. `pitch_px` survives, because it is `pitch_um /
+            pixel_pitch_um`, a property of the hardware and not of the
+            alignment, and it is the tedious number to re-enter. The reference
+            frame transposes if the turn was odd, so the pitch rescale below
+            stays isotropic. See optics/orientation.py for why this resets
+            rather than transforms.
           * bound to a different SIZE -- an older alignment stored in preview
             pixels, or a genuine sensor-mode change. **Rescale** so the grid
             stays on the same physical lenslets, and say so loudly. This is the
@@ -249,13 +251,12 @@ class MLAGridOverlay(Stage):
             camera, once.
 
         Orientation is handled before size deliberately. Taken the other way
-        round, a rotated frame reaches `rescaled` as a 1456x1088 reference
+        round, a turned frame reaches `rescaled` as a 1456x1088 reference
         against a 1088x1456 frame, which is anisotropic, which raises -- and
-        the old handler for that swallowed the error, stamped the new size and
-        left pitch and both offsets verbatim. The grid then looked bound,
-        reported a plausible tile count, and put every crop in the wrong place.
-        Silent and confident is the worst of the available failures, so that
-        path now only survives for a genuinely anisotropic *resample*.
+        the handler for that stamps the new size while leaving pitch verbatim,
+        so a rig that was turned *and* migrated would keep a preview-sized
+        pitch. Transposing the reference first makes the rescale a clean
+        factor of two again.
         """
         now = orientation or self.reference_orientation
         was = self.reference_orientation
@@ -266,31 +267,22 @@ class MLAGridOverlay(Stage):
             return
 
         if was != now:
-            r = orientation_rebase(
-                was, now,
-                offset_x=float(self.params.offset_x),
-                offset_y=float(self.params.offset_y),
-                rotation_deg=float(self.params.rotation_deg),
-                reference_width=ref[0],
-                reference_height=ref[1],
-            )
+            if was.swaps_axes_relative_to(now):
+                ref = (ref[1], ref[0])
+            had = (float(self.params.offset_x), float(self.params.offset_y),
+                   float(self.params.rotation_deg))
             log.warning(
-                "%s: the frame orientation changed (rotate %d->%d, flip h %s->%s, "
-                "v %s->%s). Carrying the alignment across: offsets (%.2f, %.2f) -> "
-                "(%.2f, %.2f), lattice rotation %.3f -> %.3f deg, reference "
-                "%dx%d -> %dx%d. Pitch is unchanged -- a turn or a mirror moves no "
-                "lenslets. Re-check the grid by eye all the same.",
-                self.name, was.rotate_deg, now.rotate_deg,
-                was.flip_horizontal, now.flip_horizontal,
-                was.flip_vertical, now.flip_vertical,
-                self.params.offset_x, self.params.offset_y, r.offset_x, r.offset_y,
-                self.params.rotation_deg, r.rotation_deg,
-                ref[0], ref[1], r.reference_width, r.reference_height,
+                "%s: the frame orientation changed (%s -> %s), so the grid "
+                "alignment has been RESET: offsets (%.1f, %.1f) and lattice "
+                "rotation %.2f deg discarded, reference frame now %dx%d. Pitch "
+                "stays at %.2f px -- that is the lens array and the pixel size, "
+                "not the alignment. Re-align the grid against the new frame.",
+                self.name, was.describe(), now.describe(),
+                had[0], had[1], had[2], ref[0], ref[1], float(self.params.pitch_px),
             )
-            self.params.offset_x = r.offset_x
-            self.params.offset_y = r.offset_y
-            self.params.rotation_deg = r.rotation_deg
-            ref = (r.reference_width, r.reference_height)
+            self.params.offset_x = 0.0
+            self.params.offset_y = 0.0
+            self.params.rotation_deg = 0.0
             self._stamp(*ref, now)
             self.reset()
 

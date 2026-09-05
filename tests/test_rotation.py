@@ -1,18 +1,20 @@
-"""Quarter-turn rotation, and what it does to everything downstream.
+"""Quarter-turn rotation, mirroring, and the rule that they are a setup step.
 
-The point of these tests is not that `np.rot90` works. It is that the four
-things which have to agree about a quarter turn actually do:
+Two things are being pinned here, and they pull in opposite directions.
 
-  * the pixels, as `CameraSource._orient` produces them;
-  * the size the camera advertises, which everything downstream binds to;
-  * the grid offsets, measured from a frame centre that has moved;
-  * the lattice indices, which get relabelled.
+The first is that orientation reaches EVERYTHING: the pixels, the size the
+camera advertises, the MLA reference frame, the readiness arithmetic, the
+sidecar. Any one of those can be right while the set of them is wrong, and the
+failure is not an exception -- it is every crop landing between micro-images,
+which from the outside is indistinguishable from an optics problem.
 
-Any one of those can be right on its own while the set of them is wrong, and
-the failure is not an exception -- it is every crop landing between
-micro-images, which from the outside is indistinguishable from an optics
-problem. So each test below pins one of them against a closed form rather than
-against another part of the same code.
+The second is that changing it is NOT something the software should smooth
+over. An earlier version carried an MLA alignment across a change of
+orientation by transforming its offsets. The arithmetic was right and the
+feature was wrong: it produced a grid that claimed to be aligned when nobody
+had looked at it. So the alignment is now reset, `pitch_px` is kept, and the
+whole thing is locked while the grid is enabled. The tests below assert the
+reset and the lock as behaviour, not as an implementation detail.
 """
 
 from __future__ import annotations
@@ -28,8 +30,7 @@ from trilobite.app import CameraRuntime
 from trilobite.calibration import readiness_report
 from trilobite.cameras.offline import SyntheticSource
 from trilobite.config import CameraConfig, StageConfig
-from trilobite.optics.mla import MLAGeometry
-from trilobite.optics.orientation import Orientation, rebase, wrap_lattice_angle
+from trilobite.optics.orientation import Orientation
 from trilobite.processing.stages.plenoptic import MLAGridOverlay
 
 ALL = [
@@ -38,65 +39,6 @@ ALL = [
     for fh in (False, True)
     for fv in (False, True)
 ]
-
-
-# -- the group ----------------------------------------------------------
-
-
-def test_the_sixteen_settings_are_the_eight_elements_of_d4():
-    """Four rotations times two mirrors times two is sixteen settings, but the
-    symmetry group of a rectangle has only eight elements -- 180 degrees is
-    both mirrors, and each quarter turn has a mirrored twin. Getting exactly
-    eight distinct matrices out of the sixteen is the check that the rotation
-    and the mirrors are composing as a group rather than as three independent
-    switches, which is what makes the round trip below exact."""
-    assert len({o.matrix for o in ALL}) == 8
-    assert Orientation(180).matrix == Orientation(0, True, True).matrix
-
-
-@pytest.mark.parametrize("start", ALL)
-def test_every_round_trip_returns_the_original_numbers(start):
-    """A -> B -> A is the identity for all 64 pairs, exactly.
-
-    This is the property the rebase actually rests on: turning the camera and
-    turning it back gives the numbers you started with, not numbers that are
-    close to them.
-    """
-    for other in ALL:
-        one = rebase(start, other, offset_x=13.5, offset_y=-7.25, rotation_deg=3.0,
-                     reference_width=1456, reference_height=1088)
-        back = rebase(other, start, offset_x=one.offset_x, offset_y=one.offset_y,
-                      rotation_deg=one.rotation_deg,
-                      reference_width=one.reference_width,
-                      reference_height=one.reference_height)
-        assert (back.offset_x, back.offset_y) == (13.5, -7.25)
-        assert back.rotation_deg == pytest.approx(3.0)
-        assert (back.reference_width, back.reference_height) == (1456, 1088)
-
-
-def test_only_an_odd_quarter_turn_swaps_the_reference_frame():
-    args = dict(offset_x=0.0, offset_y=0.0, rotation_deg=0.0,
-                reference_width=1456, reference_height=1088)
-    z = Orientation()
-    assert rebase(z, Orientation(90), **args).reference_width == 1088
-    assert rebase(z, Orientation(270), **args).reference_width == 1088
-    assert rebase(z, Orientation(180), **args).reference_width == 1456
-    assert rebase(z, Orientation(0, flip_horizontal=True), **args).reference_width == 1456
-
-
-def test_the_lattice_angle_folds_into_the_window_a_square_lattice_can_see():
-    # A square lattice turned by 90 degrees is the same lattice, so the
-    # parameter is meaningful only modulo 90 -- and has to stay inside its own
-    # +/-45 validation bound while being carried across.
-    assert wrap_lattice_angle(93.0) == pytest.approx(3.0)
-    assert wrap_lattice_angle(-87.0) == pytest.approx(3.0)
-    assert wrap_lattice_angle(45.0) == pytest.approx(45.0)
-    assert wrap_lattice_angle(-45.0) == pytest.approx(45.0)
-    for deg in (-44.0, 0.0, 12.5, 44.9):
-        assert wrap_lattice_angle(deg) == pytest.approx(deg)
-
-
-# -- pixels, against the definition -------------------------------------
 
 
 def source(**kw):
@@ -109,13 +51,18 @@ def source(**kw):
     return s
 
 
+# -- pixels, against the definition -------------------------------------
+
+
 @pytest.mark.parametrize("deg", [0, 90, 180, 270])
 def test_rotation_is_clockwise_on_screen(deg):
     """One marked pixel, tracked by hand. The sign convention lives or dies here.
 
     A clockwise turn takes the top-left corner to the top-right, then to the
     bottom-right, then to the bottom-left. Stated as corners rather than as a
-    matrix, because a matrix is what is under test.
+    matrix, because there is no matrix to appeal to: this IS the definition,
+    and every other statement about rotation in the codebase is downstream of
+    it.
     """
     from trilobite.cameras.base import CameraSource
 
@@ -151,37 +98,6 @@ def test_rotation_is_applied_before_the_mirrors():
     assert not np.array_equal(got, np.rot90(np.flip(a, axis=1), k=-1))
 
 
-@pytest.mark.parametrize("o", ALL)
-def test_the_matrix_agrees_with_where_the_pixels_actually_go(o):
-    """The seam between the two halves of this feature, tested directly.
-
-    `CameraSource._orient` moves pixels; `Orientation.matrix` claims to say
-    where they went, and the grid rebase trusts that claim completely. Nothing
-    else compares the two, so a sign error in one and a matching one in the
-    other would leave every test above passing and the grid off by a
-    reflection. Here a marked pixel is followed through the real orient and
-    checked against the matrix acting on its centred coordinates.
-    """
-    from trilobite.cameras.base import CameraSource
-
-    w, h = 9, 5
-    a = np.zeros((h, w), dtype=np.uint8)
-    x, y = 7, 1
-    a[y, x] = 1
-    out = CameraSource._orient(
-        source(rotate_deg=o.rotate_deg, flip_horizontal=o.flip_horizontal,
-               flip_vertical=o.flip_vertical), a)
-    yy, xx = (int(v) for v in np.argwhere(out == 1)[0])
-
-    m = o.matrix
-    dx, dy = x - (w - 1) / 2, y - (h - 1) / 2
-    want_dx = m[0][0] * dx + m[0][1] * dy
-    want_dy = m[1][0] * dx + m[1][1] * dy
-    ow, oh = out.shape[1], out.shape[0]
-    assert xx - (ow - 1) / 2 == pytest.approx(want_dx)
-    assert yy - (oh - 1) / 2 == pytest.approx(want_dy)
-
-
 def test_the_rotation_reaches_the_saved_frame_not_only_the_preview():
     """The same trap the flip had: turning what you look at and not what you
     measure, discovered when the calibration comes back transposed."""
@@ -205,8 +121,8 @@ def test_the_full_frame_served_to_calibration_is_rotated_too():
 
 def test_a_rotated_frame_says_so_in_its_metadata():
     """A portrait .npy that does not record the turn cannot be read back: a
-    turned landscape sensor and a portrait one are otherwise identical on disk,
-    and the difference decides whether the MLA offsets need their axes swapped."""
+    turned landscape sensor and a portrait one are identical on disk, and the
+    difference decides whether the MLA offsets have had their axes swapped."""
     f = source(rotate_deg=270).capture_full()
     assert f.meta["rotate_deg"] == 270
     assert f.meta["flip_horizontal"] is False
@@ -243,121 +159,102 @@ def test_the_preview_and_the_full_frame_are_turned_the_same_way():
     assert math.isclose(fw / pw, fh / ph)
 
 
-# -- the grid, against a closed form ------------------------------------
+# -- the Orientation value ------------------------------------------------
 
 
-def test_a_rotated_grid_lands_on_the_same_lenslets():
-    """The assertion the whole rebase exists to satisfy.
-
-    Take a lenslet centre in the sensor frame. Rotate the *image*. The rebased
-    grid must put a lenslet centre exactly on the rotated pixel -- not near it.
-    The lenslet's *index* changes, because a quarter turn relabels the lattice
-    axes: u becomes v and v becomes -u, so (i, j) becomes (-j, i). That index
-    map is part of the claim, and is asserted alongside the position.
-    """
-    w, h = 1456, 1088
-    g = MLAGeometry(width=w, height=h, pitch=100.0, rotation_deg=4.0,
-                    offset_x=11.0, offset_y=-6.0)
-    r = rebase(Orientation(0), Orientation(90),
-               offset_x=g.offset_x, offset_y=g.offset_y,
-               rotation_deg=g.rotation_deg, reference_width=w, reference_height=h)
-    turned = MLAGeometry(width=r.reference_width, height=r.reference_height,
-                         pitch=g.pitch, rotation_deg=r.rotation_deg,
-                         offset_x=r.offset_x, offset_y=r.offset_y)
-
-    for i, j in [(0, 0), (1, 0), (0, 1), (-3, 2), (5, -4)]:
-        cx, cy = g.centre_of(i, j)
-        # A clockwise quarter turn sends pixel (x, y) of a w x h frame to
-        # (h - 1 - y, x) of the h x w frame that results.
-        want = (h - 1 - cy, cx)
-        got = turned.centre_of(-j, i)
-        assert got[0] == pytest.approx(want[0], abs=1e-9)
-        assert got[1] == pytest.approx(want[1], abs=1e-9)
+def test_an_orientation_knows_whether_it_transposes_the_frame():
+    assert Orientation(90).portrait
+    assert Orientation(270).portrait
+    assert not Orientation(180).portrait
+    assert not Orientation(0, flip_horizontal=True).portrait
+    assert Orientation(0).swaps_axes_relative_to(Orientation(90))
+    assert not Orientation(90).swaps_axes_relative_to(Orientation(270))
+    assert not Orientation(0).swaps_axes_relative_to(Orientation(0, True, True))
 
 
-def test_a_mirrored_grid_lands_on_the_same_lenslets():
-    """The same claim for a reflection, where the lattice tilt also negates."""
-    w, h = 1456, 1088
-    g = MLAGeometry(width=w, height=h, pitch=100.0, rotation_deg=4.0,
-                    offset_x=11.0, offset_y=-6.0)
-    r = rebase(Orientation(0), Orientation(0, flip_horizontal=True),
-               offset_x=g.offset_x, offset_y=g.offset_y,
-               rotation_deg=g.rotation_deg, reference_width=w, reference_height=h)
-    assert r.rotation_deg == pytest.approx(-4.0)
-    flipped = MLAGeometry(width=w, height=h, pitch=g.pitch,
-                          rotation_deg=r.rotation_deg,
-                          offset_x=r.offset_x, offset_y=r.offset_y)
-    for i, j in [(0, 0), (1, 0), (0, 1), (-3, 2)]:
-        cx, cy = g.centre_of(i, j)
-        got = flipped.centre_of(-i, j)
-        assert got[0] == pytest.approx(w - 1 - cx, abs=1e-9)
-        assert got[1] == pytest.approx(cy, abs=1e-9)
+def test_an_alignment_with_no_recorded_orientation_reads_as_unturned():
+    """Which is what it was. Configs and state files predate this field, and
+    treating a missing value as "unknown" would reset every existing grid."""
+    stage = MLAGridOverlay("mla", pitch_px=100.0)
+    assert stage.reference_orientation == Orientation()
 
 
-# -- bind_sensor, where it all has to come together ----------------------
+# -- bind_sensor: reset, do not transform ---------------------------------
 
 
 def _stage(**kw):
-    base = dict(enabled=True, pitch_px=100.0, rotation_deg=0.0,
+    base = dict(enabled=True, pitch_px=100.0, rotation_deg=2.0,
                 offset_x=20.0, offset_y=10.0,
                 reference_width=1456, reference_height=1088)
     base.update(kw)
     return MLAGridOverlay("mla", **base)
 
 
-def test_binding_a_rotated_sensor_transfers_the_alignment():
+def test_turning_the_camera_resets_the_alignment_and_keeps_the_pitch():
+    """The rule, in one test.
+
+    Offsets and lattice rotation were measured by eye against a frame that no
+    longer exists, so they go. Pitch is `pitch_um / pixel_pitch_um` -- a
+    property of the lens array and the sensor, the same number whichever way
+    the camera is bolted -- so it stays, and it is the tedious one to re-enter.
+    """
     stage = _stage()
     stage.bind_sensor(1088, 1456, Orientation(90))
-    assert stage.reference_shape == (1088, 1456)
+    assert (stage.params.offset_x, stage.params.offset_y) == (0.0, 0.0)
+    assert stage.params.rotation_deg == 0.0
     assert stage.params.pitch_px == pytest.approx(100.0)
-    # (dx, dy) -> (-dy, dx) for a clockwise quarter turn with y downward.
-    assert stage.params.offset_x == pytest.approx(-10.0)
-    assert stage.params.offset_y == pytest.approx(20.0)
+    assert stage.reference_shape == (1088, 1456)
     assert stage.params.reference_rotate_deg == 90
 
 
-def test_pitch_survives_every_orientation_untouched():
-    """A turn and a mirror are isometries. If pitch moves, something resampled."""
-    stage = _stage(rotation_deg=3.0)
-    for deg in (90, 180, 270, 0):
-        size = (1088, 1456) if deg % 180 else (1456, 1088)
-        stage.bind_sensor(*size, Orientation(deg))
-        assert stage.params.pitch_px == pytest.approx(100.0)
+def test_a_mirror_resets_the_alignment_too():
+    """A flip does not change the frame SIZE, so nothing raises and nothing
+    looks wrong -- which is exactly why it has to be handled explicitly. The
+    grid offsets are measured from the frame centre along an axis the flip
+    negates."""
+    stage = _stage()
+    stage.bind_sensor(1456, 1088, Orientation(0, flip_horizontal=True))
+    assert (stage.params.offset_x, stage.params.offset_y) == (0.0, 0.0)
+    assert stage.params.rotation_deg == 0.0
+    assert stage.params.pitch_px == pytest.approx(100.0)
+    assert stage.reference_shape == (1456, 1088)
+    assert stage.params.reference_flip_horizontal is True
 
 
-def test_binding_the_same_rotated_sensor_twice_changes_nothing():
+def test_binding_the_same_orientation_twice_changes_nothing():
     """Idempotence, and not a nicety: bind_sensor is called at camera start AND
-    again after the state restore, which is how a stored alignment used to get
-    rebased twice."""
+    again after the state restore. A reset that fired on the second call would
+    wipe the alignment the state file had just restored."""
     stage = _stage()
     stage.bind_sensor(1088, 1456, Orientation(90))
+    stage.params.offset_x = 7.5           # stand in for a fresh alignment
+    stage.params.offset_y = -3.25
     snapshot = stage.params.model_dump()
     stage.bind_sensor(1088, 1456, Orientation(90))
     assert stage.params.model_dump() == snapshot
 
 
 def test_a_turn_and_a_resolution_change_compose_in_that_order():
-    """A preview-referenced alignment meeting a rotated sensor: both fixes.
+    """A preview-referenced alignment meeting a turned sensor: both fixes.
 
-    Orientation is dealt with first, deliberately. The other way round, a
-    728x544 reference meets a 1088x1456 frame, which is anisotropic, which
-    raises -- and the handler for that stamps the new size while leaving pitch
-    and both offsets verbatim. That path produced a grid that looked bound,
-    reported a plausible tile count, and put every crop in the wrong place.
+    The orientation is dealt with first, which is what keeps the pitch rescale
+    isotropic. Taken the other way round, a 728x544 reference meets a 1088x1456
+    frame, `rescaled` raises on the anisotropy, and the handler for that stamps
+    the new size while leaving pitch verbatim -- so a rig that was both turned
+    and migrated would keep a preview-sized pitch and detect nothing.
     """
     stage = _stage(pitch_px=50.0, offset_x=10.0, offset_y=5.0,
                    reference_width=728, reference_height=544)
     stage.bind_sensor(1088, 1456, Orientation(90))
     assert stage.reference_shape == (1088, 1456)
     assert stage.params.pitch_px == pytest.approx(100.0)
-    # Turn first: (10, 5) -> (-5, 10) in the 544x728 frame. Then scale by two.
-    assert stage.params.offset_x == pytest.approx(-10.0)
-    assert stage.params.offset_y == pytest.approx(20.0)
+    assert (stage.params.offset_x, stage.params.offset_y) == (0.0, 0.0)
 
 
 def test_an_unrotated_bind_still_takes_the_old_migration_path():
-    """The 728 -> 1456 migration has to keep working exactly as it did."""
-    stage = _stage(pitch_px=50.0, offset_x=10.0, offset_y=5.0,
+    """The 728 -> 1456 migration has to keep working exactly as it did, offsets
+    and all: no orientation changed, so there is nothing to reset."""
+    stage = _stage(pitch_px=50.0, rotation_deg=0.0, offset_x=10.0, offset_y=5.0,
                    reference_width=728, reference_height=544)
     stage.bind_sensor(1456, 1088)
     assert stage.params.pitch_px == pytest.approx(100.0)
@@ -368,8 +265,24 @@ def test_a_grid_that_has_never_been_bound_just_adopts_the_frame():
     stage = _stage(reference_width=0, reference_height=0)
     stage.bind_sensor(1088, 1456, Orientation(90))
     assert stage.reference_shape == (1088, 1456)
-    assert stage.params.offset_x == 20.0, "there was nothing to carry across"
+    assert stage.params.offset_x == 20.0, "there was nothing to reset"
     assert stage.params.reference_rotate_deg == 90
+
+
+@pytest.mark.parametrize("o", ALL)
+def test_no_orientation_leaves_the_grid_claiming_a_frame_it_is_not_in(o):
+    """Whatever the orientation, what comes out of bind_sensor is consistent:
+    the reference frame equals the frame it was handed, and the recorded
+    orientation equals the one it was handed. Those two are what every offline
+    reader trusts."""
+    stage = _stage()
+    size = (1088, 1456) if o.portrait else (1456, 1088)
+    stage.bind_sensor(*size, o)
+    assert stage.reference_shape == size
+    assert stage.reference_orientation == o
+
+
+# -- readiness on a portrait rig ------------------------------------------
 
 
 def test_the_readiness_arithmetic_survives_a_portrait_frame():
@@ -396,7 +309,7 @@ def test_the_readiness_arithmetic_survives_a_portrait_frame():
     cam.mla_stage().bind_sensor(w, h, Orientation.of(cfg))
 
     ids = {c["id"]: c for c in readiness_report([cam])["checks"]}
-    # 1088 x 1456 at a 100 px pitch is a 10 x 14 lattice; a width-only ratio
+    # 1088 x 1456 at a 100 px pitch is a 10 x 14 lattice. A width-only ratio
     # would have read the pitch as 100 * 1088/1456 = 75 px and counted about
     # 200. Both numbers are "plausible", which is the problem.
     assert ids["left.tile_count"]["ok"], ids["left.tile_count"]["message"]
@@ -407,7 +320,95 @@ def test_the_readiness_arithmetic_survives_a_portrait_frame():
     cam.source.close()
 
 
-# -- surviving a restart --------------------------------------------------
+# -- the lock, and surviving a restart ------------------------------------
+
+
+def _app(rotate_deg=0, grid_on=True, **grid):
+    """One camera with an MLA stage, through the real web layer."""
+    from trilobite.config import AppConfig
+    from trilobite.web.server import create_app
+
+    params = {"enabled": grid_on, "pitch_px": 100.0,
+              "offset_x": 20.0, "offset_y": 10.0}
+    params.update(grid)
+    cfg = AppConfig(cameras=[CameraConfig(
+        cam_id="left", backend="synthetic", rotate_deg=rotate_deg,
+        full_resolution=(1456, 1088), preview_resolution=(728, 544),
+        synthetic_drift_px=0.0,
+        pipeline=[StageConfig(type="mla_grid_overlay", name="mla", params=params)],
+    )])
+    from trilobite.app import Application
+
+    app = Application(cfg, state_path=None, restore=False)
+    cam = app.cameras["left"]
+    cam.source.open()
+    # What CameraRuntime.start() does after opening the device. Done here
+    # rather than starting the capture thread: these tests are about the
+    # endpoints, and a running thread would make them wall-clock dependent.
+    w, h = cam.source.describe().full_resolution
+    cam.mla_stage().bind_sensor(int(w), int(h), Orientation.of(cam.cfg))
+    return app, create_app(app)
+
+
+def _client(api):
+    from fastapi.testclient import TestClient
+
+    return TestClient(api)
+
+
+def test_the_orientation_is_locked_while_the_grid_is_on():
+    """The rule, enforced rather than documented.
+
+    Everything after the alignment -- the poses, the corners, the fit --
+    assumes a fixed frame. Allowing the frame to change mid-calibration and
+    then being clever about the grid would fix one of those and silently
+    invalidate the rest.
+    """
+    app, api = _app(grid_on=True)
+    c = _client(api)
+    assert c.get("/api/orientation/left").json()["locked"] is True
+    r = c.post("/api/orientation/left", json={"flip_horizontal": True})
+    assert r.status_code == 409, r.text
+    assert "MLA grid is enabled" in r.text
+    assert app.cameras["left"].cfg.flip_horizontal is False, "and nothing changed"
+
+
+def test_asking_for_the_orientation_it_already_has_is_not_a_conflict():
+    """A page re-rendering its own state must not be refused. Only a real
+    change is a change."""
+    _, api = _app(grid_on=True)
+    c = _client(api)
+    r = c.post("/api/orientation/left", json={"flip_horizontal": False,
+                                              "rotate_deg": 0})
+    assert r.status_code == 200, r.text
+    assert r.json()["changed"] == []
+
+
+def test_turning_the_grid_off_unlocks_it_and_the_change_resets_the_alignment():
+    _, api = _app(grid_on=True)
+    c = _client(api)
+    c.post("/api/pipeline/left/mla", json={"values": {"enabled": False}})
+    assert c.get("/api/orientation/left").json()["locked"] is False
+
+    r = c.post("/api/orientation/left", json={"rotate_deg": 90})
+    assert r.status_code == 200, r.text
+    assert r.json()["rotate_deg"] == 90
+    assert "reset" in r.json()["rebased"]
+
+    mla = c.get("/api/pipeline/left").json()[0]["values"]
+    assert (mla["offset_x"], mla["offset_y"]) == (0.0, 0.0)
+    assert mla["pitch_px"] == pytest.approx(100.0), "pitch is hardware, it stays"
+    assert (mla["reference_width"], mla["reference_height"]) == (1088, 1456)
+
+
+def test_a_quarter_turn_is_the_only_rotation_offered():
+    """Anything else is a resample rather than a relabelling of pixels, and
+    would cost resolution on every frame for the life of the rig."""
+    _, api = _app(grid_on=False)
+    c = _client(api)
+    assert c.post("/api/orientation/left", json={"rotate_deg": 45}).status_code == 422
+    assert c.post("/api/orientation/left", json={"rotate_deg": "sideways"}
+                  ).status_code == 422
 
 
 def _turned_camera(rotate_deg=0):
@@ -425,20 +426,21 @@ def _turned_camera(rotate_deg=0):
     return cam
 
 
-def test_the_orientation_survives_a_restart_and_the_grid_is_not_turned_twice():
+def test_the_orientation_survives_a_restart_and_the_grid_is_not_reset_again():
     """The whole restore path, end to end, because the failure is a silent one.
 
     The saved pipeline carries the alignment's `reference_rotate_deg`. If the
     orientation itself is not saved beside it, a restart finds a
-    portrait-referenced grid on a camera the config calls landscape, rebases it
-    back, and undoes the turn -- with a warning that reads like the 728->1456
-    migration it is not. Deleting `"orientation"` from the snapshot is the
+    portrait-referenced grid on a camera the config calls landscape, decides
+    the orientation has changed, and resets an alignment that took twenty
+    minutes to dial in. Deleting `"orientation"` from the snapshot is the
     mutation this catches.
     """
     live = _turned_camera(rotate_deg=90)
+    live.mla_stage().params.offset_x = 12.5      # an alignment made after the turn
+    live.mla_stage().params.offset_y = -4.0
     saved = live.state_snapshot()
     assert saved["orientation"]["rotate_deg"] == 90
-    before = (live.mla_stage().params.offset_x, live.mla_stage().params.offset_y)
 
     # A fresh process: the config is back at its on-disk value of 0.
     fresh = _turned_camera(rotate_deg=0)
@@ -449,11 +451,79 @@ def test_the_orientation_survives_a_restart_and_the_grid_is_not_turned_twice():
     fresh.mla_stage().bind_sensor(w, h, Orientation.of(fresh.cfg))
 
     p = fresh.mla_stage().params
-    assert (p.offset_x, p.offset_y) == pytest.approx(before)
+    assert (p.offset_x, p.offset_y) == (12.5, -4.0), "the alignment survived"
     assert (p.reference_width, p.reference_height) == (1088, 1456)
     assert p.pitch_px == pytest.approx(100.0)
     live.source.close()
     fresh.source.close()
+
+
+def test_the_sensor_controls_reported_are_the_live_ones_not_the_config():
+    """What made a restored exposure look unrestored.
+
+    The camera really was at the restored value and the box really did say the
+    YAML one, because the read endpoint returned `cfg.controls`. The first
+    nudge of any slider then sent the sensor back to the config.
+    """
+    _, api = _app(grid_on=False)
+    c = _client(api)
+    c.post("/api/controls/left", json={"controls": {"ExposureTime": 12345}})
+    got = c.get("/api/controls/left").json()
+    assert got["requested"]["ExposureTime"] == 12345
+    assert got["config"].get("ExposureTime") != 12345, \
+        "the config is reported separately, and unchanged"
+
+
+def test_an_orientation_change_is_marked_for_the_state_file(tmp_path):
+    """It was the one setting the snapshot never marked dirty.
+
+    Autosave writes only when something says it should, so a flip set in the
+    UI lived until the next restart and then reverted to the YAML -- which
+    reads exactly like "settings are not saved", because it is.
+    """
+    from trilobite.app import Application
+    from trilobite.config import AppConfig
+    from trilobite.web.server import create_app
+
+    cfg = AppConfig(cameras=[CameraConfig(
+        cam_id="left", backend="synthetic", full_resolution=(64, 48),
+        preview_resolution=(64, 48), synthetic_drift_px=0.0)])
+    path = tmp_path / "rig.state.json"
+    app = Application(cfg, state_path=path, restore=False)
+    app.cameras["left"].source.open()
+    c = _client(create_app(app))
+
+    assert c.post("/api/orientation/left",
+                  json={"flip_vertical": True}).status_code == 200
+    assert app.state._dirty.is_set(), "nothing asked for the change to be saved"
+    app.state.save()
+    import json as _json
+
+    saved = _json.loads(path.read_text())
+    assert saved["cameras"]["left"]["orientation"]["flip_vertical"] is True
+
+
+# -- the page the browser is actually running -----------------------------
+
+
+def test_the_page_is_served_revalidating_and_stamped_with_its_build():
+    """Why a rotate control that existed was not on screen.
+
+    Deployment is `git pull` on the Pi with the browser left open. A
+    FileResponse carries an ETag but no Cache-Control, so a browser applies
+    heuristic freshness and can serve the page from its own cache without ever
+    asking -- producing a UI missing controls the server already implements,
+    which is indistinguishable from the feature being broken.
+    """
+    _, api = _app(grid_on=False)
+    c = _client(api)
+    r = c.get("/")
+    assert "no-cache" in r.headers.get("cache-control", "")
+    assert "__UI_BUILD__" not in r.text, "the build stamp was not substituted"
+    build = c.get("/api/ui-build").json()["build"]
+    assert build and build in r.text
+    # And the control the whole exchange was about is in fact in the page.
+    assert 'textContent = "Rotate"' in r.text
 
 
 # -- the pipeline rate cap ----------------------------------------------
