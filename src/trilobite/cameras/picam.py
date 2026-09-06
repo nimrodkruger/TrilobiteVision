@@ -32,7 +32,16 @@ from typing import Any
 import numpy as np
 
 from ..config import CameraConfig
-from ..types import DIAGNOSTIC, SCIENCE, CameraInfo, Frame
+from ..types import (
+    DIAGNOSTIC,
+    SCIENCE,
+    SRC_ISP_MAIN,
+    SRC_ISP_PREVIEW,
+    SRC_RAW,
+    UNVALIDATED,
+    CameraInfo,
+    Frame,
+)
 from .base import CameraSource
 from .rawformat import RawFormatError, admit, best_format, classify, describe_refusal
 
@@ -51,12 +60,20 @@ class Picamera2Source(CameraSource):
         self._last_meta: dict[str, Any] = {}
         # How the raw format was arrived at, in words, for the sidecar.
         self._raw_choice: str = "unknown"
-        # True only when the format was established admissible at open time.
-        # False means the escape hatch is open and everything raw this source
-        # produces is `diagnostic` -- carried as state rather than re-derived
-        # per capture, so a capture cannot accidentally be judged by a
-        # different rule than the one the camera was opened under.
+        # True only when the format the driver NEGOTIATED was established
+        # admissible after configuration. False means the escape hatch is open
+        # and everything raw this source produces is `diagnostic` -- carried as
+        # state rather than re-derived per capture, so a capture cannot
+        # accidentally be judged by a different rule than the one the camera
+        # was opened under.
         self._raw_admissible: bool = False
+        # The format name asked for, kept so a driver substitution can be
+        # named rather than merely absorbed.
+        self._requested_raw: str | None = None
+        # Read back from camera_configuration() after configure: what the raw
+        # stream ACTUALLY is. Admission checks against this and nothing else.
+        self._raw_negotiated: dict[str, Any] = {
+            "format": "", "size": (0, 0), "stride": None}
 
     @staticmethod
     def _split_controls(picam: Any, controls: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -139,14 +156,28 @@ class Picamera2Source(CameraSource):
         )
         picam.configure(config)
 
-        # A configured mono sensor reports a MONO_* raw format. That is a
-        # firmer signal than the pre-configure sensor_format string, so let it
-        # override.
+        # Supervisory review R5. Everything above is a REQUEST. What the driver
+        # negotiated is read back here and is the only thing admission is
+        # allowed to check against, for two reasons the review names:
+        #
+        #   * the driver may substitute a format. Asking for R10 and being
+        #     given MONO_PISP_COMP1 was the original failure, and validating
+        #     the request rather than the result cannot see it;
+        #   * the raw stream's size is not the main stream's. `full_resolution`
+        #     in the config sizes `main`; raw is configured at the sensor's
+        #     native size. Checking a raw buffer against the main resolution
+        #     happens to work only while the two are equal.
         try:
-            if "MONO" in str(picam.camera_configuration()["raw"]["format"]).upper():
-                self._mono = True
-        except (KeyError, TypeError):
-            pass
+            self._raw_negotiated = self._read_back_raw(picam)
+        except RawFormatError:
+            with contextlib.suppress(Exception):
+                picam.close()
+            raise
+
+        if "MONO" in str(self._raw_negotiated.get("format", "")).upper():
+            # A configured mono sensor reports a MONO_* raw format. That is a
+            # firmer signal than the pre-configure sensor_format string.
+            self._mono = True
 
         controls: dict[str, Any] = {}
         if self.cfg.fps:
@@ -230,7 +261,17 @@ class Picamera2Source(CameraSource):
                 full = full[..., 0]
             self._serve_full_frame(Frame.now(
                 self._orient(np.ascontiguousarray(full)), self.cam_id, seq,
-                space="mono8", stream="main", mono_sensor=self._mono,
+                space="mono8",
+                # ISP output. Nothing about it has been established as sensor
+                # counts -- it has been through demosaic-equivalent processing,
+                # gamma and whatever else the pipeline applies -- so it is
+                # `unvalidated`, not `science`. It used to be `science` by
+                # default, which is supervisory review R2: an ISP frame
+                # inheriting the strongest claim in the system by omission.
+                # Corner GEOMETRY off it is still defensible; the source kind
+                # is what a reader needs to decide that, so it is recorded.
+                source_kind=SRC_ISP_MAIN,
+                stream="main", mono_sensor=self._mono,
                 **self.orientation, **meta,
             ))
 
@@ -243,6 +284,7 @@ class Picamera2Source(CameraSource):
         # chose -- see set_controls.
         self._last_meta = meta
         return Frame.now(self._orient(luma), self.cam_id, seq, space="mono8",
+                         source_kind=SRC_ISP_PREVIEW,
                          **self.orientation, **meta)
 
     def skip_preview(self) -> None:
@@ -310,20 +352,27 @@ class Picamera2Source(CameraSource):
         meta["allow_unvalidated_raw"] = bool(
             getattr(self.cfg, "allow_unvalidated_raw", False))
 
-        validity = SCIENCE
         if raw:
+            source_kind = SRC_RAW
             data, evidence, validity = self._admit_raw(data)
             meta.update(evidence)
             # image_* describes the frame the caller ends up holding, so it is
-            # the POST-rotation size; the raw_* keys stay in the sensor's own
-            # terms, because that is the frame the padding lives in.
-            out_w, out_h = self.oriented_size(self._full_res)
+            # the POST-rotation size, and it is derived from the RAW stream's
+            # geometry rather than main's -- those are not the same stream and
+            # were being conflated (R5).
+            native = self._raw_negotiated.get("size") or self._full_res
+            out_w, out_h = self.oriented_size(native)
             meta["image_width"] = int(out_w)
             meta["image_height"] = int(out_h)
+        else:
+            # The ISP path. Not admitted, not refused -- nothing was
+            # established, which is exactly what `unvalidated` says.
+            source_kind, validity = SRC_ISP_MAIN, UNVALIDATED
         meta.update(self.orientation)
         return Frame.now(
             np.ascontiguousarray(self._orient(data)), self.cam_id,
-            self._next_seq(), space=space, validity=validity, **meta
+            self._next_seq(), space=space, validity=validity,
+            source_kind=source_kind, **meta
         )
 
     def _choose_raw_format(self, picam: Any) -> str | None:
@@ -363,6 +412,11 @@ class Picamera2Source(CameraSource):
         the rest of its life. That is the only way past this, and it is
         recorded in every sidecar it touches.
 
+        **This method decides what to ASK FOR and nothing more.** It cannot
+        establish admissibility, because the driver may negotiate something
+        else entirely; that verdict belongs to `_read_back_raw`, after
+        `configure`, and is supervisory review R5.
+
         Returns the format string to request, or None to accept the driver's
         default (only reachable with the hatch open).
         """
@@ -387,10 +441,10 @@ class Picamera2Source(CameraSource):
                 refuse(describe_refusal(configured),
                        f"{configured} (from config, UNVALIDATED)")
                 return configured
-            self._raw_admissible = True
             self._raw_choice = f"{fmt.name} (from config)"
-            log.info("%s: raw format %s (from config; %d-bit, uncompressed)",
-                     self.cam_id, fmt.name, fmt.bits)
+            self._requested_raw = fmt.name
+            log.info("%s: requesting raw format %s (from config; nominally "
+                     "%d-bit, uncompressed)", self.cam_id, fmt.name, fmt.bits)
             return fmt.name
 
         candidates: list[str] = []
@@ -419,18 +473,93 @@ class Picamera2Source(CameraSource):
             )
             return None
 
-        self._raw_admissible = True
         self._raw_choice = f"{chosen} (auto)"
-        log.info("%s: raw format %s (chosen; uncompressed, unpacked)",
+        self._requested_raw = chosen
+        log.info("%s: requesting raw format %s (chosen; uncompressed, unpacked)",
                  self.cam_id, chosen)
         return chosen
 
-    def _admit_raw(self, data: np.ndarray) -> tuple[np.ndarray, dict[str, Any], str]:
-        """Establish that a buffer is sensor counts, or say it is not.
+    def _read_back_raw(self, picam: Any) -> dict[str, Any]:
+        """What the driver ACTUALLY negotiated for the raw stream (R5).
 
-        Returns (pixels, evidence, validity). The evidence goes in the sidecar
-        either way: a refusal is a finding worth recording, not just a reason
-        to stop.
+        picamera2 exposes the configured stream as a dict with `format`, `size`
+        and `stride`. All three are read here, once, after `configure`, and
+        every later buffer is checked against them rather than against what was
+        asked for. A driver substitution -- being handed a compressed format
+        after requesting an uncompressed one -- is caught here and nowhere
+        else, because from that point on the buffers are self-consistent with
+        the substituted format and look perfectly correct.
+
+        `stride` may be absent on older picamera2 builds. Its absence is
+        recorded so admission can say which rule it applied, rather than
+        quietly falling back to a looser one.
+        """
+        try:
+            raw_cfg = dict(picam.camera_configuration()["raw"])
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise RawFormatError(
+                f"{self.cam_id}: the camera reports no raw stream after "
+                f"configuration ({exc}). Nothing can be admitted as sensor "
+                f"data without knowing what the driver negotiated."
+            ) from None
+
+        name = str(raw_cfg.get("format") or "")
+        size = raw_cfg.get("size") or (0, 0)
+        stride = raw_cfg.get("stride")
+        negotiated = {
+            "format": name,
+            "size": (int(size[0]), int(size[1])),
+            "stride": int(stride) if stride else None,
+        }
+
+        fmt = classify(name)
+        if fmt is None or not fmt.admissible:
+            reason = (f"the driver negotiated {name!r} for the raw stream, "
+                      f"not what was requested ({self._raw_choice}). "
+                      f"{describe_refusal(name)}")
+            if not bool(getattr(self.cfg, "allow_unvalidated_raw", False)):
+                raise RawFormatError(f"{self.cam_id}: {reason}")
+            log.error(
+                "%s: %s -- opening anyway because allow_unvalidated_raw is "
+                "set; every raw capture will be DIAGNOSTIC.", self.cam_id, reason)
+            self._raw_admissible = False
+        else:
+            if self._requested_raw and fmt.name != self._requested_raw:
+                # Admissible, but not what was asked for. Not a refusal -- the
+                # data is still readable -- but it must not pass unremarked,
+                # because a silent downgrade from R10 to R8 throws away two
+                # bits per pixel and nothing downstream would ever say so.
+                log.warning(
+                    "%s: requested raw format %s, driver negotiated %s. The "
+                    "capture is admissible but it is not the format the config "
+                    "asked for.", self.cam_id, self._requested_raw, fmt.name)
+                self._raw_choice = (f"{fmt.name} (negotiated; "
+                                    f"{self._requested_raw} was requested)")
+            self._raw_admissible = True
+
+        if negotiated["size"] != tuple(self._full_res):
+            # Not an error. It is the ordinary case once `full_resolution` is
+            # set smaller than the sensor, and the point of recording it is
+            # that admission must use the raw size, not this one.
+            log.info(
+                "%s: raw stream is %dx%d and main is %dx%d; admission uses the "
+                "raw geometry.", self.cam_id, negotiated["size"][0],
+                negotiated["size"][1], self._full_res[0], self._full_res[1])
+        log.info("%s: negotiated raw %s %dx%d stride %s", self.cam_id, name,
+                 negotiated["size"][0], negotiated["size"][1],
+                 negotiated["stride"] if negotiated["stride"] else "unreported")
+        return negotiated
+
+    def _admit_raw(self, data: np.ndarray) -> tuple[np.ndarray, dict[str, Any], str]:
+        """Establish that a buffer is sensor counts, or refuse the capture.
+
+        Returns (pixels, evidence, validity), and only reaches the diagnostic
+        return when `allow_unvalidated_raw` is set. Supervisory review R4: this
+        used to swallow every admission failure and hand back diagnostic data
+        regardless, so a science capture request could be answered -- reported
+        as successful -- with pixels the code had just established were not
+        sensor counts. The opt-in was advertised as the way that happens and
+        was not consulted.
 
         Admission runs on the buffer exactly as the sensor delivered it, BEFORE
         orientation, and that order is load-bearing. The stride padding is on
@@ -438,30 +567,43 @@ class Picamera2Source(CameraSource):
         would be on the left, rotate first and it would be along the bottom --
         and cropping the right would then remove real image.
         """
-        fmt_name = self._raw_format_name()
+        neg = self._raw_negotiated
+        fmt_name = neg.get("format") or self._raw_format_name()
         try:
-            got = admit(data, fmt_name, self._full_res)
+            got = admit(
+                data, fmt_name, neg.get("size") or self._full_res,
+                stride_bytes=neg.get("stride"),
+                alignment=self.cfg.raw_alignment,
+            )
         except RawFormatError as exc:
-            if not self._raw_admissible:
-                # Expected: the hatch is open and the format was already known
-                # inadmissible at open time. One line, not a stack trace.
-                log.warning("%s: raw buffer not admitted as science data: %s",
-                            self.cam_id, exc)
-            else:
-                # NOT expected, and worse than the hatch case: the format was
-                # checked and accepted at open, and the buffer still does not
-                # reconcile with it. That indicts the driver, so it is loud
-                # even though the capture is still returned to look at.
-                log.error(
-                    "%s: raw format %r was validated at open time and the "
-                    "delivered buffer still does not reconcile with it: %s",
-                    self.cam_id, fmt_name, exc,
-                )
+            hatch = bool(getattr(self.cfg, "allow_unvalidated_raw", False))
+            if not hatch:
+                # The science request fails. There is no silent downgrade: the
+                # caller asked for measurement data and none is available.
+                if self._raw_admissible:
+                    # Worse than the hatch case. The format was checked and
+                    # accepted at open and the buffer still does not reconcile
+                    # with it, which indicts the driver rather than the config.
+                    log.error(
+                        "%s: raw format %r was validated at open time and the "
+                        "delivered buffer still does not reconcile with it: %s",
+                        self.cam_id, fmt_name, exc)
+                raise RawFormatError(
+                    f"{self.cam_id}: this buffer cannot be admitted as sensor "
+                    f"data, so there is no science capture to return. {exc} "
+                    f"Set 'allow_unvalidated_raw: true' for this camera to "
+                    f"capture it as a diagnostic frame instead."
+                ) from None
+            log.warning("%s: raw buffer not admitted as science data: %s",
+                        self.cam_id, exc)
             return data, {
                 "raw_admitted": False,
                 "raw_refusal": str(exc),
                 "raw_buffer_shape": [int(n) for n in data.shape],
                 "raw_buffer_dtype": str(data.dtype),
+                "raw_negotiated_format": fmt_name,
+                "raw_negotiated_size": list(neg.get("size") or self._full_res),
+                "raw_negotiated_stride": neg.get("stride"),
             }, DIAGNOSTIC
         return got.array, {"raw_admitted": True, **got.meta}, SCIENCE
 

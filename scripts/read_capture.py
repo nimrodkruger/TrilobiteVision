@@ -35,13 +35,33 @@ USAGE
 
 WHAT THE SIDECARS CARRY
 
-Every capture sidecar carries `validity`: `science` or `diagnostic`. Diagnostic
-means the rig could not establish that the pixel values are sensor counts --
-a compressed or packed raw format, or a buffer that did not reconcile with the
-sensor geometry. Those files are named `diagnostic_...` and `--detect` refuses
-them unless `--allow-diagnostic` is passed. Note that this is a different
-question from `space`: `space: raw` says the ISP was bypassed, which is a claim
-about the path the pixels took, not about what the values mean.
+Every capture sidecar carries `validity` and `source_kind`, and this reader
+FAILS CLOSED on both: an unrecognised, missing or misspelled validity is
+refused for measurement, not assumed good.
+
+    science      the rig established that the pixel values are sensor counts,
+                 and the sidecar carries the admission record proving it. The
+                 label alone is not enough — a `science` claim with no evidence
+                 beside it is refused.
+    diagnostic   the rig established that they are NOT: a compressed or packed
+                 raw format, a buffer that did not reconcile with the negotiated
+                 geometry, or a preview processed for viewing. Named
+                 `diagnostic_...` on disk.
+    unvalidated  nothing was established either way. ISP output, including
+                 every calibration pose, and rendered frames. Named
+                 `unvalidated_...` on disk.
+    (missing)    written before the admission boundary existed, or by something
+                 other than this rig.
+
+Two different measurements, two different requirements. Reading pixel VALUES
+as sensor counts needs `science`; reading pixel POSITIONS -- corners,
+micro-image centres -- is defensible on an ISP frame too, so `--detect` accepts
+`science` and `unvalidated` ISP captures and refuses the other two unless
+`--allow-diagnostic` or `--allow-legacy` is said out loud.
+
+None of this is the same question as `space`: `space: raw` says the ISP was
+bypassed, which is a claim about the path the pixels took, not about what the
+values mean. A compressed PiSP buffer is `space: raw`.
 
 A capture sidecar (`raw_*`/`view_*`) has `pipeline`, so the MLA parameters are
 under `pipeline.mla` **in preview pixels** with `reference_width` alongside;
@@ -92,14 +112,25 @@ class Capture:
     meta: dict[str, Any]
     kind: str                      # "raw" | "view" | "pose" | "bare"
 
-    # 'science', 'diagnostic', or 'unrecorded' for a file written before the
-    # rig had an admission boundary. NOT the same question as `space == 'raw'`:
-    # that says the ISP was bypassed, which is a claim about the path the
-    # pixels took, not about whether the values arriving down it are sensor
-    # counts. A compressed PiSP buffer is `space: raw` and is not measurable.
-    validity: str = "unrecorded"
+    # What the rig established about these pixel values, verbatim from the
+    # sidecar. NOT the same question as `space == 'raw'`: that says the ISP was
+    # bypassed, which is a claim about the path the pixels took, not about
+    # whether the values arriving down it are sensor counts. A compressed PiSP
+    # buffer is `space: raw` and is not measurable.
+    #
+    # Anything other than the three the rig writes -- including a missing
+    # field, a typo and a value from a newer schema -- is `unknown`, and
+    # `unknown` is refused. See `eligibility`.
+    validity: str = "unknown"
+    # Where the pixels came from: raw / isp_main / isp_lores / synthetic /
+    # replay. Decides which KINDS of measurement are defensible, which is not
+    # the same question as whether the values were admitted.
+    source_kind: str = "unknown"
     # Why the rig refused to admit it, when it did.
     refusal: str = ""
+    # Whether the sidecar carries the admission record a `science` claim
+    # requires. A label without its evidence is not the evidence.
+    admitted: bool = False
 
     # MLA geometry converted to THIS frame's pixels, or None if unrecorded.
     pitch: float | None = None
@@ -123,26 +154,81 @@ class Capture:
     def has_geometry(self) -> bool:
         return self.pitch is not None and self.pitch > 1.0
 
+    # -- eligibility --------------------------------------------------
+    #
+    # Supervisory review R1. The first version of this asked one question --
+    # "is the validity string exactly 'diagnostic'?" -- and admitted everything
+    # else, so a missing field, a typo and a value from a schema this code has
+    # never seen all passed as measurable. Probes confirmed `unrecorded` and
+    # `typo` both returned true. That is failing OPEN on precisely the field
+    # whose job is to fail closed.
+    #
+    # Two things had to change. It now requires an explicit recognised claim
+    # plus the evidence that claim depends on, and it distinguishes the kind of
+    # measurement being attempted, because those have different requirements:
+    #
+    #   RADIOMETRY -- anything reading pixel VALUES as sensor counts. Needs
+    #   `science` and an admission record. An ISP frame never qualifies.
+    #
+    #   GEOMETRY -- corner positions, micro-image centres, anything reading
+    #   WHERE things are. An ISP mono frame is perfectly good for this and it
+    #   is what the calibration poses are, so refusing them would break the
+    #   main documented workflow to no purpose. What is refused is
+    #   `diagnostic` (positively established as wrong) and `unknown` (nothing
+    #   established at all, including every pre-boundary archive file).
+    #
+    # The archive is not silently promoted. A file written before the boundary
+    # existed reads as `unknown` and needs `--allow-legacy` said out loud.
+
     @property
     def is_science(self) -> bool:
-        # `unrecorded` counts as measurable: refusing every file written before
-        # the boundary existed would make this script useless on the archive,
-        # and those files were checked by hand at the time. It is reported as
-        # unrecorded rather than silently promoted to science.
-        return self.validity != "diagnostic"
+        """Are the VALUES established sensor counts? Label plus evidence."""
+        return self.validity == "science" and self.admitted
+
+    @property
+    def geometry_ok(self) -> bool:
+        """Are the pixel POSITIONS trustworthy, whatever the values mean?"""
+        if self.is_science:
+            return True
+        # An ISP frame is `unvalidated` by construction and is still a
+        # geometrically faithful picture of the scene.
+        return (self.validity == "unvalidated"
+                and self.source_kind in ("isp_main", "isp_lores"))
+
+    def _refuse(self, what: str, needed: str, override: str) -> None:
+        reason = ""
+        if self.validity == "diagnostic":
+            reason = (f"  the rig REFUSED this buffer: "
+                      f"{self.refusal or 'reason not recorded'}\n")
+        elif self.validity == "science" and not self.admitted:
+            reason = ("  the sidecar claims 'science' but carries no admission "
+                      "record. A label is not the evidence.\n")
+        elif self.validity == "unknown":
+            reason = ("  the sidecar records no recognised validity. Either it "
+                      "predates the admission boundary, or it was written by "
+                      "something other than this rig.\n")
+        else:
+            reason = (f"  validity is '{self.validity}'"
+                      + (f" from a {self.source_kind} source" if self.source_kind
+                         != "unknown" else "")
+                      + f", and {what} needs {needed}.\n")
+        raise SystemExit(
+            f"{self.path.name}: refusing {what}.\n{reason}"
+            f"Re-capture with an admissible raw format (scripts/probe_cameras.py "
+            f"lists what the sensor offers), or pass {override} to look at it "
+            f"anyway. Looking is not measuring."
+        )
 
     def require_science(self, what: str) -> None:
-        """Refuse to measure pixels the rig would not vouch for."""
-        if self.is_science:
-            return
-        raise SystemExit(
-            f"{self.path.name}: this capture is tagged DIAGNOSTIC, so {what} "
-            f"would be fitting a model to values that are not sensor counts.\n"
-            f"  reason: {self.refusal or 'not recorded'}\n"
-            f"Re-capture with an admissible raw format (scripts/probe_cameras.py "
-            f"lists what the sensor offers). Pass --allow-diagnostic to override, "
-            f"which is for looking, not for measuring."
-        )
+        """Refuse to read pixel VALUES the rig did not admit as sensor counts."""
+        if not self.is_science:
+            self._refuse(what, "an admitted 'science' capture", "--allow-unadmitted")
+
+    def require_geometry(self, what: str) -> None:
+        """Refuse to measure POSITIONS in pixels of unestablished provenance."""
+        if not self.geometry_ok:
+            self._refuse(what, "a science or ISP capture",
+                         "--allow-diagnostic or --allow-legacy")
 
     def geometry(self):
         """An MLAGeometry for this frame, from the recorded parameters."""
@@ -260,14 +346,28 @@ def load(npy_path: Path) -> Capture:
     image, trimmed = _trim_stride(image, meta)
     cap = Capture(path=path, image=image, meta=meta, kind="bare")
     cap.trimmed_padding = trimmed
-    sensor = meta.get("sensor_metadata") or {}
+    # Captures put driver metadata under `sensor_metadata`; poses under
+    # `sensor`. One name here so the eligibility rules do not have to know
+    # which kind of file they are looking at.
+    sensor = meta.get("sensor_metadata") or meta.get("sensor") or {}
     cap.rotate_deg = int(sensor.get("rotate_deg") or 0)
     cap.flip_horizontal = bool(sensor.get("flip_horizontal"))
     cap.flip_vertical = bool(sensor.get("flip_vertical"))
-    # Top level, written by the writer for every capture. Files from before the
-    # boundary existed have neither key and stay 'unrecorded'.
-    cap.validity = str(meta.get("validity") or "unrecorded")
+    # Top level, written for every capture and every pose. A file from before
+    # the boundary existed has neither key and stays 'unknown', which is
+    # refused rather than assumed good (R1).
+    recorded = str(meta.get("validity") or "")
+    cap.validity = recorded if recorded in ("science", "diagnostic",
+                                            "unvalidated") else "unknown"
+    if recorded and cap.validity == "unknown":
+        print(f"warning: {path.name} records validity {recorded!r}, which this "
+              f"reader does not recognise — treating it as unknown. It may come "
+              f"from a newer schema.", file=sys.stderr)
+    cap.source_kind = str(meta.get("source_kind") or "unknown")
     cap.refusal = str(sensor.get("raw_refusal") or "")
+    # The evidence a `science` claim rests on. Without it the label is just a
+    # string in a file anyone can edit.
+    cap.admitted = sensor.get("raw_admitted") is True
     h, w = image.shape[:2]
 
     if "geometry" in meta:
@@ -351,20 +451,43 @@ def describe(cap: Capture) -> None:
     # `space: raw` says the ISP was bypassed; it does not say the values that
     # came down that path are sensor counts. Conflating the two is what let a
     # session of compressed transport be recorded as measurement data.
+    sensor_meta = m.get("sensor_metadata") or m.get("sensor") or {}
     if cap.validity == "diagnostic":
-        print("validity    : DIAGNOSTIC  <-- NOT measurement data. The rig could "
-              "not establish that\n"
-              "              these values are sensor counts.")
+        print("validity    : DIAGNOSTIC  <-- NOT measurement data. The rig "
+              "established that these\n"
+              "              values are not sensor counts.")
         if cap.refusal:
             print(f"              reason: {cap.refusal}")
+    elif cap.is_science:
+        bits = [str(sensor_meta.get("raw_format") or "?")]
+        if sensor_meta.get("raw_alignment"):
+            bits.append(f"{sensor_meta['raw_bits_nominal']}-bit nominal, "
+                        f"{sensor_meta['raw_alignment']}-aligned in "
+                        f"{sensor_meta['raw_container_bits']}")
+        if sensor_meta.get("raw_sample_shift"):
+            bits.append(f"sample = value >> {sensor_meta['raw_sample_shift']}"
+                        f"  <-- NOT applied to the pixels above")
+        print("validity    : science  (" + "; ".join(bits) + ")")
+        if sensor_meta.get("raw_observed_max") is not None:
+            print(f"              observed max {sensor_meta['raw_observed_max']} "
+                  f"of a permitted {sensor_meta.get('raw_value_ceiling', '?')}")
     elif cap.validity == "science":
-        fmt = (m.get("sensor_metadata") or {}).get("raw_format")
-        print("validity    : science"
-              + (f"  ({fmt}, admitted at capture)" if fmt else ""))
-    elif m.get("space") == "raw":
-        print("validity    : not recorded — written before the rig checked its "
-              "raw format.\n"
-              "              Verify by eye before fitting anything to it.")
+        print("validity    : science CLAIMED, but the sidecar carries no "
+              "admission record.\n"
+              "              A label is not the evidence. Refused for "
+              "measurement.")
+    elif cap.validity == "unvalidated":
+        print(f"validity    : unvalidated ({cap.source_kind}) — nothing was "
+              f"established about\n"
+              f"              these values. "
+              + ("Positions are trustworthy; values are not."
+                 if cap.geometry_ok else
+                 "Neither positions nor values are established."))
+    else:
+        print("validity    : NOT RECORDED — written before the rig checked its "
+              "raw format,\n"
+              "              or by something else. Refused for measurement "
+              "unless --allow-legacy.")
 
     sensor = m.get("sensor") or m.get("sensor_metadata") or {}
     keep = {k: sensor[k] for k in
@@ -558,6 +681,11 @@ def main() -> int:
     ap.add_argument("--allow-diagnostic", action="store_true",
                     help="run --detect on captures the rig tagged diagnostic "
                          "(for looking at, never for measuring)")
+    ap.add_argument("--allow-legacy", action="store_true",
+                    help="run --detect on captures with no recorded validity — "
+                         "files written before the admission boundary existed. "
+                         "Inspection, not measurement: nothing here establishes "
+                         "that they were ever checked")
     args = ap.parse_args()
 
     files = gather(args.path)
@@ -576,12 +704,19 @@ def main() -> int:
 
         detections = None
         if args.detect:
-            if not args.allow_diagnostic:
-                cap.require_science("corner detection")
-            elif not cap.is_science:
-                print("warning: detecting corners in a DIAGNOSTIC capture "
-                      "because --allow-diagnostic was passed. The positions "
-                      "are not measurements.", file=sys.stderr)
+            # Corner detection reads POSITIONS, so an ISP frame qualifies and a
+            # calibration pose -- which is exactly that -- goes through with no
+            # flag. What does not go through is a refused buffer or a file whose
+            # provenance was never recorded.
+            overridden = ((cap.validity == "diagnostic" and args.allow_diagnostic)
+                          or (cap.validity == "unknown" and args.allow_legacy))
+            if overridden:
+                print(f"warning: detecting corners in a "
+                      f"{cap.validity.upper()} capture because it was "
+                      f"explicitly permitted. The positions are not "
+                      f"measurements.", file=sys.stderr)
+            else:
+                cap.require_geometry("corner detection")
             board = None
             if args.board:
                 try:

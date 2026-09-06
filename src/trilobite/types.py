@@ -13,13 +13,37 @@ from typing import Any
 
 import numpy as np
 
-# The two values `Frame.validity` may take. Defined here rather than in
+# The values `Frame.validity` may take. Defined here rather than in
 # cameras/rawformat.py, where they are used most, because `types` is the layer
 # everything else sits on: the other direction would have `types` importing
 # from `cameras`, and `cameras.base` already imports `types`. That cycle is
 # latent today only because `cameras/__init__.py` happens to be empty.
-SCIENCE = "science"
-DIAGNOSTIC = "diagnostic"
+#
+# THREE values, not two, and the third is the default. Supervisory review R2:
+# `validity` defaulted to `science`, so every construction that did not think
+# about the question asserted the strongest possible claim about its pixels.
+# A replayed array whose own sidecar said `diagnostic` came back out marked
+# `science`. The default now asserts nothing, and `science` has to be put there
+# by something that established it.
+SCIENCE = "science"            # established: these are sensor counts
+DIAGNOSTIC = "diagnostic"      # established NOT to be: refused, or made for viewing
+UNVALIDATED = "unvalidated"    # nothing was established either way
+VALIDITIES = (SCIENCE, DIAGNOSTIC, UNVALIDATED)
+
+# What produced the pixels. Separate from `validity` because the two answer
+# different questions -- "where did this come from" and "what is known about
+# it" -- and because measurement eligibility is not one predicate. Corner
+# GEOMETRY off an ISP mono frame is defensible; radiometry off the same frame
+# is not. Without the source recorded, a reader has no way to tell those two
+# cases apart, and Stage 4 has to define the distinction properly.
+SRC_RAW = "raw"                # sensor buffer, ISP bypassed, through admission
+SRC_ISP_MAIN = "isp_main"      # full-resolution ISP output
+SRC_ISP_PREVIEW = "isp_lores"  # the low-resolution ISP preview stream
+SRC_SYNTHETIC = "synthetic"    # rendered; no sensor involved
+SRC_REPLAY = "replay"          # read back from a file
+SRC_UNKNOWN = "unknown"
+SOURCE_KINDS = (SRC_RAW, SRC_ISP_MAIN, SRC_ISP_PREVIEW, SRC_SYNTHETIC,
+                SRC_REPLAY, SRC_UNKNOWN)
 
 
 @dataclass(slots=True)
@@ -75,25 +99,36 @@ class Frame:
     t_mono: float
     t_wall: float
     space: str = "mono8"
-    # Whether these pixels may be fitted to. A first-class field rather than a
-    # metadata key because it is a claim about the data's admissibility, and a
-    # claim like that should be impossible to lose by forgetting to copy a
-    # dictionary entry. `derive` carries it automatically.
+    # What is known about whether these pixels are sensor counts. A
+    # first-class field rather than a metadata key because it is a claim about
+    # the data's admissibility, and a claim like that should be impossible to
+    # lose by forgetting to copy a dictionary entry. `derive` carries it.
     #
-    #   'science'     the format was negotiated, known, uncompressed, unpacked,
-    #                 its geometry reconciles with the sensor's and its values
-    #                 fit the bit depth it claims. See cameras/rawformat.py.
-    #   'diagnostic'  something about that could not be established. The pixels
-    #                 may be useful to look at; they are not measurements, they
-    #                 are named as such on disk, and the offline readers refuse
-    #                 them for anything that fits a model.
-    validity: str = SCIENCE
+    #   'science'      the format was negotiated, known, uncompressed and
+    #                  unpacked, the samples are unsigned integers in native
+    #                  byte order, the geometry and stride reconcile with what
+    #                  the driver negotiated, and the values fit the depth and
+    #                  alignment claimed. See cameras/rawformat.py.
+    #   'diagnostic'   established NOT to be: a refused buffer captured under
+    #                  `allow_unvalidated_raw`, or a preview deliberately
+    #                  processed for viewing.
+    #   'unvalidated'  nothing was established. THE DEFAULT, so that a producer
+    #                  which never considered the question cannot assert the
+    #                  strongest claim by omission.
+    #
+    # `unvalidated` is not a weaker `diagnostic`. Diagnostic is a positive
+    # statement that the values are wrong; unvalidated is the absence of a
+    # statement, which is what an ISP frame or a sidecar-less replay honestly
+    # has. Readers treat both as inadmissible and say which they hit.
+    validity: str = UNVALIDATED
+    # Where the pixels came from. See the SRC_* constants above.
+    source_kind: str = SRC_UNKNOWN
     meta: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def now(
         cls, data: np.ndarray, cam_id: str, seq: int, space: str = "mono8",
-        validity: str = SCIENCE, **meta: Any
+        validity: str = UNVALIDATED, source_kind: str = SRC_UNKNOWN, **meta: Any
     ) -> Frame:
         return cls(
             data=data,
@@ -103,6 +138,7 @@ class Frame:
             t_wall=time.time(),
             space=space,
             validity=validity,
+            source_kind=source_kind,
             meta=dict(meta),
         )
 

@@ -25,7 +25,7 @@ from trilobite.cameras.rawformat import (
     classify,
     describe_refusal,
 )
-from trilobite.types import DIAGNOSTIC, SCIENCE
+from trilobite.types import DIAGNOSTIC, SCIENCE, UNVALIDATED, VALIDITIES
 
 W, H = 1456, 1088                      # IMX296
 
@@ -301,23 +301,184 @@ def test_padding_would_move_the_grid_origin_off_centre():
             - MLAGeometry(W, H, 100.0).origin[0]) == pytest.approx(8.0)
 
 
-def test_the_two_validity_values_are_the_only_two():
-    """A Frame's validity is a claim about admissibility, so it is a closed
-    set of two, not free text that a typo can quietly widen."""
+def test_a_frame_asserts_nothing_about_itself_by_default():
+    """Supervisory review R2, as one assertion.
+
+    `validity` used to default to `science`, so every construction that never
+    considered the question made the strongest claim in the system by
+    omission. The default now says nothing, and `science` has to be put there
+    by something that established it.
+    """
     from trilobite.types import Frame
 
-    assert (SCIENCE, DIAGNOSTIC) == ("science", "diagnostic")
     f = Frame.now(np.zeros((4, 4), np.uint8), "left", 1)
-    assert f.validity == SCIENCE and f.is_science
-    assert not Frame.now(np.zeros((4, 4), np.uint8), "left", 1,
-                         validity=DIAGNOSTIC).is_science
+    assert f.validity == UNVALIDATED
+    assert not f.is_science
+    assert f.source_kind == "unknown"
 
 
-def test_validity_survives_a_pipeline_stage():
-    """`derive` carries it automatically, which is the reason it is a field and
-    not a metadata key: a claim about admissibility must be impossible to lose
-    by forgetting to copy a dictionary entry."""
-    from trilobite.types import Frame
+def test_unvalidated_is_not_a_weaker_diagnostic():
+    """Three values, three meanings. `diagnostic` is a positive statement that
+    the values are wrong; `unvalidated` is the absence of any statement. Both
+    are inadmissible, and collapsing them would make an ISP frame and a
+    compressed buffer indistinguishable in the record."""
+    assert len({SCIENCE, DIAGNOSTIC, UNVALIDATED}) == 3
+    assert VALIDITIES == (SCIENCE, DIAGNOSTIC, UNVALIDATED)
 
-    f = Frame.now(np.zeros((4, 4), np.uint8), "left", 1, validity=DIAGNOSTIC)
-    assert f.derive(np.ones((4, 4), np.uint8)).validity == DIAGNOSTIC
+
+def test_validity_and_source_survive_a_pipeline_stage():
+    """`derive` carries both automatically, which is the reason they are fields
+    and not metadata keys: a claim about admissibility must be impossible to
+    lose by forgetting to copy a dictionary entry."""
+    from trilobite.types import SRC_RAW, Frame
+
+    f = Frame.now(np.zeros((4, 4), np.uint8), "left", 1,
+                  validity=DIAGNOSTIC, source_kind=SRC_RAW)
+    out = f.derive(np.ones((4, 4), np.uint8))
+    assert out.validity == DIAGNOSTIC
+    assert out.source_kind == SRC_RAW
+
+
+# -- R3: the sample representation, not merely its size ----------------------
+#
+# `dtype.itemsize` is not a check on the dtype. int16, float16 and uint16 are
+# all two bytes wide, and probes admitted int16(-1) and float16(0.5) as 10-bit
+# sensor counts. A negative count and a fractional count are both impossible,
+# so the invariant the module advertised was simply false.
+
+
+@pytest.mark.parametrize("dtype,why", [
+    (np.int16, "signed integer"),
+    (np.float16, "floating point"),
+])
+def test_a_two_byte_buffer_that_is_not_unsigned_is_refused(dtype, why):
+    buf = np.zeros((H, W + 16), dtype)
+    with pytest.raises(RawFormatError, match=why):
+        admit(buf, "R10", (W, H))
+
+
+def test_a_negative_sample_is_refused_before_any_value_check():
+    """The exact probe from the review. It has the right item size, the right
+    shape and the right stride, and -1 is not a photon count."""
+    buf = np.full((H, W + 16), -1, np.int16)
+    with pytest.raises(RawFormatError, match="cannot be negative or fractional"):
+        admit(buf, "R10", (W, H))
+
+
+def test_a_fractional_sample_is_refused():
+    buf = np.full((H, W + 16), 0.5, np.float16)
+    with pytest.raises(RawFormatError, match="cannot be negative or fractional"):
+        admit(buf, "R10", (W, H))
+
+
+def test_a_byte_swapped_buffer_is_refused():
+    """Right item size, right shape, every value wrong by a byte swap."""
+    buf = np.zeros((H, W + 16), np.dtype(">u2"))
+    with pytest.raises(RawFormatError, match="byte order"):
+        admit(buf, "R10", (W, H))
+
+
+@pytest.mark.parametrize("size", [(0, H), (W, 0), (-1, H)])
+def test_a_non_positive_negotiated_geometry_is_refused(size):
+    with pytest.raises(RawFormatError, match="non-positive"):
+        admit(r8(), "R8", size)
+
+
+# -- R3: sample depth, container width and alignment are three things --------
+#
+# The Picamera2 manual describes Pi 5 uncompressed samples as left-shifted in
+# their 16-bit word, and warns against deriving the sensor depth from the
+# format name. `R10` says the sample is ten bits; it does not say whether those
+# ten bits are 0-9 or 6-15, and the two readings differ by a factor of 64 in
+# every pixel.
+
+
+def test_the_three_quantities_are_recorded_separately():
+    got = admit(r10_unpacked(pad_px=16), "R10", (W, H))
+    assert got.meta["raw_bits_nominal"] == 10
+    assert got.meta["raw_bits_source"] == "format-name"
+    assert got.meta["raw_container_bits"] == 16
+    assert got.meta["raw_alignment"] == "lsb"
+    assert got.meta["raw_sample_shift"] == 0
+
+
+def test_left_aligned_samples_are_admitted_when_declared():
+    """A 10-bit sample shifted into bits 6-15 reaches 65472, which the
+    right-aligned reading refuses outright."""
+    samples = np.full((H, W), 1000, np.uint16)
+    buf = r10_unpacked(samples << 6, pad_px=16)
+
+    with pytest.raises(RawFormatError, match="above the 1023 maximum"):
+        admit(buf, "R10", (W, H), alignment="lsb")
+
+    got = admit(buf, "R10", (W, H), alignment="msb")
+    assert got.meta["raw_sample_shift"] == 6
+    assert got.meta["raw_value_ceiling"] == 1023 << 6
+    assert got.meta["raw_observed_max"] == 64000
+    assert got.meta["raw_low_bits_zero_filled"] is True
+    # The pixels are NOT shifted on the way out. Rescaling every value
+    # silently on the way to disk is the act this boundary exists to prevent.
+    assert int(got.array.max()) == 64000
+
+
+def test_a_left_aligned_refusal_names_the_setting_that_would_fix_it():
+    buf = r10_unpacked(np.full((H, W), 1000, np.uint16) << 6, pad_px=16)
+    with pytest.raises(RawFormatError, match="raw_alignment"):
+        admit(buf, "R10", (W, H), alignment="lsb")
+
+
+def test_left_alignment_still_catches_a_wider_sample():
+    """The ceiling is weaker under msb but not absent: 12-bit data delivered as
+    R10 reaches 65520, past the 65472 a left-aligned 10-bit sample can hold."""
+    buf = r10_unpacked(np.full((H, W), 4095, np.uint16) << 4, pad_px=16)
+    with pytest.raises(RawFormatError, match="above the 65472 maximum"):
+        admit(buf, "R10", (W, H), alignment="msb")
+
+
+def test_non_zero_low_bits_are_recorded_rather_than_refused():
+    """Some pipelines replicate the high bits downward instead of zero-filling.
+    That is not proof of anything wrong, so it is evidence, not a refusal."""
+    buf = r10_unpacked((np.full((H, W), 1000, np.uint16) << 6) | 0b101010, pad_px=16)
+    got = admit(buf, "R10", (W, H), alignment="msb")
+    assert got.meta["raw_low_bits_zero_filled"] is False
+    assert got.meta["raw_low_bits_max"] == 0b101010
+
+
+def test_an_unknown_alignment_is_refused_rather_than_guessed():
+    """A dark left-aligned frame and a bright right-aligned one have
+    indistinguishable histograms. A guess would enter the record with the same
+    confidence as a measurement."""
+    with pytest.raises(RawFormatError, match="cannot be guessed"):
+        admit(r8(), "R8", (W, H), alignment="whatever")
+
+
+def test_alignment_is_moot_when_the_sample_fills_its_container():
+    """R8 in one byte and R16 in two have nowhere to shift to."""
+    for name in ("R8",):
+        for how in ("lsb", "msb"):
+            assert admit(r8(), name, (W, H), alignment=how).meta["raw_sample_shift"] == 0
+
+
+# -- R5: the negotiated stride is exact, not a guide -------------------------
+
+
+def test_the_negotiated_stride_must_match_exactly():
+    buf = r10_unpacked(pad_px=16)                       # 2944 bytes per row
+    assert admit(buf, "R10", (W, H), stride_bytes=2944).array.shape == (H, W)
+    with pytest.raises(RawFormatError, match="negotiated a stride"):
+        admit(buf, "R10", (W, H), stride_bytes=2912)
+
+
+def test_which_stride_rule_was_applied_is_recorded():
+    """Two different strengths of evidence, and a sidecar must not present them
+    as the same thing."""
+    buf = r10_unpacked(pad_px=16)
+    assert admit(buf, "R10", (W, H), stride_bytes=2944).meta["raw_stride_source"] == "negotiated"
+    assert admit(buf, "R10", (W, H)).meta["raw_stride_source"] == "inferred"
+
+
+def test_an_internally_inconsistent_negotiation_is_refused():
+    """A driver reporting a stride narrower than one row of pixels is
+    describing a configuration nothing here can reconcile."""
+    with pytest.raises(RawFormatError, match="internally inconsistent"):
+        admit(r10_unpacked(pad_px=16), "R10", (W, H), stride_bytes=100)

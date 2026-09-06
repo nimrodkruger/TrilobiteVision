@@ -194,18 +194,83 @@ def test_the_hatch_turns_each_refusal_back_into_a_diagnostic_open(caplog):
     src = _source("MONO_PISP_COMP1", hatch=True)
     with caplog.at_level(logging.ERROR):
         assert src._choose_raw_format(_FakePicam(IMX296_MODES)) == "MONO_PISP_COMP1"
-    assert src._raw_admissible is False
     assert "UNVALIDATED" in src._raw_choice
     assert any("DIAGNOSTIC" in r.message for r in caplog.records)
 
 
-def test_the_hatch_does_not_downgrade_an_admissible_format():
-    """Setting the hatch is permission, not a mode. A camera that CAN be
-    validated still is, and still produces science frames."""
-    src = _source(None, hatch=True)
-    assert src._choose_raw_format(_FakePicam(IMX296_MODES)) == "R10"
+# -- what the driver actually negotiated (R5) --------------------------------
+#
+# _choose_raw_format decides what to ASK FOR. Nothing it decides is evidence,
+# because the driver answers for itself: it may substitute a format, and the
+# raw stream's geometry is not the main stream's. The verdict is taken from
+# camera_configuration() after configure, and these are the cases that
+# separates.
+
+
+def _read_back(negotiated, requested="R10", hatch=False, full=(1456, 1088)):
+    from trilobite.cameras.picam import Picamera2Source
+
+    src = Picamera2Source(CameraConfig(
+        cam_id="left", backend="picamera2", full_resolution=full,
+        allow_unvalidated_raw=hatch))
+    src._full_res = full
+    src._requested_raw = requested
+    src._raw_choice = f"{requested} (test)"
+
+    class _P:
+        def camera_configuration(self):
+            return {"raw": dict(negotiated)}
+
+    return src, src._read_back_raw(_P())
+
+
+def test_the_negotiated_format_is_what_decides_admissibility():
+    src, neg = _read_back({"format": "R10", "size": (1456, 1088), "stride": 2944})
     assert src._raw_admissible is True
-    assert "UNVALIDATED" not in src._raw_choice
+    assert neg == {"format": "R10", "size": (1456, 1088), "stride": 2944}
+
+
+def test_a_driver_substituting_a_compressed_format_refuses_to_open():
+    """The case the open-time check cannot see. R10 was requested and accepted;
+    the driver handed back the compressed transport, and from that point every
+    buffer is self-consistent with the substitution and looks correct."""
+    with pytest.raises(RawFormatError, match="COMPRESSED"):
+        _read_back({"format": "MONO_PISP_COMP1", "size": (1456, 1088)})
+
+
+def test_a_driver_substituting_an_admissible_format_is_allowed_but_named(caplog):
+    """R10 requested, R8 delivered. Readable, so not a refusal -- but two bits
+    per pixel have gone and nothing downstream would otherwise say so."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        src, _ = _read_back({"format": "R8", "size": (1456, 1088)})
+    assert src._raw_admissible is True
+    assert "R10 was requested" in src._raw_choice
+    assert any("negotiated R8" in r.message for r in caplog.records)
+
+
+def test_a_camera_with_no_raw_stream_after_configure_refuses():
+    from trilobite.cameras.picam import Picamera2Source
+
+    src = Picamera2Source(CameraConfig(cam_id="left", backend="picamera2"))
+
+    class _P:
+        def camera_configuration(self):
+            return {}
+
+    with pytest.raises(RawFormatError, match="no raw stream"):
+        src._read_back_raw(_P())
+
+
+def test_the_raw_geometry_is_recorded_independently_of_main():
+    """`full_resolution` sizes the MAIN stream; raw is configured at the
+    sensor's native size. Validating a raw buffer against the main resolution
+    happens to work only while the two are equal."""
+    src, neg = _read_back({"format": "R10", "size": (1456, 1088)},
+                          full=(728, 544))
+    assert neg["size"] == (1456, 1088)
+    assert src._full_res == (728, 544)
 
 
 # -- the wiring: capture_full through the admission boundary -----------------
@@ -233,9 +298,12 @@ class _FakeRequest:
 
 
 class _FakePicam2:
-    def __init__(self, arrays, raw_format, meta=None):
+    def __init__(self, arrays, raw_format, meta=None, raw_size=(1456, 1088),
+                 stride=None):
         self._arrays = arrays
         self._raw_format = raw_format
+        self._raw_size = raw_size
+        self._stride = stride
         self._meta = meta or {"ExposureTime": 5000}
         self.requests: list[_FakeRequest] = []
 
@@ -245,20 +313,38 @@ class _FakePicam2:
         return r
 
     def camera_configuration(self):
-        return {"raw": {"format": self._raw_format}}
+        raw = {"format": self._raw_format, "size": self._raw_size}
+        if self._stride is not None:
+            raw["stride"] = self._stride
+        return {"raw": raw}
 
 
-def _wired(raw_format, buffer, *, admissible, full=(1456, 1088), rotate_deg=0):
+def _wired(raw_format, buffer, *, hatch=False, full=(1456, 1088),
+           raw_size=None, stride=None, rotate_deg=0, alignment="lsb"):
+    """A source wired past open(), with the raw stream already negotiated.
+
+    `hatch` is `allow_unvalidated_raw`, and it is the ONLY thing that decides
+    whether an inadmissible buffer yields a diagnostic frame or a refusal --
+    which is supervisory review R4. Admissibility itself comes from the
+    negotiated format, exactly as `_read_back_raw` would set it.
+    """
     from trilobite.cameras.picam import Picamera2Source
+    from trilobite.cameras.rawformat import classify
 
+    raw_size = raw_size or full
     src = Picamera2Source(CameraConfig(
         cam_id="left", backend="picamera2", full_resolution=full,
-        rotate_deg=rotate_deg))
-    src._picam = _FakePicam2({"raw": buffer}, raw_format)
+        rotate_deg=rotate_deg, allow_unvalidated_raw=hatch,
+        raw_alignment=alignment))
+    src._picam = _FakePicam2({"raw": buffer}, raw_format, raw_size=raw_size,
+                             stride=stride)
     src._full_res = full
     src._open = True
-    src._raw_admissible = admissible
+    fmt = classify(raw_format)
+    src._raw_admissible = bool(fmt and fmt.admissible)
     src._raw_choice = f"{raw_format} (test)"
+    src._raw_negotiated = {"format": raw_format, "size": raw_size,
+                           "stride": stride}
     return src
 
 
@@ -270,29 +356,55 @@ def _r10_bytes(h, w, pad_px=16):
 
 def test_an_admitted_raw_capture_is_science_and_carries_its_evidence():
     truth, delivered = _r10_bytes(1088, 1456)
-    f = _wired("R10", delivered, admissible=True).capture_full(raw=True)
+    f = _wired("R10", delivered, stride=2944).capture_full(raw=True)
 
     assert f.is_science and f.validity == "science"
+    assert f.source_kind == "raw"
     assert f.data.shape == (1088, 1456)
     assert np.array_equal(f.data, truth)
     assert f.meta["raw_admitted"] is True
     assert f.meta["raw_format"] == "R10"
     assert f.meta["raw_bytes_per_pixel"] == 2
     assert f.meta["raw_padding_px"] == 16
+    assert f.meta["raw_stride_source"] == "negotiated"
     assert f.meta["allow_unvalidated_raw"] is False
 
 
-def test_a_compressed_capture_comes_back_diagnostic_with_the_reason():
-    """The hatch is open, so a frame is still produced -- you have to be able
-    to look at something while bringing a sensor up. What must not happen is
-    that it calls itself science."""
+def test_a_science_request_fails_rather_than_degrading_when_the_hatch_is_shut():
+    """Supervisory review R4, and the one that mattered most in this batch.
+
+    The runtime path caught every admission failure and returned diagnostic
+    pixels regardless, so a science capture request was answered -- and
+    reported as a success -- with data the code had just established were not
+    sensor counts. `allow_unvalidated_raw` was advertised as the way that
+    happens and was never consulted.
+    """
     buf = np.full((1088, 1456), 128, np.uint8)
-    f = _wired("MONO_PISP_COMP1", buf, admissible=False).capture_full(raw=True)
+    src = _wired("MONO_PISP_COMP1", buf)
+    with pytest.raises(RawFormatError, match="no science capture to return"):
+        src.capture_full(raw=True)
+    assert all(r.released for r in src._picam.requests), (
+        "a refusal must not cost a request from the pool")
+
+
+def test_the_refusal_names_the_setting_that_would_permit_it():
+    src = _wired("MONO_PISP_COMP1", np.zeros((1088, 1456), np.uint8))
+    with pytest.raises(RawFormatError, match="allow_unvalidated_raw"):
+        src.capture_full(raw=True)
+
+
+def test_a_compressed_capture_comes_back_diagnostic_only_with_the_hatch_open():
+    """With the opt-in set, a frame is still produced -- you have to be able to
+    look at something while bringing a sensor up. What must not happen is that
+    it calls itself science."""
+    buf = np.full((1088, 1456), 128, np.uint8)
+    f = _wired("MONO_PISP_COMP1", buf, hatch=True).capture_full(raw=True)
 
     assert not f.is_science and f.validity == "diagnostic"
     assert f.meta["raw_admitted"] is False
     assert "COMPRESSED" in f.meta["raw_refusal"]
     assert f.meta["raw_buffer_shape"] == [1088, 1456]
+    assert f.meta["raw_negotiated_format"] == "MONO_PISP_COMP1"
     # Untouched, deliberately: there is no correct interpretation to apply, so
     # applying none is the honest answer.
     assert f.data.shape == (1088, 1456)
@@ -304,11 +416,32 @@ def test_a_buffer_that_betrays_a_validated_format_is_loud(caplog):
     not reconcile with it -- that indicts the driver, not the config."""
     import logging
 
-    src = _wired("R10", np.zeros((1080, 2944), np.uint8), admissible=True)
-    with caplog.at_level(logging.ERROR):
-        f = src.capture_full(raw=True)
-    assert f.validity == "diagnostic"
+    src = _wired("R10", np.zeros((1080, 2944), np.uint8))
+    with caplog.at_level(logging.ERROR), pytest.raises(RawFormatError):
+        src.capture_full(raw=True)
     assert any("validated at open time" in r.message for r in caplog.records)
+
+
+def test_admission_uses_the_raw_geometry_not_the_main_resolution():
+    """R5 at the capture seam. `full_resolution` sizes main; the raw stream is
+    at the sensor's native size. Checking one against the other works only
+    while they happen to be equal."""
+    truth, delivered = _r10_bytes(1088, 1456)
+    f = _wired("R10", delivered, full=(728, 544), raw_size=(1456, 1088),
+               stride=2944).capture_full(raw=True)
+    assert f.data.shape == (1088, 1456)
+    assert f.meta["raw_width"] == 1456
+    assert (f.meta["image_width"], f.meta["image_height"]) == (1456, 1088)
+
+
+def test_a_stride_that_disagrees_with_the_negotiated_one_is_refused():
+    """Once the driver states its stride there is no bounded-pad guessing
+    left to do: the row length either matches it or the buffer is not the one
+    the configuration describes."""
+    _, delivered = _r10_bytes(1088, 1456, pad_px=16)          # 2944 bytes
+    src = _wired("R10", delivered, stride=2912)               # driver says 2912
+    with pytest.raises(RawFormatError, match="negotiated a stride"):
+        src.capture_full(raw=True)
 
 
 def test_admission_runs_before_orientation():
@@ -316,7 +449,8 @@ def test_admission_runs_before_orientation():
     the sensor delivers it; turn the frame first and it is along the bottom,
     where cropping the right removes real image instead."""
     truth, delivered = _r10_bytes(1088, 1456)
-    f = _wired("R10", delivered, admissible=True, rotate_deg=90).capture_full(raw=True)
+    f = _wired("R10", delivered, stride=2944,
+               rotate_deg=90).capture_full(raw=True)
 
     assert f.data.shape == (1456, 1088), "the frame is turned"
     assert np.array_equal(f.data, np.rot90(truth, k=-1)), "and nothing else changed"
@@ -324,21 +458,32 @@ def test_admission_runs_before_orientation():
     assert (f.meta["image_width"], f.meta["image_height"]) == (1088, 1456)
 
 
-def test_the_request_is_released_even_on_the_refusal_path():
+def test_the_request_is_released_even_on_the_diagnostic_path():
     """A request left unreleased starves a four-deep pool and stalls the
-    sensor, so a refusal must not cost one."""
-    src = _wired("MONO_PISP_COMP1", np.zeros((1088, 1456), np.uint8),
-                 admissible=False)
+    sensor, so neither a refusal nor a diagnostic capture may cost one."""
+    src = _wired("MONO_PISP_COMP1", np.zeros((1088, 1456), np.uint8), hatch=True)
     src.capture_full(raw=True)
     assert all(r.released for r in src._picam.requests)
 
 
-def test_the_processed_stream_is_not_put_through_raw_admission():
-    """`raw=False` is the ISP output. It is not sensor counts and never claimed
-    to be, so the raw format has no bearing on it."""
-    src = _wired("MONO_PISP_COMP1", np.zeros((1088, 1456), np.uint8),
-                 admissible=False)
+def test_the_processed_stream_is_unvalidated_not_science():
+    """`raw=False` is the ISP output. Nothing establishes it as sensor counts,
+    and nothing establishes that it is not -- which is what `unvalidated` says,
+    and what the old default of `science` did not (R2)."""
+    src = _wired("R10", np.zeros((1088, 2944), np.uint8))
     src._picam._arrays["main"] = np.zeros((1088, 1456), np.uint8)
     f = src.capture_full(raw=False)
     assert f.space == "mono8"
+    assert f.validity == "unvalidated"
+    assert f.source_kind == "isp_main"
     assert "raw_admitted" not in f.meta
+
+
+def test_the_preview_and_the_served_full_frame_are_both_unvalidated():
+    """Three producers, one rule. Neither ISP stream may claim admission."""
+    s = source()
+    s.request_full_frame()
+    preview = s.read_preview()
+    served = s.take_full_frame()
+    assert preview.validity == "unvalidated"
+    assert served.validity == "unvalidated"

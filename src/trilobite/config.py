@@ -132,6 +132,35 @@ class CameraConfig(BaseModel):
     # model. It is for bringing a new sensor up, not for capturing data.
     allow_unvalidated_raw: bool = False
 
+    # Where the sensor sample sits inside the container word it is delivered
+    # in. Supervisory review R3, and the Picamera2 manual's own warning.
+    #
+    #   lsb   right-aligned. A 10-bit sample occupies bits 0-9 of a uint16;
+    #         values run 0..1023.
+    #   msb   left-aligned, which is what the Picamera2 manual (raw stream
+    #         configuration, pp. 21-22) describes for the Pi 5. A 10-bit
+    #         sample occupies bits 6-15; values run 0..65472 in steps of 64,
+    #         and the true sample is `value >> 6`.
+    #
+    # THE FORMAT NAME DOES NOT SAY WHICH. `R10` names the sensor's sample
+    # depth; the manual explicitly warns against deriving more from it. The two
+    # readings differ by a factor of 64 in every pixel, so this is declared
+    # rather than guessed: a dark left-aligned frame and a bright right-aligned
+    # one have indistinguishable histograms, and a guess would enter the record
+    # with the same confidence as a measurement.
+    #
+    # Getting it wrong one way is loud. Declaring `lsb` against left-aligned
+    # data puts values far above the 10-bit ceiling, and admission refuses the
+    # buffer and names this setting in the refusal. The other way is quiet --
+    # `msb` against right-aligned data just reads very dark -- so confirm it
+    # once against a bright target. `raw_observed_max` is in every sidecar for
+    # exactly that check.
+    #
+    # The pixels on disk are NEVER shifted to match. `raw_sample_shift` is
+    # recorded and the readers apply it; silently rescaling every value on the
+    # way to storage is the thing this whole boundary exists to prevent.
+    raw_alignment: Literal["lsb", "msb"] = "lsb"
+
     # Camera controls passed straight to libcamera, e.g.
     #   {ExposureTime: 5000, AnalogueGain: 1.0, AeEnable: false}
     # For calibration you almost always want AeEnable and AwbEnable off so

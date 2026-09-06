@@ -57,7 +57,7 @@ from typing import Any
 import numpy as np
 
 from ..config import StorageConfig
-from ..types import Frame
+from ..types import SCIENCE, Frame
 from . import devices
 
 log = logging.getLogger(__name__)
@@ -455,14 +455,20 @@ class SessionWriter:
         # by what the file *is* and names which physical camera produced it
         # without opening the sidecar.
         #
-        # A frame whose pixels could not be established as sensor counts is
-        # named `diagnostic_` FIRST, ahead of the tag. In the filename rather
-        # than only in the sidecar because the failure this guards against is
-        # somebody loading a directory of .npy files by glob and fitting a
-        # model to them -- which is exactly what happened with the compressed
-        # session -- and a leading prefix is the one piece of provenance that
-        # survives `ls`, a glob, and a drag into MATLAB.
-        prefix = "" if frame.is_science else "diagnostic_"
+        # A frame whose pixels were not established as sensor counts says so in
+        # its NAME, ahead of the tag. In the filename rather than only in the
+        # sidecar because the failure this guards against is somebody loading a
+        # directory of .npy files by glob and fitting a model to them -- which
+        # is exactly what happened with the compressed session -- and a leading
+        # prefix is the one piece of provenance that survives `ls`, a glob and
+        # a drag into MATLAB.
+        #
+        # Three validities, three names, because `diagnostic` and
+        # `unvalidated` are different claims: the first says the values are
+        # known to be wrong, the second says nothing was established. Calling
+        # an ISP frame `diagnostic_` would be as inaccurate in its own
+        # direction as calling it `science`.
+        prefix = "" if frame.validity == SCIENCE else f"{frame.validity}_"
         stem = (f"{prefix}{tag}_{frame.cam_id}_{n:06d}_"
                 f"{datetime.now().strftime('%H%M%S_%f')}")
 
@@ -493,11 +499,16 @@ class SessionWriter:
             "t_wall": frame.t_wall,
             "t_iso": datetime.fromtimestamp(frame.t_wall).isoformat(),
             "space": frame.space,
-            # 'science' or 'diagnostic'. The one field an offline reader must
-            # check before fitting anything: `space: raw` says the ISP was
-            # bypassed, which is a statement about the PATH, not about whether
-            # the values that came down it are sensor counts.
+            # 'science', 'diagnostic' or 'unvalidated'. The field an offline
+            # reader must check before fitting anything: `space: raw` says the
+            # ISP was bypassed, which is a statement about the PATH, not about
+            # whether the values that came down it are sensor counts.
             "validity": frame.validity,
+            # What produced the pixels. Recorded alongside validity because
+            # measurement eligibility is not one predicate -- corner geometry
+            # off an ISP mono frame is defensible where radiometry off the same
+            # frame is not, and a reader cannot tell those apart without this.
+            "source_kind": frame.source_kind,
             "dtype": str(frame.data.dtype),
             "shape": list(frame.data.shape),
             "sensor_metadata": _jsonable(frame.meta),

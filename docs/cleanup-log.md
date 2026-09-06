@@ -12,6 +12,218 @@ git checkout .              # everything back to HEAD
 
 ---
 
+## 2026-09-06 (q) — supervisory review R1–R6: the boundary was bypassable
+
+`docs/stage-2-supervisory-review.md` reviewed the Stage 2 work and did not
+accept it against gate G1. Six findings, all of the same shape: **the admission
+boundary was correct in isolation and the claim it produced did not survive
+contact with the rest of the software.** Probes against the running code, not
+inspection — which is why they found things the mutation pass did not.
+
+This entry closes R1–R6. Stage 3 is gated on it.
+
+### R2 — validity was being laundered
+
+The worst of the six, because it made the other five academic. `Frame.validity`
+defaulted to `science`, so every construction that never considered the
+question asserted the strongest claim in the system by omission. And
+`ReplaySource` read pixels and ignored the sidecar beside them. Put together:
+a capture the rig had **refused**, written to disk as `diagnostic`, replayed
+through the replay backend, came back out labelled `science`. The stack
+laundering a refusal into an admission by round-tripping through a file.
+
+**Three validities now, and the third is the default.**
+
+| | means |
+| --- | --- |
+| `science` | established: these are sensor counts |
+| `diagnostic` | established NOT to be — refused, or processed for viewing |
+| `unvalidated` | **the default.** Nothing was established either way |
+
+`unvalidated` is not a weaker `diagnostic` and collapsing them would lose the
+distinction that matters: `diagnostic` is a positive statement that the values
+are wrong, `unvalidated` is the absence of a statement. An ISP frame and a
+compressed buffer are different situations and the record now says which.
+
+A new `source_kind` field (`raw` / `isp_main` / `isp_lores` / `synthetic` /
+`replay` / `unknown`) sits beside it, because **measurement eligibility is not
+one predicate**. Corner geometry off an ISP mono frame is defensible;
+radiometry off the same frame is not. Without the source recorded a reader
+cannot tell those apart, and every calibration pose is exactly that case.
+
+Closed: the `Frame` default, `capture_full(raw=False)`, the served full frame,
+the preview, both synthetic paths, and replay — which now reads the sidecar and
+carries what it finds, promoting nothing.
+
+### R1 — both readers failed open
+
+`scripts/read_capture.py` asked one question: is the validity string exactly
+`diagnostic`? Everything else passed. The review's probes returned true for
+`unrecorded` and for `typo`. So a missing field, a misspelling and a value from
+a newer schema all read as measurable — failing open on the one field whose
+job is to fail closed. `tv_require_science.m` had the same policy.
+
+Both now require **an explicitly recognised claim plus the evidence it rests
+on**. A sidecar saying `science` with no `raw_admitted` record is refused: a
+label anyone can edit is not evidence, and treating it as such makes the whole
+boundary bypassable with a text editor.
+
+And both now distinguish the two questions:
+
+- `require_science` — reading VALUES as sensor counts. Needs admitted `science`.
+- `require_geometry` — reading POSITIONS. Accepts admitted `science` and
+  `unvalidated` output from an ISP source.
+
+That distinction is what keeps `--detect` working on calibration poses without
+a flag, which it must: it is the one documented use of the script. Refusing
+them would have trained the operator to pass `--allow-everything` and thrown
+the guard away. `--allow-diagnostic` and `--allow-legacy` are separate flags
+because they permit different things, and the archive is not silently promoted
+— a pre-boundary file reads as `unknown` and needs saying out loud.
+
+### R3 — the representation was never checked
+
+`admit()` checked `dtype.itemsize`, which is not a check on the dtype. `int16`,
+`float16` and `uint16` are all two bytes wide, and the review's probes admitted
+`int16(-1)` and `float16(0.5)` as 10-bit sensor counts. A negative count and a
+fractional count are both impossible, so the invariant the module advertised
+was simply false. Now: unsigned integers only, native byte order only, positive
+geometry only.
+
+**And the harder half.** The review cites the Picamera2 manual (raw stream
+configuration, pp. 21–22): Pi 5 uncompressed samples are **left-shifted within
+their 16-bit word**, and the manual explicitly warns against deriving the
+sensor bit depth from the format name. `R10` names a ten-bit sample and says
+nothing about whether those ten bits are 0–9 or 6–15. **Those two readings
+differ by a factor of 64 in every pixel.**
+
+So three quantities are now kept apart where one `bits` field used to stand:
+
+| field | is |
+| --- | --- |
+| `raw_bits_nominal` (+ `raw_bits_source`) | what the format NAME implies. Evidence of nothing on its own, and now named so |
+| `raw_container_bits` | the width of the word the sample arrives in |
+| `raw_alignment` / `raw_sample_shift` | where the one sits inside the other |
+
+Alignment is **declared in the config, not guessed**, because a dark
+left-aligned frame and a bright right-aligned one have indistinguishable
+histograms and a guess would enter the record with the same confidence as a
+measurement. Getting it wrong one way is loud: `lsb` declared against
+left-aligned data puts values far past the ten-bit ceiling and admission
+refuses the buffer, naming the setting in the refusal. The other way is quiet
+— the frame just reads dark — so `raw_observed_max` is in every sidecar for
+that check, and `config/pi.yaml` says to confirm it once against a bright
+target.
+
+**The pixels on disk are never shifted.** `raw_sample_shift` is recorded and
+the readers apply it. Silently rescaling every value on the way to storage is
+precisely the act this boundary exists to prevent, and doing it "helpfully"
+would be worse than not having the boundary.
+
+### R5 — the request was being validated, not the negotiation
+
+`_choose_raw_format` decided what to ask for and the code then treated that
+decision as established. But the driver answers for itself: it may substitute a
+format, and — separately — the raw stream's geometry is not the main stream's.
+`full_resolution` sizes `main`; raw is configured at the sensor's native size.
+Admission was checking raw buffers against the main resolution, which happens
+to work only while the two are equal.
+
+`_read_back_raw` now reads `camera_configuration()["raw"]` after `configure`
+and takes **format, size and stride** from it. That is the only thing admission
+checks against. A substituted compressed format is caught here and nowhere
+else, because from that point on every buffer is self-consistent with the
+substitution and looks perfectly correct. A substitution to a different but
+still admissible format (R10 requested, R8 delivered) is allowed and named
+loudly — two bits per pixel have gone and nothing downstream would otherwise
+say so.
+
+With the driver's stride in hand the row length must match it **exactly**;
+the bounded-pad rule survives only as the fallback when the driver does not
+report one, and `raw_stride_source` records which was used. Two different
+strengths of evidence, and a sidecar must not present them as the same thing.
+
+### R4 — the opt-in was advertised and not consulted
+
+`_admit_raw` caught every admission failure and returned diagnostic data
+regardless of `allow_unvalidated_raw`. So a **science capture request could be
+answered — and reported as a success — with pixels the code had just
+established were not sensor counts.** A 65535-valued R10 probe confirmed it.
+
+The runtime failure now fails the request. `/api/capture/{id}/raw` returns
+**422 and no file**, naming the setting that would permit a diagnostic capture
+instead. There is no unconditional fallback left.
+
+### R6 — an unbounded await is not a request, it is a hostage
+
+The status poll awaited `fetch` with no timeout and scheduled the next poll
+only after that await returned. A response that never completes — a half-open
+TCP connection surviving a Pi that has gone away, which is the ordinary way a
+bench rig disappears — suspended the poll loop indefinitely. And the poll loop
+was what set the stale indicator. **The page went quiet in exactly the case it
+exists to shout in**, while MJPEG carried on displaying the last frame it
+received.
+
+Two independent fixes, because either alone is a single point of failure: a
+4-second `AbortController` bound on the status fetch, and a 1-second watchdog
+timer that renders the banner from **elapsed time since the last good status**
+regardless of whether any poll has completed. The banner counts up, so it reads
+as a live measurement of how long the rig has been away rather than as a stuck
+warning.
+
+### On disk
+
+`validity` and `source_kind` are in every sidecar, including poses. Filenames
+carry the validity as a prefix ahead of the tag — `diagnostic_raw_…`,
+`unvalidated_still_…`, and nothing for `science` — so `ls`, a glob and a drag
+into MATLAB all separate measurement from everything else. Three validities,
+three names: calling an ISP frame `diagnostic_` would be as inaccurate in its
+own direction as calling it `science`.
+
+### Testing
+
+New: `tests/test_validity.py` (15) proves nothing anywhere can produce a
+science frame without establishing one — defaults, replay, ISP, synthetic,
+pipeline. `tests/test_reader_gate.py` (14) loads `read_capture.py` by path and
+asserts every case that used to pass. `tests/test_rawformat.py` grew to 57 with
+the representation and alignment cases. Three browser scenarios cover R6,
+including a route that swallows `/api/status` entirely — never fulfilled, never
+aborted, because an error response is the easy case.
+
+**Mutation testing: 24 mutants across R1–R5, all caught.** Including the ones
+that matter most — `Frame` defaulting to `science` again, the reader trusting a
+label without its evidence, admission using the main resolution, and the hatch
+being ignored at runtime.
+
+Suite: **433 passed, 13 skipped**, plus 13 browser scenarios. Ruff clean.
+
+### Not closed here
+
+Rig acceptance of Stages 1, 2 and these corrections. The Stage 0 residuals:
+`src/flyeye` and its service file still need removing (PowerShell, since this
+session cannot delete on Windows), and `Claude outputs/tests.yml` is still a
+draft outside `.github/workflows/` so there is no active CI. Recorded as
+outstanding rather than folded into this entry's claims.
+
+### Bench test for these corrections
+
+1. Normal capture: `"validity": "science"`, `"source_kind": "raw"`,
+   `raw_admitted: true`, `raw_stride_source: "negotiated"`, and
+   `raw_observed_max` present. Check that last one against 1023 — if it is
+   much larger, the pipeline is left-aligning and `raw_alignment` must be `msb`.
+2. A capture with `raw_format: MONO_PISP_COMP1` and the hatch shut: the camera
+   refuses to open. With the hatch open: it opens, and the capture lands as
+   `diagnostic_still_…` with the refusal quoted.
+3. `python scripts/read_capture.py <any pose> --detect --board 4x3` still works
+   with no flag. The same command on a `diagnostic_` file refuses.
+4. Take an old pre-boundary capture off the archive and run `--detect` on it:
+   it must refuse and name `--allow-legacy`.
+5. Unplug the Pi's network mid-session with the dashboard open. Within five
+   seconds the header must show a stale-status banner whose age counts up.
+   Plug back in; it must clear.
+
+---
+
 ## 2026-09-06 (p) — review stage 2: a raw buffer must earn the word "science"
 
 Stage 2 of `docs/implementation-plan.md`, closing review finding **F7** and

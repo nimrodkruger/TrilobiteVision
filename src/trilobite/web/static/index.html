@@ -396,10 +396,31 @@ function note(camId, msg, cls = "") {
   log(msg, cls);
 }
 
-async function jget(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`${r.status} ${(await r.text()).slice(0, 250)}`);
-  return r.json();
+/* An unbounded await is not a request, it is a hostage.
+   Supervisory review R6: the status poll awaited `fetch` with no timeout and
+   scheduled the next poll only after that await returned. A response that
+   never completes -- a half-open TCP connection surviving a Pi that has gone
+   away, which is the ordinary way a rig on a bench disappears -- therefore
+   suspended the poll loop indefinitely, and the loop was what set the stale
+   indicator. The page went quiet in exactly the case it exists to shout in.
+   Two independent fixes, because either alone is a single point of failure:
+   this bound, and the elapsed-time watchdog further down. */
+const POLL_TIMEOUT_MS = 4000;
+
+async function jget(url, timeoutMs = 0) {
+  const ctrl = timeoutMs ? new AbortController() : null;
+  const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
+  try {
+    const r = await fetch(url, ctrl ? { signal: ctrl.signal } : undefined);
+    if (!r.ok) throw new Error(`${r.status} ${(await r.text()).slice(0, 250)}`);
+    return await r.json();
+  } catch (e) {
+    if (e.name === "AbortError")
+      throw new Error(`no response within ${timeoutMs} ms`);
+    throw e;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 async function jsend(url, body, method = "POST") {
   const r = await fetch(url, {
@@ -2163,19 +2184,34 @@ function renderCameraHealth(c) {
 }
 
 /* The status poll failing is a different fault from anything it reports, and
-   the header is the only place it can be shown. */
-function setPollHealth(ok, message = "") {
+   the header is the only place it can be shown.
+
+   Driven by ELAPSED TIME since the last good status, not by a poll having
+   completed with an error. That is the whole point (R6): a request that hangs
+   produces no error and no completion, so anything keyed off the poll's own
+   outcome cannot see it. This function is called from the poll AND from a
+   timer that runs whether or not the poll is making progress. */
+const STATUS_STALE_S = 5.0;
+let lastStatusAt = 0;              // performance.now() of the last good status
+let lastStatusError = "";
+
+function renderPollHealth() {
   const el = $("#poll-dead");
   if (!el) return;
-  el.hidden = ok;
-  el.textContent = ok ? "" : "⚠ no reply from the rig — everything below is stale";
-  el.title = message;
+  const age = lastStatusAt ? (performance.now() - lastStatusAt) / 1000 : Infinity;
+  const dead = age > STATUS_STALE_S;
+  el.hidden = !dead;
+  if (!dead) return;
+  el.textContent = lastStatusAt
+    ? `⚠ no reply from the rig for ${age.toFixed(0)} s — everything below is stale`
+    : "⚠ no reply from the rig yet — nothing below has been confirmed";
+  el.title = lastStatusError || "the status request has not completed";
 }
 
 let tick = 0;
 async function poll() {
   try {
-    const s = await jget("/api/status");
+    const s = await jget("/api/status", POLL_TIMEOUT_MS);
     const st = s.storage || {};
     const el = $("#session");
     el.textContent =
@@ -2219,18 +2255,26 @@ async function poll() {
     // feature is broken when the page is simply the one from before the pull.
     if (tick % 15 === 0) checkStale();
     pollFailures = 0;
-    setPollHealth(true);
+    lastStatusAt = performance.now();
+    lastStatusError = "";
   } catch (e) {
-    /* One missed poll is a hiccup; several in a row means the server has
-       stopped answering, and the page must say so. It used to swallow every
-       one of them silently, so a dead backend looked exactly like a quiet
-       rig -- the streams do NOT show it, because MJPEG keeps displaying the
-       last frame it received for as long as the tab is open. */
+    /* One missed poll is a hiccup; the banner is driven by how long it has
+       been since a GOOD status, not by this count, so a slow rig does not
+       flicker and a dead one cannot hide. The message is kept for the
+       tooltip: "no reply for 12 s" and "422 from /api/status" call for
+       different responses at the bench. */
     pollFailures++;
-    if (pollFailures >= 3) setPollHealth(false, e.message);
+    lastStatusError = e.message;
   }
+  renderPollHealth();
   setTimeout(poll, 1000);
 }
+
+/* The watchdog. Independent of the poll on purpose: if the poll loop is stuck
+   -- awaiting a response that never arrives, or thrown somewhere unexpected --
+   this still runs, and the header still tells the truth. It is also what makes
+   the age count up on screen rather than sitting on one stale number. */
+setInterval(renderPollHealth, 1000);
 
 buildTabs().then(() => { poll(); pollTiles(); pollSession(); })
           .catch(e => log("startup: " + e.message, "err"));

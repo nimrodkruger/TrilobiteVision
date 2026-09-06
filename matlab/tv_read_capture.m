@@ -11,15 +11,25 @@ function cap = tv_read_capture(path)
 %     .cam_id       'left' or 'right'
 %     .tag          'raw' or 'view'
 %     .space        'raw', 'mono8', 'mono16'
-%     .validity     'science', 'diagnostic', or 'unrecorded' (written before
-%                   the rig had an admission boundary). DIFFERENT QUESTION
-%                   from .space: 'raw' says the ISP was bypassed, which is a
-%                   claim about the path the pixels took, not about whether
-%                   the values are sensor counts. A compressed PiSP buffer is
-%                   space 'raw' and is not measurable.
-%     .is_science   false only for 'diagnostic'. Call TV_REQUIRE_SCIENCE(CAP)
-%                   before fitting anything; the micro-image and sub-aperture
-%                   helpers do it for you.
+%     .validity     'science', 'diagnostic', 'unvalidated', or 'unknown' for
+%                   anything this reader does not recognise -- including a
+%                   missing field, a typo, and a newer schema's value.
+%                   DIFFERENT QUESTION from .space: 'raw' says the ISP was
+%                   bypassed, which is a claim about the path the pixels took,
+%                   not about whether the values are sensor counts. A
+%                   compressed PiSP buffer is space 'raw' and is not
+%                   measurable.
+%     .source_kind  'raw' / 'isp_main' / 'isp_lores' / 'synthetic' / 'replay'.
+%                   Decides which KINDS of measurement are defensible: corner
+%                   geometry off an ISP frame is fine, radiometry is not.
+%     .admitted     whether the sidecar carries the admission record a
+%                   'science' claim depends on. A label is not the evidence.
+%     .is_science   'science' AND .admitted. Call TV_REQUIRE_SCIENCE(CAP)
+%                   before fitting anything; the micro-image helper calls it
+%                   with 'geometry' for you.
+%     .sample_shift how far left the sensor sample sits in its stored word.
+%                   .image is NOT shifted; use BITSHIFT(cap.image, -shift).
+%     .alignment    'lsb' / 'msb' / 'unknown'.
 %     .t_iso        wall-clock time of capture
 %     .sensor       exposure, gain and whatever else libcamera reported
 %     .pipeline     every processing stage's full parameter set
@@ -127,17 +137,56 @@ function cap = tv_read_capture(path)
   cap.pipeline = i_get(info, 'pipeline', struct());
   cap.camera   = i_get(info, 'camera', struct());
 
-  % Whether these pixels may be fitted to. Written by the rig for every
-  % capture; absent on files from before the admission boundary existed, which
-  % are reported as 'unrecorded' rather than promoted to 'science'.
-  cap.validity   = i_get(info, 'validity', 'unrecorded');
-  cap.is_science = ~strcmp(cap.validity, 'diagnostic');
-  if ~cap.is_science
+  % What the rig established about these pixel values, and where they came
+  % from. Both are read verbatim and neither is repaired: an unrecognised,
+  % missing or misspelled validity becomes 'unknown', which every downstream
+  % check refuses. The old version treated everything except the exact string
+  % 'diagnostic' as measurable, which failed OPEN on the one field whose job
+  % is to fail closed.
+  cap.validity    = i_get(info, 'validity', '');
+  if ~any(strcmp(cap.validity, {'science', 'diagnostic', 'unvalidated'}))
+    if ~isempty(cap.validity)
+      warning('tv_read_capture:unknownValidity', ...
+              ['%s records validity "%s", which this reader does not ' ...
+               'recognise -- treating it as unknown. It may come from a ' ...
+               'newer schema.'], img_path, cap.validity);
+    end
+    cap.validity = 'unknown';
+  end
+  cap.source_kind = i_get(info, 'source_kind', 'unknown');
+
+  % The evidence a 'science' claim rests on. Kept separate from the label
+  % because a label anyone can edit is not evidence of anything.
+  cap.admitted = isstruct(cap.sensor) && isfield(cap.sensor, 'raw_admitted') ...
+                 && logical(cap.sensor.raw_admitted);
+  cap.is_science = strcmp(cap.validity, 'science') && cap.admitted;
+
+  if strcmp(cap.validity, 'diagnostic')
     warning('tv_read_capture:diagnostic', ...
-            ['%s is tagged DIAGNOSTIC: the rig could not establish that its ' ...
-             'values are sensor counts (%s). Look at it, but do not fit ' ...
+            ['%s is tagged DIAGNOSTIC: the rig established that its values ' ...
+             'are NOT sensor counts (%s). Look at it, but do not fit ' ...
              'anything to it.'], ...
             img_path, i_get(cap.sensor, 'raw_refusal', 'no reason recorded'));
+  elseif strcmp(cap.validity, 'science') && ~cap.admitted
+    warning('tv_read_capture:noAdmission', ...
+            ['%s claims validity "science" but carries no admission record. ' ...
+             'A label is not the evidence; it is refused for measurement.'], ...
+            img_path);
+  end
+
+  % How to turn a stored value into a sensor sample, when the two differ. On a
+  % Pi 5 an uncompressed sample is left-shifted inside its 16-bit word, so the
+  % stored value is 2^shift times the sample. The rig records the shift and
+  % deliberately does NOT apply it to the pixels, so this is where it becomes
+  % visible -- .image is untouched and .sample_shift says what to do with it.
+  cap.sample_shift = double(i_get(cap.sensor, 'raw_sample_shift', 0));
+  cap.alignment    = i_get(cap.sensor, 'raw_alignment', 'unknown');
+  if cap.sample_shift > 0
+    warning('tv_read_capture:shifted', ...
+            ['%s holds %s-aligned samples: the stored value is 2^%d times ' ...
+             'the sensor sample. .image is UNSHIFTED -- use ' ...
+             'bitshift(cap.image, -cap.sample_shift) for counts.'], ...
+            img_path, cap.alignment, cap.sample_shift);
   end
 
   % How the frame was turned and mirrored at acquisition. Lifted out of the

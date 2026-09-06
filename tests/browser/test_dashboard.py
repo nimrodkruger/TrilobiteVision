@@ -141,3 +141,80 @@ def test_the_page_does_not_report_itself_stale_when_it_is_current(page):
     matters after a deploy."""
     page.wait_for_timeout(1000)
     assert page.locator("#stale").is_hidden()
+
+
+# -- the status poll must age out, not hang (supervisory review R6) ----------
+
+
+def _isolated(browser, rig):
+    """A page in its own context, so an intercepted route cannot leak into the
+    session-scoped fixture and so the aborted-fetch console noise is expected
+    here rather than a failure everywhere else."""
+    ctx = browser.new_context(viewport={"width": 1400, "height": 900})
+    return ctx, ctx.new_page()
+
+
+def test_a_status_response_that_never_arrives_still_reads_as_stale(browser, rig):
+    """The failure R6 names, and it is the ordinary way a bench rig disappears.
+
+    A half-open TCP connection survives a Pi that has gone away: the request is
+    neither answered nor refused. The poll awaited it with no timeout and
+    scheduled the next poll only afterwards, so the loop stopped -- and the
+    loop was the only thing that set the stale indicator. The page went quiet
+    in exactly the case it exists to shout in, while MJPEG carried on showing
+    the last frame it received.
+
+    Asserted against a route that swallows the request entirely, because an
+    error response is a different and much easier case.
+    """
+    ctx, page = _isolated(browser, rig)
+    try:
+        page.goto(rig)
+        page.wait_for_selector("#modes button", timeout=15000)
+        page.wait_for_timeout(1500)
+        assert page.locator("#poll-dead").is_hidden(), "healthy rig, no banner"
+
+        # Swallow every subsequent status request. Never fulfilled, never
+        # aborted: the page must not depend on either happening.
+        page.route("**/api/status", lambda route: None)
+
+        page.wait_for_selector("#poll-dead:visible", timeout=15000)
+        assert "no reply from the rig" in page.locator("#poll-dead").inner_text()
+    finally:
+        ctx.close()
+
+
+def test_the_stale_banner_counts_up_rather_than_freezing(browser, rig):
+    """It is driven by elapsed time, so it keeps getting worse while the rig is
+    away. A banner stuck on one number reads as a stale banner rather than as a
+    live measurement of how long the rig has been gone."""
+    ctx, page = _isolated(browser, rig)
+    try:
+        page.goto(rig)
+        page.wait_for_selector("#modes button", timeout=15000)
+        page.wait_for_timeout(1500)
+        page.route("**/api/status", lambda route: None)
+        page.wait_for_selector("#poll-dead:visible", timeout=15000)
+
+        first = page.locator("#poll-dead").inner_text()
+        page.wait_for_timeout(3000)
+        assert page.locator("#poll-dead").inner_text() != first
+    finally:
+        ctx.close()
+
+
+def test_the_poll_recovers_when_the_rig_answers_again(browser, rig):
+    """The other half. A banner that cannot clear is a banner that gets
+    ignored, and the poll loop must still be alive after the timeouts."""
+    ctx, page = _isolated(browser, rig)
+    try:
+        page.goto(rig)
+        page.wait_for_selector("#modes button", timeout=15000)
+        page.wait_for_timeout(1500)
+        page.route("**/api/status", lambda route: None)
+        page.wait_for_selector("#poll-dead:visible", timeout=15000)
+
+        page.unroute("**/api/status")
+        page.wait_for_selector("#poll-dead", state="hidden", timeout=15000)
+    finally:
+        ctx.close()

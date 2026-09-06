@@ -1,8 +1,32 @@
-function tv_require_science(cap, what)
-%TV_REQUIRE_SCIENCE  Refuse to measure pixels the rig would not vouch for.
+function tv_require_science(cap, what, kind)
+%TV_REQUIRE_SCIENCE  Refuse to measure pixels the rig did not vouch for.
 %
-%   TV_REQUIRE_SCIENCE(CAP) errors if CAP is tagged 'diagnostic'.
+%   TV_REQUIRE_SCIENCE(CAP) errors unless CAP is an admitted science capture.
 %   TV_REQUIRE_SCIENCE(CAP, WHAT) names the operation in the message.
+%   TV_REQUIRE_SCIENCE(CAP, WHAT, KIND) picks which question is being asked:
+%
+%     'values'    (default) reading the pixel VALUES as sensor counts --
+%                 radiometry, flat fields, anything where a number means a
+%                 photon count. Requires validity 'science' AND the admission
+%                 record that claim rests on.
+%     'geometry'  reading WHERE things are -- corners, micro-image centres,
+%                 lattice fits. An ISP mono frame is a geometrically faithful
+%                 picture of the scene, so 'unvalidated' output from an ISP
+%                 source passes; every calibration pose is exactly that.
+%
+%   IT FAILS CLOSED, WHICH IS THE CHANGE.
+%
+%   The first version of this function asked one question -- is the validity
+%   string exactly 'diagnostic'? -- and let everything else through. A missing
+%   field, a typo, and a value from a schema this code has never seen all read
+%   as measurable, on precisely the field whose job is to refuse. So the test
+%   is now for an explicitly recognised claim plus its evidence, and anything
+%   else is refused by default.
+%
+%   Pre-boundary archive files have no validity field at all. They are refused
+%   rather than assumed to have been checked: nothing in such a file
+%   establishes that anyone ever looked. Inspect them deliberately with
+%   TV_READ_CAPTURE and your own judgement, not by having this function shrug.
 %
 %   WHY THIS IS A SEPARATE CHECK FROM .space
 %
@@ -14,43 +38,70 @@ function tv_require_science(cap, what)
 %   rather than like a decode failure. A whole recording session was fitted
 %   before anyone noticed.
 %
-%   So the rig now decides at capture time whether it can establish that a
-%   buffer is sensor counts -- known format, uncompressed, unpacked, geometry
-%   reconciling with the sensor, values inside the declared bit depth -- and
-%   records the verdict as .validity. This is the function that consumes it.
-%
-%   'unrecorded' (a file written before the boundary existed) is allowed
-%   through: refusing the whole archive would be worse than the risk, and those
-%   captures were checked by hand at the time. It is not silently promoted to
-%   'science' either -- tv_read_capture reports it as unrecorded.
-%
 %   See also TV_READ_CAPTURE, TV_MICRO_IMAGES.
 
   if nargin < 2 || isempty(what)
     what = 'this measurement';
   end
+  if nargin < 3 || isempty(kind)
+    kind = 'values';
+  end
+  if ~any(strcmp(kind, {'values', 'geometry'}))
+    error('tv_require_science:usage', ...
+          'kind must be ''values'' or ''geometry'', not "%s"', kind);
+  end
   if ~isstruct(cap)
     error('tv_require_science:usage', 'expects a tv_read_capture struct');
   end
 
-  validity = 'unrecorded';
-  if isfield(cap, 'validity')
-    validity = cap.validity;
+  validity = i_field(cap, 'validity', 'unknown');
+  source   = i_field(cap, 'source_kind', 'unknown');
+  admitted = false;
+  if isfield(cap, 'sensor') && isstruct(cap.sensor) && ...
+     isfield(cap.sensor, 'raw_admitted')
+    admitted = logical(cap.sensor.raw_admitted);
   end
-  if ~strcmp(validity, 'diagnostic')
+
+  is_science  = strcmp(validity, 'science') && admitted;
+  isp_source  = any(strcmp(source, {'isp_main', 'isp_lores'}));
+  geometry_ok = is_science || (strcmp(validity, 'unvalidated') && isp_source);
+
+  if (strcmp(kind, 'values') && is_science) || ...
+     (strcmp(kind, 'geometry') && geometry_ok)
     return;
   end
 
-  reason = 'no reason recorded';
-  if isfield(cap, 'sensor') && isstruct(cap.sensor) && ...
-     isfield(cap.sensor, 'raw_refusal')
-    reason = cap.sensor.raw_refusal;
+  % Say which of the several different failures this is. They call for
+  % different responses and lumping them together is what made the old message
+  % useless.
+  switch validity
+    case 'diagnostic'
+      why = sprintf(['the rig REFUSED this buffer: %s'], ...
+                    i_field(cap.sensor, 'raw_refusal', 'reason not recorded'));
+    case 'science'
+      why = ['the sidecar claims ''science'' but carries no admission ' ...
+             'record. A label is not the evidence.'];
+    case 'unvalidated'
+      why = sprintf(['nothing was established about these values (source: ' ...
+                     '%s). ISP output is geometrically faithful but its ' ...
+                     'values are not sensor counts.'], source);
+    otherwise
+      why = ['no recognised validity is recorded. The file either predates ' ...
+             'the admission boundary or was written by something other than ' ...
+             'this rig.'];
   end
 
-  error('tv_require_science:diagnostic', ...
-        ['this capture is tagged DIAGNOSTIC, so %s would be fitting a model ' ...
-         'to values that are not sensor counts.\n  reason: %s\n' ...
-         'Re-capture with an admissible raw format; ' ...
-         'scripts/probe_cameras.py lists what the sensor offers.'], ...
-        what, reason);
+  error('tv_require_science:refused', ...
+        ['refusing %s.\n  %s\nRe-capture with an admissible raw format; ' ...
+         'scripts/probe_cameras.py lists what the sensor offers. To look at ' ...
+         'it anyway, call the lower-level functions directly -- looking is ' ...
+         'not measuring.'], what, why);
+end
+
+
+function v = i_field(s, name, default)
+  v = default;
+  if isstruct(s) && isfield(s, name) && ~isempty(s.(name))
+    v = s.(name);
+  end
 end

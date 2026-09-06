@@ -614,6 +614,7 @@ class CaptureSession:
                     # which is legitimate for corner GEOMETRY and is not
                     # radiometric data -- `space` is what says which it is.
                     "validity": frame.validity,
+                    "source_kind": frame.source_kind,
                     "forced": forced,
                     "sensor": {k: v for k, v in frame.meta.items()
                                if k in ("ExposureTime", "AnalogueGain", "DigitalGain",

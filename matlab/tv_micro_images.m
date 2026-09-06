@@ -64,9 +64,13 @@ function [tiles, grid] = tv_micro_images(cap, varargin)
     error('tv_micro_images:usage', 'first argument must be a tv_read_capture struct');
   end
   % Splitting a frame into micro-images is the first step of every measurement
-  % downstream, so it is the right place to refuse pixels the rig could not
-  % establish as sensor counts.
-  tv_require_science(cap, 'splitting into micro-images');
+  % downstream, so it is the right place to refuse pixels of unestablished
+  % provenance. GEOMETRY, not values: cropping tiles out of an ISP mono frame
+  % is legitimate and is what every calibration pose is, so the check asks the
+  % question this operation actually depends on rather than the strictest one
+  % available. Anything reading the VALUES as sensor counts must call
+  % tv_require_science(cap, ..., 'values') for itself.
+  tv_require_science(cap, 'splitting into micro-images', 'geometry');
   if ~cap.has_mla
     error('tv_micro_images:noMLA', ...
           ['this capture has no usable MLA geometry: the mla_grid_overlay ' ...

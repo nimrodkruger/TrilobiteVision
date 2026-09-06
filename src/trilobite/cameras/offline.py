@@ -12,6 +12,7 @@ does not need a photon.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import time
@@ -21,7 +22,15 @@ from typing import Any
 import numpy as np
 
 from ..config import CameraConfig
-from ..types import CameraInfo, Frame
+from ..types import (
+    DIAGNOSTIC,
+    SCIENCE,
+    SRC_REPLAY,
+    SRC_SYNTHETIC,
+    UNVALIDATED,
+    CameraInfo,
+    Frame,
+)
 from .base import CameraSource
 
 log = logging.getLogger(__name__)
@@ -182,7 +191,8 @@ class SyntheticSource(CameraSource):
         if self.full_frame_pending:
             self._serve_full_frame(Frame.now(
                 self._orient(self._render(self._full, phase)), self.cam_id, seq,
-                space="mono8", Synthetic=True, stream="main",
+                space="mono8", source_kind=SRC_SYNTHETIC,
+                Synthetic=True, stream="main",
                 **self.orientation, **self._controls,
             ))
 
@@ -191,18 +201,29 @@ class SyntheticSource(CameraSource):
             self.cam_id,
             seq,
             space="mono8",
+            source_kind=SRC_SYNTHETIC,
             Synthetic=True,
             **self.orientation,
             **self._controls,
         )
 
     def capture_full(self, raw: bool = True) -> Frame:
+        """A rendered frame. Never `science`, whatever `raw` says.
+
+        `space="raw"` here means "stands in for the raw path" so the rest of
+        the stack can be exercised without a sensor. It does not mean sensor
+        counts, because there is no sensor: these values came from
+        `_render`. Marking them `science` -- which the old default did -- would
+        have put simulated data into the archive under the same label as
+        measurements, which is supervisory review R2 at its worst.
+        """
         phase = self._phase(time.monotonic())
         return Frame.now(
             self._orient(self._render(self._full, phase)),
             self.cam_id,
             self._next_seq(),
             space="raw" if raw else "mono8",
+            source_kind=SRC_SYNTHETIC,
             Synthetic=True,
             **self.orientation,
             **self._controls,
@@ -325,6 +346,52 @@ class ReplaySource(CameraSource):
     def close(self) -> None:
         self._open = False
 
+    @staticmethod
+    def _sidecar_validity(path: Path) -> tuple[str, dict[str, Any]]:
+        """What the file beside this one says about its own pixels.
+
+        Supervisory review R2. Replay read the array and nothing else, so a
+        capture whose own sidecar said `diagnostic` came back out of the replay
+        backend marked `science` -- the software stack laundering a refusal
+        into an admission by round-tripping through a file.
+
+        Nothing is promoted here. A sidecar that says `science` is carried
+        through only if it also carries the admission evidence that claim
+        requires; anything else, a missing or unreadable sidecar included, is
+        `unvalidated`. Full replay lineage -- original timestamps, orientation,
+        processing history -- is Stage 4; this closes the promotion only.
+        """
+        side = path.with_suffix(".json")
+        if not side.exists():
+            return UNVALIDATED, {"replay_sidecar": None}
+        try:
+            meta = json.loads(side.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            log.warning("replay: cannot read %s (%s); treating as unvalidated",
+                        side.name, exc)
+            return UNVALIDATED, {"replay_sidecar": side.name,
+                                 "replay_sidecar_error": str(exc)}
+
+        recorded = str(meta.get("validity") or "")
+        sensor = meta.get("sensor_metadata") or {}
+        carried: dict[str, Any] = {
+            "replay_sidecar": side.name,
+            "replay_recorded_validity": recorded or None,
+            "replay_source_kind": meta.get("source_kind"),
+            "replay_space": meta.get("space"),
+            "replay_t_iso": meta.get("t_iso"),
+        }
+        if recorded == SCIENCE and sensor.get("raw_admitted") is True:
+            carried["raw_admitted"] = True
+            for key in ("raw_format", "raw_alignment", "raw_sample_shift",
+                        "raw_bits_nominal", "raw_container_bits"):
+                if key in sensor:
+                    carried[key] = sensor[key]
+            return SCIENCE, carried
+        if recorded == DIAGNOSTIC:
+            return DIAGNOSTIC, carried
+        return UNVALIDATED, carried
+
     def _load(self, path: Path) -> np.ndarray:
         if path.suffix.lower() == ".npy":
             return np.load(path)
@@ -358,8 +425,10 @@ class ReplaySource(CameraSource):
         # it does not, the frame and what describe() advertises have to agree.
         data = self._orient(data)
         self._measured = (int(data.shape[1]), int(data.shape[0]))
+        validity, carried = self._sidecar_validity(path)
         frame = Frame.now(data, self.cam_id, self._next_seq(), space=space,
-                          source_file=str(path), **self.orientation)
+                          validity=validity, source_kind=SRC_REPLAY,
+                          source_file=str(path), **carried, **self.orientation)
         if self.full_frame_pending:
             # Replay has one resolution, so the "full" frame is the same frame.
             self._serve_full_frame(self._to_mono(frame))

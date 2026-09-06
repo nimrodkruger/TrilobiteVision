@@ -1,14 +1,89 @@
 # Implementation plan — responding to the 0.1 architecture review
 
 **Responds to:** `docs/software-stack-review.md` (6 September 2026).
-**Shape:** ten stages. Each is a single coherent change, independently
-deployable, with a bench test that can pass or fail on its own. Nothing in a
-later stage is needed to evaluate an earlier one.
+**Shape:** ten stages with explicit dependency and acceptance gates. Each has
+a coherent deliverable and its own evidence; implementation is not acceptance.
+**Amended 6 September 2026:** following code review through `ce1d92c` in
+[the Stage 2 supervisory review](stage-2-supervisory-review.md). The amendment
+below and rewritten Stages 3/4 supersede their original scope and tests.
 
 **How to use it.** Do one stage. Deploy it. Run its bench test on the rig. If
 it passes, say so and the next stage starts; if it fails, the stage is reworked
 before anything else moves. No stage leaves the rig in a state where the
 previous stage's test would no longer pass.
+
+## Amendment: explicit changes to Stages 3 and 4
+
+| Item | Original plan | Required amended plan |
+|---|---|---|
+| Entry | Stages 0–2 treated as complete foundations | Close R1–R6 below; distinguish implemented, desktop-tested and rig-accepted. Supervisor reviews entry evidence before Stage 3. |
+| Stage 3 ownership | Queue stills and controls on the capture thread | Own open/configure/start/request/release/stop/close too; migrate every caller. |
+| Stage 3 workload | Drain commands against the current request | Bounded queue/work budget, explicit rejection, fairness, deadline/cancellation races and future-request control semantics. Minimum admission moves from Stage 8. |
+| Stage 3 lifecycle | Stop/recovery mainly in Stage 7 | Partial-open cleanup, failed-stop, generation isolation and prevention of a second owner move into Stage 3. Durable state and broader soak stay in Stage 7. |
+| Stage 3 evidence | Matching software sequence proves same exposure | Use actual request lineage and copied SDK metadata; distinguish software delivery IDs, SDK identity and clock domains. No inter-head synchronisation claim. |
+| Stage 3 → 4 interface | Frame metadata to be addressed in Stage 4 | Stage 3 supplies immutable acquisition evidence, orientation applied and control acknowledgement identity; Stage 4 adds processing execution and persisted schema. |
+| Stage 4 validity/replay | Reader enforcement and replay dealt with later | Close diagnostic/default/legacy promotion before Stage 3; implement complete replay lineage and schema enforcement in Stage 4. |
+| Stage 4 execution | Snapshot configuration | Freeze nested values and stage topology for the actual execution; separate acquisition, processing and save-event records across all active writers. |
+| Stage 4 test | Same retained preview saved twice must have different sidecars | Acquisition/processing evidence must stay identical; save events may differ. A newly processed frame is the separate new-revision test. |
+| Supervision | Bench before moving on | Review entry contract before Stage 3 and ownership/rig evidence before Stage 4; review G4 results at completion. Do not wait until Stage 4 to intervene. |
+
+### Prerequisite closure before Stage 3 — **IMPLEMENTED 6 Sep**
+
+All six are implemented and verified on the desktop suite; rig acceptance is
+still outstanding and is a precondition for Stage 3, not for its contract
+review. Full record in `docs/cleanup-log.md` 2026-09-06 (q), including the
+bench-test steps. Summary of what each turned into:
+
+| | closed by |
+|---|---|
+| R1 | both readers require an explicitly recognised validity **plus** the admission record it rests on. `require_science` (values) and `require_geometry` (positions) are separate questions, so ISP poses still work with no flag; `--allow-diagnostic` and `--allow-legacy` are separate explicit paths. |
+| R2 | a third validity, `unvalidated`, as the **default**, plus a `source_kind` field. Closed on the `Frame` default, ISP main, the served full frame, previews, both synthetic paths, and replay — which now reads the sidecar and promotes nothing. |
+| R3 | unsigned dtype and native byte order enforced; positive geometry; and sample depth, container width and **alignment** separated, with `raw_alignment` declared in config, `raw_bits_nominal` named as nominal, and the shift recorded rather than applied to the pixels. |
+| R4 | a runtime admission failure fails the science request. `/api/capture/{id}/raw` returns 422 and no file unless `allow_unvalidated_raw` is set. |
+| R5 | `_read_back_raw` takes format, size and stride from `camera_configuration()` after `configure`. Driver substitutions are caught; the negotiated stride must match exactly; `raw_stride_source` records which rule applied. |
+| R6 | a 4 s `AbortController` bound on the status fetch **and** an independent 1 s watchdog that renders staleness from elapsed time, so a permanently pending response cannot hide. |
+
+24 mutants across R1–R5, all caught. Suite 433 passed / 13 skipped, 13 browser
+scenarios. **Still outstanding:** rig acceptance of Stages 1–2 and of these
+corrections, and the Stage 0 residuals (legacy tree and service file; the CI
+workflow is still a draft outside `.github/workflows/`).
+
+The original statement of the six follows.
+
+The detailed evidence and probe results are in the supervisory review. Retain
+existing tests and add regressions for these missing contracts:
+
+- **R1 — readers fail closed:** unknown/missing validity is not measurement
+  admission. Explicit science status needs admission evidence; retain an
+  explicit legacy/inspection path in both Python and MATLAB.
+- **R2 — no validity promotion:** defaults, replay, ISP main and derived-frame
+  paths cannot turn unvalidated/diagnostic data into admitted sensor data.
+  Prevent replay promotion now; full replay fidelity remains Stage 4.
+- **R3 — validate representation:** reject signed/floating samples and invalid
+  geometry; establish unsigned dtype, byte order, negotiated stride, sensor
+  bit depth versus container width and alignment, not merely item size/max.
+- **R4 — enforce diagnostic opt-in:** runtime admission failure fails the
+  science request. Diagnostic saving is explicit and distinguishable, governed
+  by `allow_unvalidated_raw`, rather than an unconditional fallback.
+- **R5 — validate actual negotiation:** use post-configuration raw size,
+  format/stride and sensor mode, not requested format or main resolution. Test
+  driver substitutions and unequal main/raw sizes. Preserve real rig fixtures
+  and configuration/version evidence; synthetic fixtures alone do not close G1.
+- **R6 — status hangs age out:** bound fetch waits and make freshness visible
+  independently of a poll completing. Test a permanently pending response.
+
+Record Stage 0 residuals: legacy tree/service removal and deployed-unit check;
+the workflow currently at `Claude outputs/tests.yml` must be installed as an
+active CI workflow before claiming CI. Record Linux/browser results separately.
+These housekeeping items may be tracked explicitly, but R1–R6 and required
+rig evidence are not silently deferred into Stage 3. G1/G5 remain pending until
+their applicable acceptance checks pass. Local review result: 374 passed,
+2 skipped; no Pi or MATLAB run, and Playwright was unavailable.
+
+Before implementation, document finite queue capacity and numeric provisional
+latency/freshness/shutdown thresholds. Supervision approves the contract and
+evidence, not an unspecified future design. Estimates for Stages 3/4 must be
+reassessed because this amendment adds work.
 
 ---
 
@@ -33,9 +108,9 @@ on the API worker thread; `Picamera2Source.capture_full` calls
 latency. My progress report says "tens of milliseconds"; that is the
 free-running sensor skew alone and ignores the write.
 
-`src/flyeye/` and `systemd/flyeye.service` are still present on the working
-tree, and `[tool.setuptools.packages.find] where = ["src"]` discovers both
-packages.
+`src/flyeye/` and `systemd/flyeye.service` remain. Stage 0 now restricts package
+discovery to `trilobite*`, so the original double-packaging observation is
+resolved; legacy-source/service retirement remains pending.
 
 ### Where I disagree with nothing, but would sequence differently
 
@@ -47,10 +122,10 @@ The review orders its six work packages by severity. This plan orders by
 > observability work is not just a P2 finding — it is the instrument every
 > later stage is measured with.
 
-So Stages 0–2 are small, additive and low-risk, and Stage 3 is the first
-structural change. If you would rather take the biggest change first, the
-order becomes 3 → 5 → 6 → 4 → 2 → 1 → 7 → 8, and Stage 3's bench test gets
-weaker. Say which you want; the default below is the recommended one.
+Stages 0–2 establish test, observability and admission foundations. Stage 2
+changes capture eligibility and is not merely additive. Retain the sequence,
+subject to the prerequisite corrections above; Stage 3 is the first ownership
+refactor.
 
 ---
 
@@ -58,11 +133,12 @@ weaker. Say which you want; the default below is the recommended one.
 
 | # | Stage | Closes | Size | Hardware test |
 |---|---|---|---|---|
-| 0 | Test hygiene, delete `src/flyeye`, correct the report | §6, §4 | ½ day | **DONE** — bar the `src/flyeye` deletion |
-| 1 | Truthful status and liveness | F5, G5 | 1 day | **DONE** — awaiting the bench test below |
-| 2 | Validated raw-frame admission | F7, G1 | 1 day | capture works; a compressed format is refused |
-| 3 | **Single acquisition owner per head** | F1, G2 | 3–4 days | the crash regression, sustained |
-| 4 | Provenance bound to the frame | F4, G4 | 2 days | change parameters mid-burst, read the sidecars |
+| 0 | Test hygiene and legacy retirement | §6, §4 | ½ day originally | Partial: legacy retirement, active CI and platform evidence outstanding |
+| 1 | Truthful status and liveness | F5, G5 | 1 day originally | Implemented; R6 correction and rig acceptance pending |
+| 2 | Validated raw-frame admission | F7, G1 | 1 day originally | Implemented; R1–R5 corrections and rig acceptance pending |
+| — | R1–R6 prerequisite closure | G1, G5 | 1 day | Implemented 6 Sep; rig acceptance pending |
+| 3 | **Single owner, bounded commands and minimum lifecycle** | F1, G2 | Re-estimate | Owner/lifecycle fault tests plus sustained rig regression |
+| 4 | Immutable execution provenance and reader schema | F4, G4 | Re-estimate | Retained-frame invariance, revision changes and reader round trips |
 | 5 | Storage identity and drainable release | F2, G3a | 2 days | pull the USB disk in four ways |
 | 6 | Transactional capture sets | F3, G3b | 3 days | cut power mid-capture |
 | 7 | Lifecycle states and durable state file | F6 | 2 days | 100 stop/start cycles; kill during save |
@@ -75,9 +151,9 @@ Sizes are engineering days for one person, excluding bench time.
 
 ## Stage 0 — make the evidence trustworthy — **IMPLEMENTED 6 Sep**
 
-**No behaviour changes. Nothing to deploy to the Pi.** This exists so that "the
-suite is green" means something on your machine, and so there is one capture
-implementation in the tree rather than two.
+This stage improves test evidence and retires the legacy implementation.
+The implemented durability metadata also changes writer output and needs
+platform verification; it is not proof of per-write durable completion.
 
 ### Changes
 
@@ -112,7 +188,8 @@ implementation in the tree rather than two.
 
 ### Bench test
 
-None. Deploy nothing.
+Verify changed writer metadata on the supported platforms; retain test-only
+changes separately from runtime changes. Do not infer Linux results from Windows.
 
 ### Acceptance
 
@@ -123,8 +200,8 @@ in `src/`.
 
 ## Stage 1 — truthful status and liveness *(F5, gate G5)* — **IMPLEMENTED 6 Sep**
 
-**Purely additive.** No acquisition, storage or UI behaviour changes. This is
-the instrument for testing Stages 3–8, which is why it is early.
+Status and UI behaviour change here. This is the instrument for testing
+Stages 3–8, which is why it is early; R6 remains an acceptance correction.
 
 ### Changes
 
@@ -154,12 +231,13 @@ the instrument for testing Stages 3–8, which is why it is early.
 
 ### Bench test
 
-1. With both cameras running, pull a ribbon cable. Within the freshness
-   deadline the UI must say that camera has stopped — not keep showing ~12 fps.
-2. Set an MLA pitch that makes the overlay stage throw. The stage's error
+1. With both cameras running, inject a source stall or controlled acquisition
+   failure. Within the freshness deadline the UI must show it as stale.
+   For physical absent-camera testing, power off before changing CSI cables.
+2. Inject an overlay-stage exception in the test harness. The stage's error
    counter must rise and the panel must show it; the preview may continue.
-3. Stop the server's status polling (block the endpoint in devtools). The
-   header must show that status is stale.
+3. Make a status response remain pending indefinitely, then separately return
+   errors. The header must show stale status within the declared deadline.
 
 ### Acceptance
 
@@ -168,11 +246,16 @@ continues to read as healthy.
 
 ### Rollback
 
-Revert; nothing else depends on it.
+Revert independently, but do not use reverted observability as acceptance
+evidence for later stages.
 
 ---
 
 ## Stage 2 — validated raw-frame admission *(F7, gate G1)* — **IMPLEMENTED 6 Sep**
+
+**Review status: not accepted.** The historical implementation description
+below records intent and delivered mechanisms; R1–R5 above qualify its claims
+and are mandatory corrections before Stage 3.
 
 Closes the failure class that cost a whole recording session.
 
@@ -219,11 +302,13 @@ camera dependency so every rejection path is reachable from a byte array.
 `Frame.validity` is a first-class field (`science` / `diagnostic`) carried
 through `derive`; its constants live in `types.py` to keep the import direction
 right. `_choose_raw_format` raises `RawFormatError` at open time and releases
-the device; `allow_unvalidated_raw` per camera is the only way past.
+the device for that refusal path. Runtime buffer failures currently return
+diagnostic data without requiring the hatch; R4 corrects this discrepancy.
 Diagnostic captures are named `diagnostic_…` ahead of the tag and carry
 `validity` in the sidecar. Saved previews are diagnostic too, which was not in
 the plan and follows from the same argument. `scripts/read_capture.py --detect`
-and the new `matlab/tv_require_science.m` refuse them.
+and the new `matlab/tv_require_science.m` refuse exact diagnostic labels, but
+currently accept missing/unknown labels; R1 closes that gap.
 
 The substantive change beyond what the plan asked for is the **direction** of
 the stride reconciliation: the old code inferred bytes-per-pixel from the row
@@ -236,118 +321,212 @@ and the bench-test steps.
 
 ---
 
-## Stage 3 — one acquisition owner per head *(F1, gate G2)*
+## Stage 3 — one acquisition owner and a bounded lifecycle *(F1, gate G2)*
 
-**The structural change.** Everything after it is easier; nothing before it is
-required, except that Stage 1 makes its bench test worth running.
+> **Contract written, awaiting review: `docs/stage-3-contract.md`.** This plan
+> requires the queue capacity and the numeric thresholds to be documented and
+> approved before implementation, on the grounds that supervision approves the
+> contract rather than an unspecified future design. That document exists and
+> no Stage 3 code has been written. It covers the owner and every caller to
+> migrate, command admission and the provisional capacities, deadline and
+> cancellation semantics with the seven outcome states, the control-to-request
+> binding policy, the acquisition envelope, the lifecycle and generation rules,
+> the four separate counters, the fake-SDK test plan and the rig run, the
+> commit sequence, and the three questions it cannot answer alone.
 
-### Design
+**Amended 6 September after implementation review through Stage 2.** Enter
+only after the prerequisite gate above is closed. This stage delivers the
+acquisition envelope and command semantics that Stage 4 consumes; it does not
+claim complete processing provenance or transactional storage.
 
-Today: the capture thread calls `capture_request()`; so does `capture_full()`
-from the API worker; so do control writes. Two mutexes serialise them. The
-review is right that this is not a single owner — request identity,
-cancellation and shutdown span two paths, and the failure class that took the
-rig down has been mitigated rather than removed.
+### Difference from the original Stage 3
 
-Replace with a command queue owned by the capture thread:
+The original queue sketch served preview and drained commands against an
+already acquired request. It omitted admission limits, control timing and
+ownership during startup/shutdown. Replace that sketch with the following
+contract. Moving a still call onto a queue alone does not meet G2.
 
-```
-API worker                      capture thread (sole SDK owner)
-  submit(Command) -> Future       loop:
-  future.result(deadline)           take request  (all three streams)
-                                    serve preview
-                                    drain command queue against THIS request
-                                    release request
-```
+### Required design
 
-- A `Command` carries an id, a kind (`still_raw`, `still_main`, `set_controls`),
-  a deadline and a `Future`. Every command reaches a terminal outcome —
-  fulfilled, failed, or cancelled by deadline. No uncorrelated shared pending
-  flag.
-- **`capture_full` and `set_controls` become owner-private.** Nothing outside
-  the thread calls into picamera2. `_capture_lock` and the picam `_lock`
-  disappear, because there is no second entrant to lock against.
-- **The raw still comes out of the request the loop is already holding.** The
-  three-stream configuration already carries `raw`, so a second
-  `capture_request()` is unnecessary — and this makes the raw still the same
-  exposure as the preview it arrived with, which today is only true of the
-  `main` handshake.
-- SDK buffers are copied or released according to their documented lifetime
-  before anything else sees them, including on a decode failure.
-- Disk and JPEG work stay outside the owner, as now.
+1. **One application owner per head for the whole SDK lifecycle.** Create/open,
+   configure, start, control submission, request acquisition, buffer access,
+   release, stop and close run through the owner. SDK-internal threads are not
+   additional application owners. Audit every entry path: API stills, preview,
+   calibration poses, burst/capture-all, controls and shutdown. Remove the
+   pending-frame handshake when all callers use the replacement. Remove locks
+   only when ownership makes their particular protection unnecessary.
+2. **Bounded command admission.** Commands carry ID, kind, camera generation,
+   submission time, monotonic deadline and one terminal outcome. Define queue
+   capacity, rejection response, FIFO/fairness policy and bounded work per loop.
+   Control coalescing is permitted only with an explicit superseded outcome.
+   Status must expose depth, oldest age, rejections, timeouts and owner state.
+   Keep this basic bound here; broader client/resource policy remains Stage 8.
+3. **Precisely defined deadlines and cancellation.** Distinguish queued,
+   executing and terminal commands. Expired queued work must never execute
+   later. A caller timeout does not interrupt the SDK or prove that an
+   executing command had no effect. Suppress late delivery/persistence for
+   cancelled capture requests, record late control effects when unavoidable,
+   and resolve completion/timeout races exactly once. Bound the API wait even
+   if SDK acquisition hangs; surface the owner's degraded/failed state.
+4. **Controls apply to future requests.** Dispatch controls at the documented
+   SDK boundary and record their acknowledgement separately. A control change
+   cannot alter the exposure of a request already obtained. Effective values
+   come from that request's sensor metadata; absent evidence remains unknown.
+   Specify whether a still uses the next delivered request or must follow a
+   particular acknowledged control revision; test the chosen policy.
+5. **One request produces an acquisition envelope.** Copy admitted raw data,
+   required preview/main data and metadata while the request is held. Give
+   them the same application request identity, camera/run generation and
+   source identity. Preserve SDK sequence/timestamp when supplied, units and
+   documented clock domain; otherwise record unknown. Keep host monotonic
+   timing separate. Copy orientation/configuration values actually applied at
+   acquisition, admission evidence and validity. Do not reconstruct them from
+   mutable settings later. Stage 4 adds the processing execution record.
+6. **Release before downstream work.** Every request is released exactly once,
+   including copy/admission/processing failures. No SDK-backed view or mutable
+   SDK metadata escapes. JPEG, pipeline processing, disk IO and waits on
+   downstream workers stay outside the owner; downstream handoffs are bounded.
+   Raw/preview siblings may be traceable without both being displayed. Do not
+   label an unrelated latest browser preview as the still's exposure.
+7. **Minimum lifecycle correctness moves here from Stage 7.** Stop rejects new
+   work, terminates pending commands and drains or reports executing work.
+   Only the owner releases/closes its device. Clean up partial opens on every
+   failure path. A join timeout means failed-stop, not stopped: do not close
+   concurrently or start a replacement owner over a surviving one. Generation
+   checks reject late results after restart. If bounded recovery cannot be
+   demonstrated in-process, document the supported recovery boundary and
+   reassess process isolation before accepting G2.
+8. **Truthful accounting.** Count actual SDK deliveries, intentional preview
+   suppression, published frames and admission failures separately. Software
+   sequence gaps or configured FPS are not sensor-drop or synchronisation
+   evidence. State what can and cannot be measured on this driver.
 
-The existing `request_full_frame` / `take_full_frame` handshake is subsumed by
-the queue and removed, so there is one mechanism rather than two.
+### Automated acceptance
 
-### Bench test
+Use a deterministic fake SDK with thread IDs, unique request tokens and
+buffers invalidated/reused on release. Exercise concurrent stills, controls,
+preview and all capture callers. Assert:
 
-This is the regression that matters. On the rig, both cameras running:
+- All application SDK operations use the declared owner; each request is
+  released once and copied output remains unchanged after SDK reuse.
+- Queue overload is bounded and rejected explicitly; command ordering,
+  coalescing and deadlines meet the declared policy. No expired queued command
+  executes, and no command resolves twice under completion/cancellation races.
+- Delayed controls do not become fictitious effective values on an earlier
+  request. Raw and preview siblings have the same SDK request token and copied
+  metadata, not merely equal locally assigned sequence numbers.
+- Exceptions at open/configure/start/copy/admit/release/stop, an indefinitely
+  blocked acquisition and a late completion all produce observable outcomes.
+  No concurrent close, leaked partial-open handle, false stopped state or
+  second owner is permitted. Test stop followed by attempted restart.
+- Slow processing/writes cannot hold an SDK request or grow an unbounded queue.
+  Existing Stage 1/2 invariants still pass through the unified path.
 
-1. **Sustained contention, 30 minutes.** Preview on both, a still every two
-   seconds, and a slider being dragged continuously. Previously this class of
-   load took the rig down. No crash, no stall, no rising skipped count beyond
-   the configured cap.
-2. **Deadlines are honoured.** Stop a camera while a still is in flight — the
-   request must come back as a failed or cancelled outcome within its deadline,
-   not hang the HTTP handler.
-3. **Same exposure.** A raw still and the preview frame it accompanies must
-   carry the same sequence number.
-4. Check `dmesg` for CSI errors before and after.
+### Rig acceptance and supervisor checkpoint before Stage 4
 
-### Acceptance
+Record the deployed commit, Pi/SDK versions, both negotiated stream layouts,
+queue capacities and numeric thresholds for command latency, frame freshness
+and shutdown **before** the run. Use provisional engineering thresholds if
+research requirements are unresolved, and identify them as provisional.
 
-G2, with the fake-SDK audit the review specifies: exactly one thread ever takes
-a request per head, every command terminates, every buffer is released even on
-a decode failure.
+Run both previews, a still every two seconds and sustained control changes
+for 30 minutes. Record latency distribution/maxima, maximum queue age/depth,
+admission failures, rejection/timeout counts, memory trend and CSI logs.
+Require no crash, unexplained stall, ownership violation or unbounded growth;
+explicit preview suppression must follow the declared policy. Exercise stop
+during capture and injected acquisition delay. Use same-request identity and
+sensor metadata to demonstrate raw/preview lineage; software sequence equality
+alone is insufficient and this test establishes no inter-head synchronisation.
 
-### Rollback
-
-Largest revert of the plan. Keep it a single commit against a known-good tree
-and run the bench test before starting Stage 4.
+The supervisor reviews this evidence and unresolved driver limitations before
+Stage 4. Keep the refactor in independently reviewable commits and verify
+rollback on the rig. Stage 7 retains durable state and broader lifecycle soak.
 
 ---
 
-## Stage 4 — provenance bound to the frame *(F4, gate G4)*
+## Stage 4 — immutable frame provenance and reader enforcement *(F4, gate G4)*
 
-The review's probe is unanswerable: render a preview at gain 1, change the
-stage to gain 2, save the preview — the pixel is 20 and the sidecar says gain 2.
-No timing trick required.
+**Amended 6 September.** Requires accepted Stage 3 acquisition envelopes and
+the corrected Stage 2 validity policy. This stage establishes which acquisition
+and processing execution produced saved pixels. Capture-set atomicity remains
+Stage 6; deployment inventory remains Stage 8.
 
-### Changes
+### Difference from the original Stage 4
 
-- **A pipeline execution is an immutable revision.** `Pipeline.__call__`
-  snapshots stage *references* today, and the overlay re-reads `self.params`
-  during an invocation. Instead, build a frozen configuration record at the
-  frame boundary and run the whole pipeline against it.
-- Each derived frame carries: the ordered stage configuration actually used,
-  per-stage outcome (`ok` / `skipped` / `failed`), the orientation applied, and
-  the sensor metadata the driver reported.
-- **The writer persists that record**, and never calls
-  `pipeline.settings_snapshot()` at save time. Saving an old preview stores the
-  old processing record.
-- Distinguish **requested** controls, **acknowledged** requests and
-  **effective** exposure in the sidecar. They are three different things today
-  reported as one.
-- Offline readers refuse a measurement frame with missing mandatory provenance,
-  and allow it in an explicitly labelled inspection mode.
-- **Replay fidelity** (review §4, last item). `ReplaySource` loops image files,
-  invents timestamps and sequence numbers and ignores the original sidecars. It
-  is image playback, not session replay. Either make it preserve recorded
-  identity, or rename it so nobody cites it as evidence of recorded timing.
+Keep immutable configuration and requested/acknowledged/effective distinctions,
+but make their implementation contract and schema explicit. Acquisition
+identity and control ordering start in Stage 3. Preventing diagnostic promotion
+is a prerequisite, not deferred replay work. Replace the contradictory test
+requiring two saves of the same frame to have different processing provenance.
 
-### Bench test
+### Required changes
 
-1. Start a 20-frame quick-record burst; halfway through, change display gain
-   and toggle an orientation flip. Every sidecar must describe exactly the
-   configuration its own pixels went through. This is checkable offline with
-   `scripts/read_capture.py`.
-2. Save a preview, then change a stage parameter, then save the *same* preview
-   again from the bus. The two sidecars must differ, and the first must match
-   the pixels.
+1. **Freeze execution, not just references.** Snapshot immutable parameter
+   values, ordered stage topology, orientation and configuration revision at a
+   defined frame boundary. The entire invocation uses that snapshot, including
+   stages that currently re-read mutable parameters. Freeze/copy nested metadata
+   and arrays as necessary to prevent later mutation of retained results.
+   Define concurrent update ordering and parameter/topology revision semantics.
+2. **Separate the records.** Persist an acquisition record from Stage 3, a
+   processing execution record and a save-event record. Acquisition carries
+   source/head/run/request identity, sensor metadata and clock interpretation,
+   actual raw layout/admission, source kind and validity. Processing carries
+   input lineage, revision, actual ordered parameters and outcomes
+   (`ok`, `skipped`, `failed` with reason), transformations and output identity.
+   Save events may carry different IDs/times for the same retained frame.
+   Include a schema version. Raw captures explicitly say which processing was
+   bypassed rather than borrowing the current preview pipeline settings.
+3. **Bind controls truthfully.** Preserve requested values, SDK submission/
+   acknowledgement identity and effective per-request metadata separately.
+   Missing metadata stays unknown. An acknowledgement is never represented as
+   proof that a given exposure used the requested control values.
+4. **Writer serialises frame evidence only.** Remove save-time reads of live
+   pipeline settings and orientation. Audit still, preview, burst and pose
+   writers; keep the parked recorder disabled. A failed processing stage remains
+   visible even if preview falls through. Define measurement eligibility for
+   derived outputs separately from raw admission, without silently promoting
+   a failed or diagnostic result.
+5. **Versioned Python/MATLAB reader contract.** Publish mandatory fields and
+   supported schema versions, reject unknown/missing required evidence for
+   measurement, and validate consistency of source, validity and admission.
+   Preserve explicitly labelled inspection/legacy handling without silently
+   backfilling scientific evidence. Use shared good/bad sidecar fixtures for
+   both languages. Do not implement optical/calibration algorithms here.
+6. **Replay lineage.** Preserve original source validity, identity, timestamps,
+   orientation and processing history where sidecars establish them. Record
+   replay scheduling/time and additional transformations separately; never
+   invent original timing or apply recorded orientation twice. Missing-sidecar
+   image playback stays explicitly unvalidated. Renaming playback alone cannot
+   satisfy the already-required non-promotion rule.
 
-### Acceptance
+### Automated acceptance
 
-G4.
+- Retain a processed frame, edit gain/orientation/topology, and save that exact
+  frame twice. Pixels and acquisition/processing provenance must be identical;
+  only save-event fields may differ. Then process a new frame and verify its
+  pixels and revision reflect the edit.
+- Force an update between two pipeline stages using a barrier. One execution
+  must use one immutable revision, never a mixture. Mutating source metadata
+  after release or live settings after execution must not change saved evidence.
+- Inject skipped/failed stages, absent sensor metadata and delayed control
+  effects. Persist truthful outcomes and reject measurement where required by
+  the schema. Verify every active capture writer uses the same contract.
+- Round-trip valid, diagnostic, missing, malformed and unsupported-version
+  sidecars through Python and MATLAB. Include replay of diagnostic and legacy
+  files, orientation and original timing; no silent validity promotion.
+
+### Rig acceptance
+
+Use the existing still/burst path for 20 frames, with controlled changes to
+display gain and orientation midway. Verify each frame's pixels, acquisition
+identity and processing record offline; raw outputs must correctly identify
+display-only processing as bypassed. Separately run the retained-frame test
+above and prove that live edits cannot rewrite old provenance.
+
+Accept G4 only with schema/fixture review and recorded automated and rig
+results. Missing MATLAB or rig execution is a pending check, not a pass.
+Supervisor sign-off here closes frame provenance; Stages 5–8 still gate broader
+field/release claims and Stage 9 remains separately gated.
 
 ---
 
@@ -408,9 +587,11 @@ G3a. No success message may name a target that was not verified.
 - **`capture_all` becomes one transaction** with a shared capture-set ID, and —
   separately — stops completing each head's disk write before requesting the
   next, which is what currently inflates pair skew.
-- **Record the durability capability** actually achieved (`strict` on Linux,
-  `file-only` where directory sync is unavailable), rather than swallowing the
-  directory-sync failure.
+- **Record achieved durability per operation.** Stage 0's cached capability
+  is not proof that a later directory sync succeeded. Track actual file and
+  directory sync outcomes, invalidate capabilities across target generations,
+  and distinguish platform support from achieved completion. Do not infer
+  `strict` solely from Linux or swallow a directory-sync failure.
 - **`CaptureSession` stays disabled** until it uses this same service. It has
   its own writer, a fixed root and its own index format; it does not inherit
   retargeting merely by sharing the durable-write helpers.
@@ -430,18 +611,17 @@ G3b.
 
 ---
 
-## Stage 7 — lifecycle states and durable state file *(F6)*
+## Stage 7 — lifecycle consolidation and durable state file *(F6)*
 
 ### Changes
 
 - Explicit `starting → running / degraded → stopping → stopped / failed` per
   camera and for the application.
-- **`CameraRuntime.stop` must not lie.** It joins for five seconds then closes
-  the source regardless; a blocking SDK call outlives the join. A timeout
-  becomes a visible `failed-stop`, not an assumption that ownership ended.
-- Guaranteed cleanup of a partially opened camera: `Picamera2Source.open`
-  assigns `self._picam` only after successful start-up, so an exception midway
-  leaves an unowned handle.
+- **Preserve Stage 3's lifecycle guarantees.** Failed-stop handling, owner-only
+  close, partial-open cleanup and restart generation isolation are already
+  required in Stage 3. This stage consolidates application-wide lifecycle and
+  exercises the broader 100-cycle/deployment scenarios; it does not first fix
+  unsafe ownership here.
 - Restore state **before** publishing measurement-ready frames.
 - **`StateStore` gains revisions and durability.** Write/rename is atomic but
   not durable — no file or directory fsync. And the dirty flag is cleared after
@@ -457,8 +637,9 @@ G3b.
    success, no camera left held.
 2. Kill -9 during an autosave; the previous good state must survive.
 3. Change a parameter during a save and confirm it is in the next one.
-4. Unplug a camera during start-up. The other must come up `running` and the
-   missing one must be `failed`, not silently absent.
+4. Start with one camera absent (disconnect CSI only while powered off), and
+   separately inject startup failure. The other must come up `running` and
+   the missing one must be `failed`, not silently absent.
 5. Time the worst-case shutdown against systemd's 15-second budget.
 
 ---
@@ -473,8 +654,9 @@ G3b.
   captures, and reserve capacity for status and control requests. Starlette's
   threadpool default is 40 tokens and is shared.
 - **Server-side command semantics.** `QUICK_BUSY` and the one-pending-shot flag
-  are browser-local and protect one tab. Add server-side admission, an operator
-  lease or revision conflict policy, and capture-by-ID reconciliation.
+  are browser-local and protect one tab. Extend Stage 3's bounded owner-command
+  admission with an operator lease or revision conflict policy and broader
+  multi-client resource controls. Capture-by-ID reconciliation builds on Stage 6.
 - **Declare the trust boundary.** The service binds `0.0.0.0` with no
   authentication and can drive cameras, retarget paths and mount filesystems
   under the service user. Either document an isolated bench network as the
@@ -529,12 +711,13 @@ it twice.
 | 1 | Is 0.1 a still/burst instrument, or must it record continuous raw data? At what cadence and duration? | Stage 9 entirely |
 | 2 | Must every exposed frame be retained, or are explicit losses acceptable? What should happen when the disk fills or vanishes? | Stage 5 fallback policy; Stage 9 |
 | 3 | How many simultaneous viewers/operators, and is the rig on an isolated network? | Stage 8 — both the concurrency cap and whether authentication is needed |
-| 4 | Acceptable command latency, preview age, stop/recovery time? | Stage 1 freshness deadline; Stage 8 acceptance thresholds |
+| 4 | Acceptable command latency, preview age, stop/recovery time? | Stages 1/3 require documented provisional thresholds; Stage 8 final operating envelope |
 | 5 | Supported OS / picamera2 / libcamera / filesystem baseline, and who owns rollback? | Stage 8 manifest |
 | 6 | Should runtime pipeline add/remove persist? | Stage 7 |
 
-**Stages 0–4 need none of these** and can start immediately. Question 2 is the
-one that most changes the design, and it is worth answering before Stage 5.
+Stages 3/4 are subject to the entry and evidence gates above. Provisional
+engineering thresholds allow development while research requirements mature,
+but must be explicit before acceptance testing. Question 2 also informs Stage 5.
 
 ---
 

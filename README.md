@@ -751,11 +751,14 @@ python scripts/read_capture.py ... --tile 3,-2 --zoom 6         # one micro-imag
 python scripts/read_capture.py ... --detect --board 4x3 --csv corners.csv
 ```
 
-`--detect` refuses a capture the rig tagged `diagnostic` — see **validity**
-under [Things that will bite you](#things-that-will-bite-you). Pass
-`--allow-diagnostic` to look anyway; the corner positions are then not
-measurements. The MATLAB path does the same thing through
-`tv_require_science`, which `tv_micro_images` calls for you.
+`--detect` reads corner POSITIONS, so it accepts an admitted `science` capture
+or `unvalidated` ISP output — which is what a calibration pose is — and refuses
+a `diagnostic` file or one whose validity was never recorded. `--allow-diagnostic`
+and `--allow-legacy` override those two cases separately; the corner positions
+are then not measurements. See **validity** under
+[Things that will bite you](#things-that-will-bite-you). The MATLAB path does
+the same thing through `tv_require_science(cap, what, 'geometry')`, which
+`tv_micro_images` calls for you.
 
 The sidecar's pitch and offsets are quoted against whichever frame the stage
 was configured on, so the reader converts them to the array it is actually
@@ -1096,23 +1099,62 @@ cannot establish one. That last part is the change that matters: the previous
 version logged an error and carried on, and a log line is not a control.
 Nobody reads the journal of a rig that appears to be working.
 
-**Every capture says whether it may be measured.** `validity` is `science` or
-`diagnostic`, in the sidecar of every file the rig writes. `science` means the
-raw format was known, uncompressed and unpacked, its geometry reconciled with
-the sensor's, and no value exceeded the bit depth it claimed. Anything else is
-`diagnostic`: named `diagnostic_…` on disk, and refused by
-`scripts/read_capture.py --detect` and by the MATLAB readers.
+And what it checks is what the driver **negotiated**, read back from
+`camera_configuration()` after `configure` — not what was requested. A driver
+can substitute a format, and validating the request cannot see that: from the
+substitution onwards every buffer is self-consistent with it and looks
+perfectly correct. The raw stream's geometry is read back for the same reason,
+because `full_resolution` sizes the *main* stream and checking a raw buffer
+against it works only while the two happen to be equal.
+
+**Every capture says whether it may be measured, and the default says
+nothing.** `validity` is in the sidecar of every file the rig writes, and
+in its filename:
+
+| | means | named |
+|---|---|---|
+| `science` | the raw format was known, uncompressed and unpacked, the samples were unsigned integers in native byte order, the geometry and stride reconciled with what the driver **negotiated**, and the values fit the depth and alignment claimed | `raw_…` |
+| `diagnostic` | established NOT to be — a refused buffer, or a preview processed for viewing | `diagnostic_raw_…` |
+| `unvalidated` | **the default.** Nothing was established: ISP output, every calibration pose, anything rendered | `unvalidated_still_…` |
+
+`unvalidated` is not a weaker `diagnostic`. The first is the absence of a
+statement; the second is a positive statement that the values are wrong. An
+ISP frame and a compressed buffer are different situations.
+
+A `source_kind` field sits beside it, because **measurement eligibility is not
+one predicate**. Corner geometry off an ISP mono frame is defensible;
+radiometry off the same frame is not. So `read_capture.py --detect` (positions)
+accepts an ISP pose with no flag while anything reading values as sensor counts
+requires admitted `science`.
+
+Both readers **fail closed**: a missing, misspelled or unrecognised validity is
+refused, and a `science` label with no admission record beside it is refused
+too — a label anyone can edit is not evidence. Pre-boundary archive files read
+as unknown and need `--allow-legacy` said out loud.
 
 This is deliberately **not** the same question as `space`. `space: raw` says
 the ISP was bypassed — a claim about the path the pixels took, not about what
 the values mean. A compressed PiSP buffer is `space: raw` and is not
-measurable. Saved previews are `diagnostic` too, for the same reason: gamma
-shaping and a drawn-on grid are not measurement data, and that used to be a
-sentence in a docstring rather than something enforced.
+measurable.
 
 Producing a diagnostic capture at all requires `allow_unvalidated_raw: true`
 in the camera's config block. It exists for bringing a new sensor up, and it
 is recorded in every sidecar it touches.
+
+**The format name does not tell you the sample depth.** The Picamera2 manual
+warns against deriving it, and describes Pi 5 uncompressed samples as
+left-shifted within their 16-bit word. `R10` names a ten-bit sample and says
+nothing about whether those ten bits are 0–9 or 6–15, and **the two readings
+differ by a factor of 64 in every pixel**. So three quantities are recorded
+separately — `raw_bits_nominal` (from the name, and evidence of nothing on its
+own), `raw_container_bits`, and `raw_alignment` / `raw_sample_shift` — and the
+alignment is *declared* in the config rather than guessed, because a dark
+left-aligned frame and a bright right-aligned one have indistinguishable
+histograms. Declaring `lsb` against left-aligned data is caught loudly:
+admission refuses the buffer and names the setting. The other way round is
+quiet, so confirm it once against a bright target using `raw_observed_max`,
+which is in every sidecar. **The pixels on disk are never shifted** — the
+shift is recorded and the readers apply it.
 
 **The rig's IP address will change.** DHCP does that. Reach it by name
 (`flyeye.local`), or give it a reservation in your router. When it has moved

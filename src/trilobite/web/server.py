@@ -41,6 +41,7 @@ from pydantic import BaseModel, ValidationError
 
 from ..app import Application, CameraRuntime
 from ..calibration import CalibrationSettings
+from ..cameras.rawformat import RawFormatError
 from ..config import StageConfig
 from ..optics.mla import UI_SUBAPERTURES
 from ..optics.orientation import Orientation
@@ -779,10 +780,28 @@ def create_app(application: Application) -> FastAPI:
 
     @api.post("/api/capture/{cam_id}/raw")
     def capture_raw(cam_id: str) -> dict[str, Any]:
-        """Full-resolution sensor data, ISP bypassed. This is measurement data."""
+        """Full-resolution sensor data, ISP bypassed. This is measurement data.
+
+        A buffer that cannot be admitted returns **422 and no file**, rather
+        than a 200 naming a diagnostic capture. Supervisory review R4: the
+        caller asked for measurement data, so "here is something else, and it
+        worked" is the wrong answer twice over. The 422 body names
+        `allow_unvalidated_raw`, which is the deliberate way to get the frame
+        anyway and which then marks it for what it is.
+        """
         cam = _cam(cam_id)
         try:
             return cam.capture_still(raw=True, tag="raw")
+        except RawFormatError as exc:
+            log.warning("%s: raw capture refused: %s", cam_id, exc)
+            raise HTTPException(422, {
+                "error": "raw buffer not admitted as sensor data",
+                "detail": str(exc),
+                "hint": ("set 'allow_unvalidated_raw: true' for this camera to "
+                         "capture it as a diagnostic frame, or fix the raw "
+                         "format; scripts/probe_cameras.py lists what the "
+                         "sensor offers"),
+            }) from None
         except Exception as exc:
             log.exception("%s: raw capture failed", cam_id)
             raise HTTPException(500, f"{type(exc).__name__}: {exc}") from None

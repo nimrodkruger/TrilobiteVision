@@ -51,6 +51,7 @@ cameras:
     # refusal rather than a warning.
     # raw_format: R10
     allow_unvalidated_raw: false
+    raw_alignment: lsb
     # RAW FORMAT. Leave unset and the widest UNPACKED format the sensor
     # advertises is chosen -- R10 on the IMX296 -- and named in the log at
     # startup. Set it by hand only from what scripts/probe_cameras.py reports.
@@ -71,6 +72,19 @@ cameras:
     # scripts/read_capture.py and the MATLAB readers. It is not a way to
     # capture data.
     allow_unvalidated_raw: false
+    # Where the sensor sample sits in the 16-bit word it is delivered in. The
+    # FORMAT NAME DOES NOT SAY: the Picamera2 manual (raw stream configuration,
+    # pp. 21-22) describes Pi 5 uncompressed samples as left-shifted in their
+    # word, and warns against deriving the depth from the name. lsb and msb
+    # differ by a factor of 64 in every pixel on a 10-bit sensor.
+    #
+    # Left at lsb because that is the reading this rig has been recording
+    # under. CONFIRM IT ONCE against a bright target: `raw_observed_max` in any
+    # sidecar should approach 1023 under lsb. If admission starts refusing
+    # buffers for values above 1023, the pipeline is left-aligning and this
+    # should be msb. The pixels on disk are never shifted either way --
+    # `raw_sample_shift` is recorded and the readers apply it.
+    raw_alignment: lsb
     # How often the PIPELINE runs. null follows server.preview_fps (12 here),
     # which is the only rate anything consumes. The sensor is still drained at
     # `fps` -- it has to be, or the request pool starves -- but stats, levels,

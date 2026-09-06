@@ -17,7 +17,7 @@ import pytest
 from trilobite.config import StorageConfig
 from trilobite.storage import devices
 from trilobite.storage.writer import SessionWriter
-from trilobite.types import Frame
+from trilobite.types import SCIENCE, SRC_RAW, Frame
 
 
 @pytest.fixture
@@ -25,8 +25,14 @@ def writer(tmp_path):
     return SessionWriter(StorageConfig(root=str(tmp_path / "internal")), tmp_path / "internal")
 
 
-def frame():
-    return Frame.now(np.zeros((8, 8), dtype=np.uint8), "left", 1)
+def frame(validity=SCIENCE, source_kind=SRC_RAW):
+    """A frame that has been through admission, unless a test says otherwise.
+
+    Explicit because the Frame default is now `unvalidated` (R2): nothing
+    constructs a science frame by omission, tests included.
+    """
+    return Frame.now(np.zeros((8, 8), dtype=np.uint8), "left", 1,
+                     validity=validity, source_kind=source_kind)
 
 
 # -- enumeration ------------------------------------------------------------
@@ -508,9 +514,7 @@ def test_a_science_capture_is_named_and_recorded_as_one(writer):
 def test_a_diagnostic_capture_is_named_diagnostic_first(writer):
     from trilobite.types import DIAGNOSTIC
 
-    f = Frame.now(np.zeros((8, 8), dtype=np.uint8), "left", 1,
-                  validity=DIAGNOSTIC)
-    out = writer.save_still(f, tag="raw")
+    out = writer.save_still(frame(validity=DIAGNOSTIC), tag="raw")
 
     assert out["validity"] == DIAGNOSTIC
     assert out["file"].startswith("diagnostic_raw_left_"), out["file"]
@@ -526,8 +530,7 @@ def test_the_two_kinds_sort_apart_in_a_directory_listing(writer):
     from trilobite.types import DIAGNOSTIC
 
     writer.save_still(frame(), tag="raw")
-    writer.save_still(Frame.now(np.zeros((8, 8), dtype=np.uint8), "left", 2,
-                                validity=DIAGNOSTIC), tag="raw")
+    writer.save_still(frame(validity=DIAGNOSTIC), tag="raw")
     names = sorted(p.name for p in (_P(writer.session_dir) / "left").glob("*.npy"))
     assert len(names) == 2
     assert names[0].startswith("diagnostic_"), names
@@ -558,9 +561,14 @@ def test_a_saved_preview_is_diagnostic_however_it_is_tagged(tmp_path):
     assert out["file"].startswith("diagnostic_view_"), out["file"]
 
 
-def test_a_full_capture_from_the_same_runtime_stays_science(tmp_path):
-    """The counterpart, so the preview rule cannot be satisfied by marking
-    everything diagnostic."""
+def test_a_synthetic_capture_is_unvalidated_and_says_which(tmp_path):
+    """Three validities, and the middle one is not a rounding of the others.
+
+    A rendered frame is not `diagnostic` -- nothing about it is known to be
+    wrong -- and it is emphatically not `science`, because there was no sensor.
+    `unvalidated` is the only true answer, and it has its own filename prefix
+    so a directory listing does not present simulation as measurement.
+    """
     from trilobite.app import CameraRuntime
     from trilobite.config import CameraConfig
 
@@ -574,5 +582,18 @@ def test_a_full_capture_from_the_same_runtime_stays_science(tmp_path):
     finally:
         cam.source.close()
 
-    assert out["validity"] == "science"
-    assert out["file"].startswith("still_left_"), out["file"]
+    assert out["validity"] == "unvalidated"
+    assert out["source_kind"] == "synthetic"
+    assert out["file"].startswith("unvalidated_still_left_"), out["file"]
+
+
+def test_an_admitted_frame_is_the_only_one_with_a_bare_name(writer):
+    """The property the prefix exists for: `ls` alone separates measurement
+    from everything else, and only an admitted frame gets the plain name."""
+    from trilobite.types import DIAGNOSTIC, UNVALIDATED
+
+    names = {v: writer.save_still(frame(validity=v), tag="raw")["file"]
+             for v in (SCIENCE, DIAGNOSTIC, UNVALIDATED)}
+    assert names[SCIENCE].startswith("raw_")
+    assert names[DIAGNOSTIC].startswith("diagnostic_raw_")
+    assert names[UNVALIDATED].startswith("unvalidated_raw_")
