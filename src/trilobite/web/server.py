@@ -191,12 +191,27 @@ def create_app(application: Application) -> FastAPI:
     # -- preview stream --------------------------------------------------
 
     def _mjpeg(produce, min_interval: float, wait_for_new):
-        """Shared MJPEG body. `produce` returns an ndarray or None."""
+        """Shared MJPEG body. `produce` returns an ndarray or None.
+
+        `wait_for_new` returns False when it timed out without a new frame. On
+        that path nothing is sent, and that is a change: this used to fall
+        through and re-encode the frame it had already sent. Two costs, and the
+        second is the reason for the fix. It burned a JPEG encode per timeout
+        on a camera that had stopped producing -- the worst moment to spend
+        CPU. And it made the byte stream indistinguishable from a live one, so
+        a frozen sensor arrived at the browser as a healthy stream of identical
+        images.
+
+        The picture on screen is still the last good one either way; MJPEG has
+        no way to say "nothing here". Saying so is the page's job, using
+        `published_age_s` from the status poll.
+        """
 
         def frames():
             last_sent = 0.0
             while True:
-                wait_for_new()
+                if wait_for_new() is False:
+                    continue
                 now = time.monotonic()
                 if now - last_sent < min_interval:
                     continue
@@ -229,9 +244,11 @@ def create_app(application: Application) -> FastAPI:
         cam = _cam(cam_id)
         state = {"seen": -1}
 
-        def wait():
+        def wait() -> bool:
             version, _ = cam.preview.wait_newer(state["seen"], timeout=2.0)
+            fresh = version != state["seen"]
             state["seen"] = version
+            return fresh
 
         return _mjpeg(lambda: (cam.latest().data if cam.latest() else None),
                       1.0 / max(preview_fps, 0.1), wait)

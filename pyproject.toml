@@ -29,13 +29,28 @@ dependencies = [
 # numpy that picamera2's buffers use. A pip wheel alongside it gives two cv2
 # modules and an import order that silently decides which one you get.
 desktop = ["numpy>=1.24", "pillow>=10.0", "opencv-python-headless>=4.9"]
-dev = ["pytest>=8.0", "ruff>=0.4"]
+# httpx is here deliberately, not incidentally. fastapi.testclient needs an
+# HTTP client at import time, and it happened to be installed because
+# something else had pulled it in -- so the API tests passed here and failed to
+# import at all in a freshly resolved environment during an external review. A
+# test dependency satisfied by luck is not satisfied.
+#
+# playwright drives the retained browser scenarios in tests/browser/. They skip
+# when it is absent, so `pip install -e '.[dev]'` still gives a green suite
+# without downloading a browser; CI installs it so the UI checks are executed
+# rather than merely described.
+dev = ["pytest>=8.0", "ruff>=0.4", "httpx>=0.27", "playwright>=1.44"]
 
 [project.scripts]
 trilobite = "trilobite.__main__:main"
 
+# `include` is explicit, not a bare `where = ["src"]`. Package discovery over
+# the whole of src/ picked up a second, older capture-and-storage stack that
+# was still sitting in the tree, so `pip install -e .` shipped both. One
+# application, one package.
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["trilobite*"]
 
 [tool.setuptools.package-data]
 "trilobite.web" = ["static/*"]

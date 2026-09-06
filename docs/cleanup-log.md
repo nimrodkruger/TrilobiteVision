@@ -12,6 +12,138 @@ git checkout .              # everything back to HEAD
 
 ---
 
+## 2026-09-06 (o) — review stages 0 and 1: trustworthy evidence, honest status
+
+First two stages of `docs/implementation-plan.md`, responding to
+`docs/software-stack-review.md`. Nothing in either changes how the rig acquires
+or stores anything; that starts at Stage 2.
+
+### Stage 0 — make the evidence trustworthy
+
+The reviewer's suite run was **311 passed, 9 failed**, and none of the failures
+were about the software. Seven were tests writing to the real
+`~/trilobite-data`, two were Windows assertions about `fsync` call counts. A
+suite that fails on a clean machine for reasons unrelated to the code is not
+evidence of anything, and it cost the reviewer time to establish that.
+
+**The seven.** `tests/test_rotation.py` built `AppConfig` with no storage
+block, which defaults to `~/trilobite-data`. Mine, and invisible because it
+works on a machine whose home directory is writable — it just scatters session
+directories through it. Fixed, and `tests/conftest.py` now refuses: an autouse
+fixture wraps `SessionWriter.__init__` and fails any test rooting a writer
+outside its own `tmp_path`, naming the test and the path. Reintroducing the
+omission reproduces exactly those seven failures with a message that says what
+to do.
+
+**The two.** They asserted `os.fsync` was *called* four times — image, sidecar,
+and their two directories. On Windows `fsync_dir` cannot open a directory and
+returns early **by design**, so two never happen and the capture is as durable
+as that platform allows. The test was checking an internal call count rather
+than an externally meaningful outcome, which the review names as a general
+fault. So `fsync_dir` now returns whether it succeeded, `durability_of()`
+measures the answer per directory (measured, not inferred from `sys.platform`
+— a Linux host on an exotic mount can be `file-only` too, and that is exactly
+where guessing gets it wrong with confidence), and every sidecar records
+`durability: strict | file-only`. The test asserts the files are on disk and
+the record says which guarantee was obtained; a second, POSIX-only test asserts
+`strict`, so the Pi's promise is still pinned.
+
+Also: `httpx` and `playwright` are explicit `dev` dependencies — the API tests
+passed here only because something else had pulled httpx in, and failed to
+import at all in a freshly resolved environment. `packages.find` gained
+`include = ["trilobite*"]`, so discovery cannot ship a second application
+again. A CI workflow runs the suite on Linux and Windows across Python 3.11 and
+3.13, and fails the build if anything wrote to `$HOME/trilobite-data`.
+
+**The browser scenarios are now tests.** They were ad-hoc scripts during
+development; the review looked for them in the repository and found none.
+`tests/browser/` runs the real application under uvicorn, drives Chromium, and
+asserts ten things a Python test cannot see — which tabs stream, which stage
+panels appear where, that the rotate control has a non-zero rendered size, that
+enabling the grid locks orientation and a POST then returns 409, and that the
+offset slider re-ranges from ±50 to ±20 when the pitch goes 100 → 40. They skip
+when Playwright or a browser is absent, so an ordinary `pytest -q` stays green;
+CI installs Chromium so they execute. `TRILOBITE_CHROMIUM` points at an
+existing binary where the download is unavailable.
+
+**Four overclaims in the progress report, corrected in place** with dated
+notes rather than quiet edits: that only the capture thread touches the camera
+(it does not — F1); that a full frame is the same exposure as its preview (true
+of the handshake, false of `capture_full`, which is what stills use); that
+device disappearance is detected (F2); and that stereo pair skew is "tens of
+milliseconds" (it also contains a full disk write, fsync included).
+
+`src/flyeye/` and `systemd/flyeye.service` are still to be deleted — a shell
+task on the Windows tree, listed in the plan.
+
+### Stage 1 — status that stops being true when the rig does
+
+Finding F5. The failure class is not that something breaks; it is that
+something breaks and everything goes on reporting success. Four ways that was
+possible, all now closed:
+
+| was | now |
+|---|---|
+| `RateMeter` computed from its last N samples with no reference to the present, so a camera stopped an hour ago still reported the rate it had when it stopped | returns `0.0` when the newest sample is older than `stale_after` (3 s) |
+| `status.sensor_fps` returned `cfg.fps` — a configured number wearing the name of a measurement, and structurally unable to fall to zero | measured at the point a frame is taken, counting frames the rate cap released, alongside `configured_fps` which keeps the old meaning under an honest name |
+| `Pipeline.__call__` caught a stage exception, logged it and passed the frame on. Nothing above that line could see it: not the frame, not `CameraRuntime.errors`, not the API | per-stage counters and last message in `/api/status`; the frame carries `pipeline_failed_stages`; logging is rate-limited to the 1st and every 100th so a stage failing at 12 Hz cannot bury the journal while the counter still records every one |
+| the MJPEG generator re-encoded and re-sent the last frame every time the 2 s bus wait timed out | sends nothing. One frame on connect, so a new viewer is not looking at a blank pane, then silence |
+
+Added: `acquired_age_s` and `published_age_s` (`null`, not `0`, when nothing
+has happened yet), and `last_write` on the writer — filename, age, bytes and
+durability of the last file that *actually landed*, recorded only after both
+members are verified, so it cannot come to mean "last write attempted".
+
+On the page: a camera with no frame for two seconds is flagged **⚠ NO FRAME FOR
+*n*s** and its image is dimmed and desaturated — a number in a header is easy
+not to look at while you are staring at the picture, which is precisely when a
+frozen picture does damage. Stage failures appear beside the camera. And the
+status poll failing three times running now shows **⚠ no reply from the rig**,
+which the page previously caught and discarded.
+
+`Frame.seq` and `Frame.t_mono` are documented accurately. The docstring said
+"gaps mean dropped frames", which was wrong in the direction that matters: it
+counts software *deliveries*, frames released by the cap never reach it, and it
+is not drop or pairing evidence. `t_mono` is receipt, not exposure — the
+driver's `SensorTimestamp` is the only timestamp here with a defined
+relationship to the exposure, and synchronisation work will need it.
+
+### Mutation results, including one that failed usefully
+
+| mutation | caught by |
+|---|---|
+| `RateMeter` stops ageing out | 2 tests |
+| `sensor_fps` back to the configured number | 1 |
+| stage failures not recorded | 4 |
+| the stream re-sends a stale frame | **initially nothing** |
+
+The fourth is worth recording. The test passed with the behaviour mutated away,
+because the helper reading the stream was built on `urllib`, whose buffered
+reader raises `OSError: cannot read from timed out object` after the first
+socket timeout and stays broken. It exited at the first quiet moment and
+returned zero bytes — for a live stream as readily as a dead one. Rewritten
+against a bare socket, it then reported 533 bytes from a *stopped* camera,
+which turned out to be correct behaviour the test had mis-specified: one frame
+on connect is right. The assertion is now "one frame, then nothing across two
+consecutive windows on one connection", and the mutation fails it with 1074
+bytes. A test that cannot fail is worth less than no test, and only the
+mutation revealed it.
+
+### Verification
+
+```
+pytest -q               → 335 passed, 10 skipped   (was 321)
+pytest tests/browser/   → 10 passed against a real server and Chromium
+ruff check .            → clean
+```
+
+Bench-verified in a browser: healthy shows `11.97 fps  sensor 19.89`, the cap
+visible in the gap; stopping one camera turns its header red with ⚠ NO FRAME
+FOR 3s and dims its image while the other is untouched; stopping the server
+raises the no-reply banner.
+
+---
+
 ## 2026-09-05 (n) — six tabs, and an audit of what the sliders may ask for
 
 ### Why collapsing the storage panel did not help

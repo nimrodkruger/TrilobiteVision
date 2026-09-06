@@ -9,6 +9,8 @@ path that says otherwise. Two of the tests below are that scenario.
 
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 import pytest
 
@@ -314,19 +316,45 @@ def test_diagnostics_reports_all_three_sources(monkeypatch):
 # had minutes to flush it.
 
 
-def test_a_capture_is_fsynced_before_it_is_reported_saved(writer, monkeypatch):
-    """The mechanism, asserted directly: fsync must be called on the file, and
-    on the directory holding it, before save_still returns."""
-    import os as _os
+def test_a_capture_is_fsynced_before_it_is_reported_saved(writer):
+    """Every file this capture produced is on the device, and the record says
+    how firmly.
 
-    synced = []
-    real_fsync = _os.fsync
-    monkeypatch.setattr(_os, "fsync", lambda fd: (synced.append(fd), real_fsync(fd))[1])
+    This asserted a *call count* on `os.fsync` before -- four, being the image,
+    the sidecar and their two directories. It failed on Windows for a reason
+    that was not a bug: `fsync_dir` cannot open a directory there and returns
+    early by design, so two of the four never happen while the capture remains
+    as durable as that platform allows.
+
+    Counting internal calls was also testing the wrong thing. What a caller
+    needs is that the bytes are down, and that the report says which guarantee
+    was obtained. So that is what is checked, and the platform difference
+    becomes a recorded capability rather than a failing test.
+    """
+    from trilobite.storage.writer import FILE_ONLY, STRICT
 
     out = writer.save_still(frame())
-    # image + image's directory + sidecar + sidecar's directory
-    assert len(synced) >= 4, synced
     assert out["bytes"] > 0
+    assert out["durability"] in (STRICT, FILE_ONLY)
+
+    from pathlib import Path as _P
+    assert _P(out["image"]).stat().st_size == out["bytes"]
+    assert _P(out["metadata"]).stat().st_size > 0
+
+
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="fsync on a directory is a POSIX affordance")
+def test_a_posix_filesystem_gives_the_strict_guarantee(writer):
+    """What the durability field is for.
+
+    On the Pi -- the only platform where a power cut matters -- the directory
+    entry is fsync'd too, so a reported save survives one. If this ever reads
+    `file-only` on Linux the target is on a mount that cannot promise it, and
+    the operator should learn that before the session rather than after.
+    """
+    from trilobite.storage.writer import STRICT
+
+    assert writer.save_still(frame())["durability"] == STRICT
 
 
 def test_save_still_reports_the_size_on_disk(writer):
@@ -405,24 +433,29 @@ def test_the_written_file_actually_loads_back(writer):
     assert _np.array_equal(_np.load(out["image"]), f.data)
 
 
-def test_the_session_manifest_is_durable_too(writer):
-    """It survived the field failure by luck -- it is written at startup, so
-    writeback had flushed it. A manifest written after a retarget has no such
-    head start."""
-    import os as _os
+def test_the_session_manifest_is_written_through_the_durable_path(writer, monkeypatch):
+    """The manifest survived the field failure by luck -- it is written at
+    start-up, so writeback had had minutes. One written after a retarget has no
+    such head start, so it must go through `write_durably` like everything else.
 
-    synced = []
-    real_fsync = _os.fsync
+    Asserted by watching that function rather than by counting `os.fsync`
+    calls: the old version demanded two syncs and so failed on Windows, where
+    the directory one is unavailable by design. What matters is that the
+    manifest does not take a shortcut, and that its content is on the disk.
+    """
+    import json as _json
+
     import trilobite.storage.writer as W
-    monkeypatch_target = W.os
-    orig = monkeypatch_target.fsync
-    monkeypatch_target.fsync = lambda fd: (synced.append(fd), real_fsync(fd))[1]
-    try:
-        path = writer.write_session_manifest({"hello": "world"})
-    finally:
-        monkeypatch_target.fsync = orig
-    assert path.stat().st_size > 0
-    assert len(synced) >= 2
+
+    calls: list[str] = []
+    real = W.write_durably
+    monkeypatch.setattr(W, "write_durably",
+                        lambda p, b: (calls.append(str(p)), real(p, b))[1])
+
+    path = writer.write_session_manifest({"hello": "world"})
+
+    assert str(path) in calls, "the manifest bypassed the durable write path"
+    assert _json.loads(path.read_text())["hello"] == "world"
 
 
 def test_verify_device_passes_on_a_working_filesystem(tmp_path):

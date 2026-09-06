@@ -325,6 +325,11 @@
        is `git pull` with the browser left open, and a cached page missing
        controls the server already has is indistinguishable from a broken
        feature. This is how the page notices. -->
+  <!-- The status poll itself has stopped answering. Distinct from anything
+       the status could report, and invisible before this existed: the page
+       swallowed the failure and MJPEG kept showing the last frame it got. -->
+  <span class="meta" id="poll-dead" hidden
+        style="color:var(--err);font-weight:650"></span>
   <span class="meta" id="stale" hidden
         style="color:var(--warn);font-weight:650;cursor:pointer"
         title="Click to reload">⟳ page is out of date — reload</span>
@@ -2099,6 +2104,74 @@ document.addEventListener("click", ev => {
   if (ev.target.closest("#stale")) location.reload();
 });
 
+/* How old a preview may be before it is called stale.
+
+   Generous relative to the 12 Hz stream, because the question is "has this
+   stopped", not "did one frame arrive late". Two seconds is about twenty-four
+   missed frames — unambiguous, and short enough that you notice before you
+   have adjusted anything against a frozen image. */
+const STALE_PREVIEW_S = 2.0;
+
+let pollFailures = 0;
+
+/* Per-camera health, and the image dimming that goes with it.
+
+   Everything here reads a MEASURED field. `fps` is the pipeline rate and falls
+   to zero when the pipeline stops; `sensor_fps` is the acquisition rate and
+   falls to zero when the sensor stops; `published_age_s` says how long since a
+   frame reached the bus. Before those existed the header could show a healthy
+   frame rate beside a frozen picture indefinitely — worse than showing
+   nothing, because it argues the rig is fine. */
+function renderCameraHealth(c) {
+  const el = document.querySelector(`[data-fps="${c.cam_id}"]`);
+  const age = c.published_age_s;
+  const stale = age != null && age > STALE_PREVIEW_S;
+  const stageFails = Object.entries(c.stage_failures || {});
+
+  if (el) {
+    const bits = [];
+    if (stale) bits.push(`⚠ NO FRAME FOR ${age.toFixed(0)}s`);
+    else bits.push(`${c.fps} fps`);
+    // The sensor rate is worth showing whenever it differs from the pipeline
+    // rate — which under the cap is always. It is how you tell a stalled
+    // sensor from a stalled pipeline without reading a log.
+    if (c.sensor_fps) bits.push(`sensor ${c.sensor_fps}`);
+    bits.push(`${c.frames} frames`);
+    if (c.errors) bits.push(`${c.errors} ERR`);
+    // A stage throwing on every frame is otherwise invisible: the pipeline
+    // catches it and the preview keeps flowing at full rate.
+    if (stageFails.length) {
+      bits.push(stageFails.map(([n, f]) => `${n} ×${f.count} FAILED`).join("  "));
+    }
+    el.textContent = bits.join("  ");
+    el.style.color = (stale || c.errors || stageFails.length) ? "var(--err)" : "";
+    el.title = stageFails.length
+      ? stageFails.map(([n, f]) => `${n}: ${f.last_error}`).join("\n")
+      : (c.last_error || "");
+  }
+
+  // Dim the image itself. A number in the header is easy not to look at while
+  // you are staring at the picture, which is exactly when a frozen picture
+  // does damage — you adjust optics against an image that stopped updating.
+  const img = document.querySelector(`img.view[src*="/stream/${c.cam_id}."]`);
+  if (img) {
+    img.style.opacity = stale ? "0.35" : "";
+    img.style.filter = stale ? "grayscale(1)" : "";
+  }
+
+  if (c.live) syncSensorRows(c.cam_id, {}, c.live);
+}
+
+/* The status poll failing is a different fault from anything it reports, and
+   the header is the only place it can be shown. */
+function setPollHealth(ok, message = "") {
+  const el = $("#poll-dead");
+  if (!el) return;
+  el.hidden = ok;
+  el.textContent = ok ? "" : "⚠ no reply from the rig — everything below is stale";
+  el.title = message;
+}
+
 let tick = 0;
 async function poll() {
   try {
@@ -2130,14 +2203,7 @@ async function poll() {
       warn.textContent = (h.problems && h.problems.length) ? `⚠ ${h.problems[0]}` : "";
       warn.hidden = !(h.problems && h.problems.length);
     }
-    for (const c of s.cameras) {
-      const el = document.querySelector(`[data-fps="${c.cam_id}"]`);
-      if (el) {
-        el.textContent = `${c.fps} fps  ${c.frames} frames` + (c.errors ? `  ${c.errors} ERR` : "");
-        el.style.color = c.errors ? "var(--err)" : "";
-      }
-      if (c.live) syncSensorRows(c.cam_id, {}, c.live);
-    }
+    for (const c of s.cameras) renderCameraHealth(c);
     // Sub-aperture indices shift as pitch changes; refresh captions at a low
     // rate rather than on every keystroke.
     tick++;
@@ -2152,7 +2218,17 @@ async function poll() {
     // Every ~15 s. Cheap, and the alternative is an operator concluding a
     // feature is broken when the page is simply the one from before the pull.
     if (tick % 15 === 0) checkStale();
-  } catch (e) { /* transient; the streams themselves show a stall */ }
+    pollFailures = 0;
+    setPollHealth(true);
+  } catch (e) {
+    /* One missed poll is a hiccup; several in a row means the server has
+       stopped answering, and the page must say so. It used to swallow every
+       one of them silently, so a dead backend looked exactly like a quiet
+       rig -- the streams do NOT show it, because MJPEG keeps displaying the
+       last frame it received for as long as the tab is open. */
+    pollFailures++;
+    if (pollFailures >= 3) setPollHealth(false, e.message);
+  }
   setTimeout(poll, 1000);
 }
 

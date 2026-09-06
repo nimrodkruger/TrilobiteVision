@@ -31,11 +31,29 @@ from .types import Frame
 log = logging.getLogger(__name__)
 
 
-class RateMeter:
-    """Rolling frame-rate estimate over a short window."""
+def _round_or_none(v: float | None, places: int = 2) -> float | None:
+    """Round, but keep None meaning "never happened" rather than "zero ago"."""
+    return None if v is None else round(v, places)
 
-    def __init__(self, window: int = 60) -> None:
+
+class RateMeter:
+    """Rolling frame-rate estimate over a short window, that goes to zero.
+
+    The going-to-zero is the point, and it was missing. The estimate was
+    computed from the last N samples with no reference to the present, so a
+    camera that stopped an hour ago went on reporting the rate it had when it
+    stopped -- for as long as the process lived. The dashboard showed 12 fps
+    next to a frozen image, which is a worse answer than showing nothing: it
+    actively argues the rig is fine.
+
+    `stale_after` is generous on purpose. It has to be longer than the slowest
+    legitimate gap -- a 1 Hz source, a paused pipeline -- or the number would
+    flicker to zero during ordinary operation and be ignored thereafter.
+    """
+
+    def __init__(self, window: int = 60, stale_after: float = 3.0) -> None:
         self._t = deque(maxlen=window)
+        self._stale_after = stale_after
 
     def tick(self) -> None:
         self._t.append(time.monotonic())
@@ -44,8 +62,20 @@ class RateMeter:
     def fps(self) -> float:
         if len(self._t) < 2:
             return 0.0
+        if time.monotonic() - self._t[-1] > self._stale_after:
+            return 0.0
         span = self._t[-1] - self._t[0]
         return (len(self._t) - 1) / span if span > 0 else 0.0
+
+    @property
+    def last(self) -> float | None:
+        """`time.monotonic()` of the most recent tick, or None."""
+        return self._t[-1] if self._t else None
+
+    @property
+    def age(self) -> float | None:
+        """Seconds since the most recent tick. None if there has never been one."""
+        return None if not self._t else time.monotonic() - self._t[-1]
 
 
 class CameraRuntime:
@@ -72,7 +102,14 @@ class CameraRuntime:
         self.bind_pipeline()
         self.preview = LatestFrame()
         self.writer = writer
+        # Two meters, because two different things are being asked about.
+        # `rate` counts frames the PIPELINE produced -- what the browser sees.
+        # `acquired` counts frames taken from the SENSOR, including the ones
+        # the rate cap released without decoding. Reporting the configured fps
+        # as the sensor rate, which is what status did before, answers "what
+        # did you ask for" while looking like an answer to "what is happening".
         self.rate = RateMeter()
+        self.acquired = RateMeter()
         self.errors = 0
         self.last_error: str | None = None
         self._thread: threading.Thread | None = None
@@ -132,6 +169,11 @@ class CameraRuntime:
                     if now < due:
                         self.source.skip_preview()
                         self.skipped += 1
+                        # A skipped frame is still an exposure that arrived, so
+                        # it counts towards the measured sensor cadence. Only
+                        # counting processed frames would make the cap look
+                        # like a stalling sensor.
+                        self.acquired.tick()
                         continue
                     # Advance the deadline by exactly one interval rather than
                     # restarting it from now. 12 Hz does not divide 30 Hz, so a
@@ -145,6 +187,7 @@ class CameraRuntime:
                 if frame is None:
                     time.sleep(0.05)
                     continue
+                self.acquired.tick()
                 frame = self.pipeline(frame)
                 self.preview.publish(frame)
                 self.rate.tick()
@@ -249,17 +292,31 @@ class CameraRuntime:
             "label": self.label,
             "backend": self.cfg.backend,
             "open": self.source.is_open,
-            # `fps` is the PIPELINE rate, not the sensor rate: it is measured
-            # where the pipeline runs, so with a cap in place it should read
-            # close to process_fps while the sensor keeps running at cfg.fps.
-            "fps": round(self.rate.fps, 2),
+            # Four rate numbers, and the distinction between them is the whole
+            # point. `fps` and `sensor_fps` are MEASURED and fall to zero when
+            # the thing they measure stops; `process_fps` and `configured_fps`
+            # are what was asked for and never change on their own. Reporting
+            # the configured sensor rate under the name `sensor_fps`, which is
+            # what this did before, answered the second question in the shape
+            # of an answer to the first.
+            "fps": round(self.rate.fps, 2),                 # pipeline, measured
+            "sensor_fps": round(self.acquired.fps, 2),      # acquisition, measured
             "process_fps": (round(1.0 / self.process_interval, 2)
                             if self.process_interval > 0 else None),
-            "sensor_fps": float(self.cfg.fps),
+            "configured_fps": float(self.cfg.fps),
             "skipped": self.skipped,
             "frames": version,
+            # Seconds since the last acquisition and the last publish. These
+            # are what a viewer needs to decide whether an image on screen is
+            # current: a frame count that has stopped rising is only visible to
+            # something that remembers the previous count.
+            "acquired_age_s": _round_or_none(self.acquired.age),
+            "published_age_s": _round_or_none(self.rate.age),
             "errors": self.errors,
             "last_error": self.last_error,
+            # Stage failures, which the capture-loop error count never saw:
+            # the pipeline catches them and passes the frame through.
+            "stage_failures": self.pipeline.failures,
             "preview_shape": list(frame.shape) if frame is not None else None,
             "live": self.live_controls(),
             "info": self.source.describe().as_dict() if self.source.is_open else None,

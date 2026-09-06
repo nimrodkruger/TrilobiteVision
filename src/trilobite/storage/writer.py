@@ -80,25 +80,62 @@ def fsync_file(fh) -> None:
     os.fsync(fh.fileno())
 
 
-def fsync_dir(path: Path) -> None:
+def fsync_dir(path: Path) -> bool:
     """Make a directory entry durable, so the *name* survives a power cut too.
 
     Fsyncing a file guarantees its contents; it says nothing about the entry
     that points at it. Both are needed, and the directory one is not available
     on Windows -- opening a directory raises there -- so a failure is logged at
     debug and ignored rather than failing a capture on the dev machine.
+
+    **Returns whether it actually happened**, which is the part that used to be
+    swallowed entirely. A caller reporting a capture as durable needs to know
+    which kind of durable it got, and a platform difference belongs in the
+    record as a measured capability rather than as an assumption baked into a
+    test.
     """
     try:
         fd = os.open(str(path), os.O_RDONLY)
     except OSError as exc:                       # Windows, or an odd FUSE mount
         log.debug("cannot open %s to fsync: %s", path, exc)
-        return
+        return False
     try:
         os.fsync(fd)
+        return True
     except OSError as exc:                       # some FUSE backends refuse
         log.debug("cannot fsync directory %s: %s", path, exc)
+        return False
     finally:
         os.close(fd)
+
+
+# Durability answers, keyed by directory. It is a property of the mount, and
+# this is asked once per capture. Cleared on retarget: a new target is a new
+# filesystem and may answer differently.
+_DURABILITY_CACHE: dict[str, str] = {}
+
+STRICT = "strict"            # contents AND the directory entry are fsync'd
+FILE_ONLY = "file-only"      # contents only; the name may not survive a cut
+
+
+def durability_of(path: Path) -> str:
+    """What this filesystem can actually promise, as a word for the record.
+
+    `strict` means a power cut after a reported save leaves the file, named,
+    with its bytes. `file-only` means the contents are down but the directory
+    entry may not be, so the file can come back nameless.
+
+    **Measured, not inferred from `sys.platform`.** A Linux host on an exotic
+    mount can be `file-only` too, and that is precisely the case where guessing
+    from the platform gives the wrong answer with confidence -- which is the
+    failure mode this whole module exists to avoid.
+    """
+    key = str(path)
+    cached = _DURABILITY_CACHE.get(key)
+    if cached is None:
+        cached = STRICT if fsync_dir(path) else FILE_ONLY
+        _DURABILITY_CACHE[key] = cached
+    return cached
 
 
 def write_durably(path: Path, payload: bytes) -> int:
@@ -219,6 +256,11 @@ class SessionWriter:
         self._lock = threading.Lock()
         self._counter = 0
         self._manifest: dict[str, Any] | None = None
+        # (filename, monotonic time, bytes, durability) of the last file that
+        # actually landed. Reported in state() so "is this device still taking
+        # data" has an answer that is evidence rather than inference from a
+        # mount point looking healthy.
+        self._last_write: tuple[str, float, int, str] | None = None
         # Human-readable record of every retarget and every recovery. Surfaced
         # in the UI, because a session that silently moved to a different disk
         # halfway through is a session you will spend an hour looking for.
@@ -266,6 +308,11 @@ class SessionWriter:
             raise ValueError(f"cannot create {target}: {exc}") from None
         if not devices._writable(str(target)):
             raise ValueError(f"{target} is not writable (read-only mount, or permissions)")
+
+        # A different filesystem may make a different durability promise, and
+        # the cached answer is per directory. Drop it rather than carry the old
+        # mount's answer onto the new one.
+        _DURABILITY_CACHE.clear()
 
         with self._lock:
             previous = self.session_dir
@@ -329,6 +376,17 @@ class SessionWriter:
             "free_gb": round(free / 1e9, 1),
             "total_gb": round(total / 1e9, 1),
             "notes": list(self.notes),
+            # When something last actually landed, and what. A mounted,
+            # writable, roomy device tells you nothing about whether the last
+            # capture reached it -- and the moment that matters is exactly the
+            # moment those three all still look fine. None means nothing has
+            # been written in this run, which is different from "long ago".
+            "last_write": (None if self._last_write is None else {
+                "file": self._last_write[0],
+                "age_s": round(time.monotonic() - self._last_write[1], 2),
+                "bytes": self._last_write[2],
+                "durability": self._last_write[3],
+            }),
         }
 
     def write_session_manifest(self, payload: dict[str, Any]) -> Path:
@@ -431,11 +489,25 @@ class SessionWriter:
             "pipeline": _jsonable(pipeline_settings or {}),
             "camera": _jsonable(camera_info or {}),
             "bytes": img_bytes,
+            # What durability this filesystem actually gave us, measured on the
+            # directory the file went into. `file-only` means the bytes are on
+            # the device but the directory entry may not be, so a power cut can
+            # return the file without its name. Recorded rather than assumed,
+            # because it is the difference between "saved" meaning two
+            # different things on the Pi and on a Windows desktop.
+            "durability": durability_of(img_path.parent),
         }
         meta_path = img_path.with_suffix(".json")
         payload = json.dumps(sidecar, indent=2).encode("utf-8")
         write_durably(meta_path, payload)
         verify_size(meta_path, len(payload))
+
+        # Recorded only here, after BOTH members are on the device and both
+        # sizes verified. Setting it earlier would make "last write" mean "last
+        # write attempted", which is the class of claim this module exists to
+        # stop making.
+        self._last_write = (img_path.name, time.monotonic(), img_bytes,
+                            sidecar["durability"])
 
         log.info("saved %s (%s %s, %d bytes on disk)",
                  img_path.name, frame.data.shape, frame.data.dtype, img_bytes)

@@ -1,0 +1,63 @@
+# The suite on both platforms it is developed and reviewed on.
+#
+# Windows is here because that is where the desktop work happens and where an
+# external reviewer ran it -- and because the two platforms make genuinely
+# different durability promises. `fsync` on a directory is a POSIX affordance;
+# a test that assumes it silently encodes "Linux" as "correct". Running both
+# means a platform difference shows up as a skip with a reason rather than as a
+# red suite nobody can reproduce.
+#
+# No Pi, no camera. Everything here runs against the synthetic backends, which
+# is the property that makes this worth having at all.
+
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  suite:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.11", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install
+        run: python -m pip install -e ".[desktop,dev]"
+
+      # Chromium only, and only on Linux: the browser scenarios check the
+      # dashboard's structure and behaviour, which does not vary by host OS,
+      # and installing three browsers on four matrix legs is minutes of CI for
+      # nothing. They skip everywhere else.
+      - name: Browser for the UI scenarios
+        if: matrix.os == 'ubuntu-latest'
+        run: python -m playwright install --with-deps chromium
+
+      - name: Lint
+        run: python -m ruff check .
+
+      - name: Tests
+        run: python -m pytest -q
+
+      # The suite must not touch the developer's home directory --
+      # tests/conftest.py enforces it for the writer, and this catches anything
+      # that finds another route.
+      - name: No stray session directories
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          if [ -d "$HOME/trilobite-data" ]; then
+            echo "tests wrote to $HOME/trilobite-data"
+            find "$HOME/trilobite-data" | head -50
+            exit 1
+          fi

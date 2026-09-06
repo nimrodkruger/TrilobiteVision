@@ -27,6 +27,13 @@ class Pipeline:
         self._stages: list[Stage] = list(stages or [])
         self._lock = threading.RLock()
         self._timings: dict[str, float] = {}
+        # Per-stage failure counters and the most recent message. A stage that
+        # throws on every frame used to be invisible to everything but the log:
+        # the frame passed through unchanged, `CameraRuntime.errors` never saw
+        # it, and the preview kept flowing at full rate. Degradation that looks
+        # like success is the failure mode this subsystem exists to prevent.
+        self._failures: dict[str, int] = {}
+        self._last_error: dict[str, str] = {}
 
     @classmethod
     def from_config(cls, configs: list[StageConfig]) -> Pipeline:
@@ -38,17 +45,48 @@ class Pipeline:
     def __call__(self, frame: Frame) -> Frame:
         with self._lock:
             stages = list(self._stages)
+        failed: list[str] = []
         for stage in stages:
             t0 = time.perf_counter()
             try:
                 frame = stage(frame)
-            except Exception:
-                # A broken stage must not kill the capture thread. Log once per
-                # occurrence, disable nothing, and pass the frame through --
-                # a degraded preview beats a dead rig mid-experiment.
-                log.exception("stage %s failed; frame passed through", stage.name)
+            except Exception as exc:
+                # A broken stage must not kill the capture thread: pass the
+                # frame through, because a degraded preview beats a dead rig
+                # mid-experiment. But say so. Passing it through *silently* is
+                # what made a permanently throwing stage indistinguishable from
+                # a working one at every level above this line.
+                self._failures[stage.name] = self._failures.get(stage.name, 0) + 1
+                self._last_error[stage.name] = f"{type(exc).__name__}: {exc}"
+                failed.append(stage.name)
+                # Logged at exception level on the first failure and every
+                # hundredth after, so a stage failing at 12 Hz does not bury
+                # the journal while the counter still records every one.
+                if self._failures[stage.name] == 1 or self._failures[stage.name] % 100 == 0:
+                    log.exception(
+                        "stage %s failed (%d times); frame passed through",
+                        stage.name, self._failures[stage.name],
+                    )
             self._timings[stage.name] = (time.perf_counter() - t0) * 1000.0
+        if failed:
+            # On the frame, so a consumer holding only the frame -- a sink, a
+            # sidecar writer -- can tell it is not the frame that was asked for.
+            frame = frame.derive(frame.data, pipeline_failed_stages=failed)
         return frame
+
+    @property
+    def failures(self) -> dict[str, dict[str, Any]]:
+        """Per-stage failure count and last message, for `/api/status`."""
+        with self._lock:
+            return {
+                name: {"count": n, "last_error": self._last_error.get(name, "")}
+                for name, n in self._failures.items()
+                if n
+            }
+
+    @property
+    def failure_count(self) -> int:
+        return sum(self._failures.values())
 
     # -- introspection --------------------------------------------------
 

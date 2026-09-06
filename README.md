@@ -538,6 +538,22 @@ symptom is a UI whose controls silently do nothing.
 So: exactly one persistent stream per camera, everything else polled as
 single-shot JPEGs. This is a constraint, not a tuning parameter.
 
+### When the preview stops, the page says so
+
+A frozen preview used to be indistinguishable from a live one: MJPEG keeps
+displaying the last part it received, the frame-rate readout was computed from
+old samples with no reference to the present, and the stream re-encoded and
+re-sent that same frame every two seconds — spending CPU to assert liveness it
+did not have.
+
+Now: a camera with no frame for two seconds gets **⚠ NO FRAME FOR *n*s** in its
+header and its image is dimmed and desaturated, because a number in a header is
+easy not to look at while you are staring at the picture — which is exactly
+when a frozen picture does damage. A stage throwing on every frame is counted
+and named beside the camera rather than only appearing in the log. And if the
+status endpoint itself stops answering, the header says **⚠ no reply from the
+rig**, which it previously swallowed.
+
 ### Three frame rates, and which one to change
 
 They are separate on purpose, and the symptom of confusing them is a page where
@@ -554,12 +570,29 @@ every sensor frame — a ~3 ms presence map among them, twice over for two
 cameras — is sixty passes a second on four cores that also have to encode JPEG
 and answer the API, and the web thread loses. Capping it to the browser rate
 cuts that by 60% and costs nothing, because the browser is the only thing that
-reads the result. `GET /api/status` reports `fps` (pipeline), `sensor_fps` and
-`skipped` per camera, so you can see the cap working rather than assume it.
+reads the result.
 
 `process_fps: 0` restores the old behaviour of processing every frame. Raise it
 above the browser rate only if something other than the browser starts reading
 the preview bus.
+
+**Measured versus configured.** `GET /api/status` reports four numbers per
+camera and the distinction between them is the point:
+
+| field | is |
+|---|---|
+| `fps` | **measured** pipeline rate |
+| `sensor_fps` | **measured** acquisition rate, counting frames the cap released |
+| `process_fps` | the cap that was asked for |
+| `configured_fps` | `cameras[].fps`, what the sensor was asked for |
+
+The measured pair fall to zero when the thing they measure stops; the
+configured pair never change on their own. `sensor_fps` used to return
+`cameras[].fps` verbatim, which answered "what did you ask for" in the shape of
+an answer to "what is happening" — so a dead sensor reported 30 fps forever.
+`acquired_age_s` and `published_age_s` say how long since the last exposure and
+the last published frame, and are `null` rather than `0` when there has never
+been one.
 
 ---
 

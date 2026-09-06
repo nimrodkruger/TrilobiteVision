@@ -323,15 +323,21 @@ def test_the_readiness_arithmetic_survives_a_portrait_frame():
 # -- the lock, and surviving a restart ------------------------------------
 
 
-def _app(rotate_deg=0, grid_on=True, **grid):
-    """One camera with an MLA stage, through the real web layer."""
-    from trilobite.config import AppConfig
+def _app(tmp_path, rotate_deg=0, grid_on=True, **grid):
+    """One camera with an MLA stage, through the real web layer.
+
+    `tmp_path` is not optional. Without a storage root the AppConfig default is
+    `~/trilobite-data`, and this helper would create session directories in the
+    developer's home folder -- which it did, until tests/conftest.py started
+    refusing.
+    """
+    from trilobite.config import AppConfig, StorageConfig
     from trilobite.web.server import create_app
 
     params = {"enabled": grid_on, "pitch_px": 100.0,
               "offset_x": 20.0, "offset_y": 10.0}
     params.update(grid)
-    cfg = AppConfig(cameras=[CameraConfig(
+    cfg = AppConfig(storage=StorageConfig(root=str(tmp_path / "data")), cameras=[CameraConfig(
         cam_id="left", backend="synthetic", rotate_deg=rotate_deg,
         full_resolution=(1456, 1088), preview_resolution=(728, 544),
         synthetic_drift_px=0.0,
@@ -356,7 +362,7 @@ def _client(api):
     return TestClient(api)
 
 
-def test_the_orientation_is_locked_while_the_grid_is_on():
+def test_the_orientation_is_locked_while_the_grid_is_on(tmp_path):
     """The rule, enforced rather than documented.
 
     Everything after the alignment -- the poses, the corners, the fit --
@@ -364,7 +370,7 @@ def test_the_orientation_is_locked_while_the_grid_is_on():
     then being clever about the grid would fix one of those and silently
     invalidate the rest.
     """
-    app, api = _app(grid_on=True)
+    app, api = _app(tmp_path, grid_on=True)
     c = _client(api)
     assert c.get("/api/orientation/left").json()["locked"] is True
     r = c.post("/api/orientation/left", json={"flip_horizontal": True})
@@ -373,10 +379,10 @@ def test_the_orientation_is_locked_while_the_grid_is_on():
     assert app.cameras["left"].cfg.flip_horizontal is False, "and nothing changed"
 
 
-def test_asking_for_the_orientation_it_already_has_is_not_a_conflict():
+def test_asking_for_the_orientation_it_already_has_is_not_a_conflict(tmp_path):
     """A page re-rendering its own state must not be refused. Only a real
     change is a change."""
-    _, api = _app(grid_on=True)
+    _, api = _app(tmp_path, grid_on=True)
     c = _client(api)
     r = c.post("/api/orientation/left", json={"flip_horizontal": False,
                                               "rotate_deg": 0})
@@ -384,8 +390,8 @@ def test_asking_for_the_orientation_it_already_has_is_not_a_conflict():
     assert r.json()["changed"] == []
 
 
-def test_turning_the_grid_off_unlocks_it_and_the_change_resets_the_alignment():
-    _, api = _app(grid_on=True)
+def test_turning_the_grid_off_unlocks_it_and_the_change_resets_the_alignment(tmp_path):
+    _, api = _app(tmp_path, grid_on=True)
     c = _client(api)
     c.post("/api/pipeline/left/mla", json={"values": {"enabled": False}})
     assert c.get("/api/orientation/left").json()["locked"] is False
@@ -401,10 +407,10 @@ def test_turning_the_grid_off_unlocks_it_and_the_change_resets_the_alignment():
     assert (mla["reference_width"], mla["reference_height"]) == (1088, 1456)
 
 
-def test_a_quarter_turn_is_the_only_rotation_offered():
+def test_a_quarter_turn_is_the_only_rotation_offered(tmp_path):
     """Anything else is a resample rather than a relabelling of pixels, and
     would cost resolution on every frame for the life of the rig."""
-    _, api = _app(grid_on=False)
+    _, api = _app(tmp_path, grid_on=False)
     c = _client(api)
     assert c.post("/api/orientation/left", json={"rotate_deg": 45}).status_code == 422
     assert c.post("/api/orientation/left", json={"rotate_deg": "sideways"}
@@ -458,14 +464,14 @@ def test_the_orientation_survives_a_restart_and_the_grid_is_not_reset_again():
     fresh.source.close()
 
 
-def test_the_sensor_controls_reported_are_the_live_ones_not_the_config():
+def test_the_sensor_controls_reported_are_the_live_ones_not_the_config(tmp_path):
     """What made a restored exposure look unrestored.
 
     The camera really was at the restored value and the box really did say the
     YAML one, because the read endpoint returned `cfg.controls`. The first
     nudge of any slider then sent the sensor back to the config.
     """
-    _, api = _app(grid_on=False)
+    _, api = _app(tmp_path, grid_on=False)
     c = _client(api)
     c.post("/api/controls/left", json={"controls": {"ExposureTime": 12345}})
     got = c.get("/api/controls/left").json()
@@ -482,12 +488,14 @@ def test_an_orientation_change_is_marked_for_the_state_file(tmp_path):
     reads exactly like "settings are not saved", because it is.
     """
     from trilobite.app import Application
-    from trilobite.config import AppConfig
+    from trilobite.config import AppConfig, StorageConfig
     from trilobite.web.server import create_app
 
-    cfg = AppConfig(cameras=[CameraConfig(
-        cam_id="left", backend="synthetic", full_resolution=(64, 48),
-        preview_resolution=(64, 48), synthetic_drift_px=0.0)])
+    cfg = AppConfig(
+        storage=StorageConfig(root=str(tmp_path / "data")),
+        cameras=[CameraConfig(
+            cam_id="left", backend="synthetic", full_resolution=(64, 48),
+            preview_resolution=(64, 48), synthetic_drift_px=0.0)])
     path = tmp_path / "rig.state.json"
     app = Application(cfg, state_path=path, restore=False)
     app.cameras["left"].source.open()
@@ -506,7 +514,7 @@ def test_an_orientation_change_is_marked_for_the_state_file(tmp_path):
 # -- the page the browser is actually running -----------------------------
 
 
-def test_the_page_is_served_revalidating_and_stamped_with_its_build():
+def test_the_page_is_served_revalidating_and_stamped_with_its_build(tmp_path):
     """Why a rotate control that existed was not on screen.
 
     Deployment is `git pull` on the Pi with the browser left open. A
@@ -515,7 +523,7 @@ def test_the_page_is_served_revalidating_and_stamped_with_its_build():
     asking -- producing a UI missing controls the server already implements,
     which is indistinguishable from the feature being broken.
     """
-    _, api = _app(grid_on=False)
+    _, api = _app(tmp_path, grid_on=False)
     c = _client(api)
     r = c.get("/")
     assert "no-cache" in r.headers.get("cache-control", "")

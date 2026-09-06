@@ -29,11 +29,36 @@ class Frame:
             Stages declare what they accept and what they emit, so a
             mis-ordered pipeline fails loudly instead of producing garbage.
     cam_id: which camera. Stable across restarts, comes from config.
-    seq:    monotonically increasing per camera. Gaps mean dropped frames.
-    t_mono: time.monotonic() at capture. Use this for intervals and sync.
-    t_wall: time.time() at capture. Use this for filenames and logs only.
-    meta:   sensor metadata from the driver (ExposureTime, AnalogueGain,
-            SensorTimestamp, ...) plus anything stages choose to record.
+
+    seq:    monotonically increasing per camera, counting frames this software
+            **delivered**. It is not an exposure counter, and a gap in it is
+            not evidence of a dropped exposure: frames released by the rate cap
+            never reach here at all, and neither does anything the driver lost.
+            Do not use it for drop accounting or for pairing two cameras. The
+            docstring used to say "gaps mean dropped frames", which was wrong
+            in the direction that matters -- it invited exactly that use.
+
+    t_mono: `time.monotonic()` at Frame CONSTRUCTION, which is after the buffer
+            has been taken, converted and copied. Fine for intervals between
+            deliveries. It is not the moment light hit the sensor, and it is
+            several milliseconds after it.
+
+    t_wall: `time.time()` at construction. Filenames and logs only -- it is
+            subject to NTP steps, so an interval computed from it can come out
+            negative.
+
+    meta:   sensor metadata from the driver, plus anything stages record. The
+            driver's own exposure timestamp arrives here as `SensorTimestamp`,
+            in the kernel's monotonic clock domain, in nanoseconds. That is the
+            only timestamp in this object with a defined relationship to the
+            exposure, and it is the one that stereo pairing and drop accounting
+            will need.
+
+    **Four times, and this object carries two of them.** Exposure, receipt,
+    processing completion, write completion. `t_mono` is receipt. Treating it
+    as exposure is the mistake that makes a synchronisation measurement quietly
+    wrong, which is why the distinction is written down here rather than
+    assumed.
     """
 
     data: np.ndarray
