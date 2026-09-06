@@ -35,6 +35,14 @@ USAGE
 
 WHAT THE SIDECARS CARRY
 
+Every capture sidecar carries `validity`: `science` or `diagnostic`. Diagnostic
+means the rig could not establish that the pixel values are sensor counts --
+a compressed or packed raw format, or a buffer that did not reconcile with the
+sensor geometry. Those files are named `diagnostic_...` and `--detect` refuses
+them unless `--allow-diagnostic` is passed. Note that this is a different
+question from `space`: `space: raw` says the ISP was bypassed, which is a claim
+about the path the pixels took, not about what the values mean.
+
 A capture sidecar (`raw_*`/`view_*`) has `pipeline`, so the MLA parameters are
 under `pipeline.mla` **in preview pixels** with `reference_width` alongside;
 this script converts them to the frame it is looking at, the same way the rig
@@ -84,6 +92,15 @@ class Capture:
     meta: dict[str, Any]
     kind: str                      # "raw" | "view" | "pose" | "bare"
 
+    # 'science', 'diagnostic', or 'unrecorded' for a file written before the
+    # rig had an admission boundary. NOT the same question as `space == 'raw'`:
+    # that says the ISP was bypassed, which is a claim about the path the
+    # pixels took, not about whether the values arriving down it are sensor
+    # counts. A compressed PiSP buffer is `space: raw` and is not measurable.
+    validity: str = "unrecorded"
+    # Why the rig refused to admit it, when it did.
+    refusal: str = ""
+
     # MLA geometry converted to THIS frame's pixels, or None if unrecorded.
     pitch: float | None = None
     rotation_deg: float = 0.0
@@ -105,6 +122,27 @@ class Capture:
     @property
     def has_geometry(self) -> bool:
         return self.pitch is not None and self.pitch > 1.0
+
+    @property
+    def is_science(self) -> bool:
+        # `unrecorded` counts as measurable: refusing every file written before
+        # the boundary existed would make this script useless on the archive,
+        # and those files were checked by hand at the time. It is reported as
+        # unrecorded rather than silently promoted to science.
+        return self.validity != "diagnostic"
+
+    def require_science(self, what: str) -> None:
+        """Refuse to measure pixels the rig would not vouch for."""
+        if self.is_science:
+            return
+        raise SystemExit(
+            f"{self.path.name}: this capture is tagged DIAGNOSTIC, so {what} "
+            f"would be fitting a model to values that are not sensor counts.\n"
+            f"  reason: {self.refusal or 'not recorded'}\n"
+            f"Re-capture with an admissible raw format (scripts/probe_cameras.py "
+            f"lists what the sensor offers). Pass --allow-diagnostic to override, "
+            f"which is for looking, not for measuring."
+        )
 
     def geometry(self):
         """An MLAGeometry for this frame, from the recorded parameters."""
@@ -142,6 +180,13 @@ def _trim_stride(image: np.ndarray, meta: dict) -> tuple[np.ndarray, int]:
     Captures are trimmed at source now; this is for the files already on disk.
     Safe because the sidecar records the true sensor size.
     """
+    sensor = meta.get("sensor_metadata") or {}
+    if sensor.get("raw_admitted") is True:
+        # The rig's own admission boundary already did this, against the
+        # negotiated format rather than by inferring the pixel size from the
+        # row length. Re-deriving it here could only disagree.
+        return image, 0
+
     cam = (meta.get("camera") or {})
     full = cam.get("full_resolution")
     if not full or len(full) != 2 or image.ndim < 2:
@@ -219,6 +264,10 @@ def load(npy_path: Path) -> Capture:
     cap.rotate_deg = int(sensor.get("rotate_deg") or 0)
     cap.flip_horizontal = bool(sensor.get("flip_horizontal"))
     cap.flip_vertical = bool(sensor.get("flip_vertical"))
+    # Top level, written by the writer for every capture. Files from before the
+    # boundary existed have neither key and stay 'unrecorded'.
+    cap.validity = str(meta.get("validity") or "unrecorded")
+    cap.refusal = str(sensor.get("raw_refusal") or "")
     h, w = image.shape[:2]
 
     if "geometry" in meta:
@@ -293,10 +342,29 @@ def describe(cap: Capture) -> None:
     if m.get("t_iso"):
         print(f"captured    : {m['t_iso']}")
     print(f"space       : {m.get('space', '?')}"
-          + ("   <-- ISP bypassed, this is measurement data"
+          + ("   <-- ISP bypassed"
              if m.get("space") == "raw" else
              "   <-- processed for viewing, do NOT fit anything to it"
              if cap.kind == "view" else ""))
+
+    # Deliberately separate from `space`, and printed even when it is boring.
+    # `space: raw` says the ISP was bypassed; it does not say the values that
+    # came down that path are sensor counts. Conflating the two is what let a
+    # session of compressed transport be recorded as measurement data.
+    if cap.validity == "diagnostic":
+        print("validity    : DIAGNOSTIC  <-- NOT measurement data. The rig could "
+              "not establish that\n"
+              "              these values are sensor counts.")
+        if cap.refusal:
+            print(f"              reason: {cap.refusal}")
+    elif cap.validity == "science":
+        fmt = (m.get("sensor_metadata") or {}).get("raw_format")
+        print("validity    : science"
+              + (f"  ({fmt}, admitted at capture)" if fmt else ""))
+    elif m.get("space") == "raw":
+        print("validity    : not recorded — written before the rig checked its "
+              "raw format.\n"
+              "              Verify by eye before fitting anything to it.")
 
     sensor = m.get("sensor") or m.get("sensor_metadata") or {}
     keep = {k: sensor[k] for k in
@@ -487,6 +555,9 @@ def main() -> int:
     ap.add_argument("--json", dest="json_out", type=Path, help="write detections as JSON")
     ap.add_argument("--no-stretch", action="store_true",
                     help="do not rescale levels for display")
+    ap.add_argument("--allow-diagnostic", action="store_true",
+                    help="run --detect on captures the rig tagged diagnostic "
+                         "(for looking at, never for measuring)")
     args = ap.parse_args()
 
     files = gather(args.path)
@@ -505,6 +576,12 @@ def main() -> int:
 
         detections = None
         if args.detect:
+            if not args.allow_diagnostic:
+                cap.require_science("corner detection")
+            elif not cap.is_science:
+                print("warning: detecting corners in a DIAGNOSTIC capture "
+                      "because --allow-diagnostic was passed. The positions "
+                      "are not measurements.", file=sys.stderr)
             board = None
             if args.board:
                 try:

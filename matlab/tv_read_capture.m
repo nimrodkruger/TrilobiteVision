@@ -11,6 +11,15 @@ function cap = tv_read_capture(path)
 %     .cam_id       'left' or 'right'
 %     .tag          'raw' or 'view'
 %     .space        'raw', 'mono8', 'mono16'
+%     .validity     'science', 'diagnostic', or 'unrecorded' (written before
+%                   the rig had an admission boundary). DIFFERENT QUESTION
+%                   from .space: 'raw' says the ISP was bypassed, which is a
+%                   claim about the path the pixels took, not about whether
+%                   the values are sensor counts. A compressed PiSP buffer is
+%                   space 'raw' and is not measurable.
+%     .is_science   false only for 'diagnostic'. Call TV_REQUIRE_SCIENCE(CAP)
+%                   before fitting anything; the micro-image and sub-aperture
+%                   helpers do it for you.
 %     .t_iso        wall-clock time of capture
 %     .sensor       exposure, gain and whatever else libcamera reported
 %     .pipeline     every processing stage's full parameter set
@@ -118,6 +127,19 @@ function cap = tv_read_capture(path)
   cap.pipeline = i_get(info, 'pipeline', struct());
   cap.camera   = i_get(info, 'camera', struct());
 
+  % Whether these pixels may be fitted to. Written by the rig for every
+  % capture; absent on files from before the admission boundary existed, which
+  % are reported as 'unrecorded' rather than promoted to 'science'.
+  cap.validity   = i_get(info, 'validity', 'unrecorded');
+  cap.is_science = ~strcmp(cap.validity, 'diagnostic');
+  if ~cap.is_science
+    warning('tv_read_capture:diagnostic', ...
+            ['%s is tagged DIAGNOSTIC: the rig could not establish that its ' ...
+             'values are sensor counts (%s). Look at it, but do not fit ' ...
+             'anything to it.'], ...
+            img_path, i_get(cap.sensor, 'raw_refusal', 'no reason recorded'));
+  end
+
   % How the frame was turned and mirrored at acquisition. Lifted out of the
   % sensor metadata because it is the one thing you cannot recover by looking:
   % a turned landscape sensor and a portrait one give the same shaped array,
@@ -156,8 +178,19 @@ function [img, trimmed] = i_trim_stride(img, info)
 %   Captures are trimmed at source now. This is for files already on disk, and
 %   it is safe because the sidecar records the true sensor size.
   trimmed = 0;
-  if ~isstruct(info) || ~isfield(info, 'camera') || ...
-     ~isfield(info.camera, 'full_resolution')
+  if ~isstruct(info)
+    return;
+  end
+  % The rig's own admission boundary already did this, against the negotiated
+  % format rather than by inferring the pixel size from the row length.
+  % Re-deriving it here could only disagree.
+  if isfield(info, 'sensor_metadata') && isstruct(info.sensor_metadata) && ...
+     isfield(info.sensor_metadata, 'raw_admitted') && ...
+     islogical(info.sensor_metadata.raw_admitted) && ...
+     info.sensor_metadata.raw_admitted
+    return;
+  end
+  if ~isfield(info, 'camera') || ~isfield(info.camera, 'full_resolution')
     return;
   end
   full = double(info.camera.full_resolution(:))';

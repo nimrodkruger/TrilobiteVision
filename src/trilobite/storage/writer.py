@@ -454,7 +454,17 @@ class SessionWriter:
         # cam_id leads the filename after the tag, so a directory listing sorts
         # by what the file *is* and names which physical camera produced it
         # without opening the sidecar.
-        stem = f"{tag}_{frame.cam_id}_{n:06d}_{datetime.now().strftime('%H%M%S_%f')}"
+        #
+        # A frame whose pixels could not be established as sensor counts is
+        # named `diagnostic_` FIRST, ahead of the tag. In the filename rather
+        # than only in the sidecar because the failure this guards against is
+        # somebody loading a directory of .npy files by glob and fitting a
+        # model to them -- which is exactly what happened with the compressed
+        # session -- and a leading prefix is the one piece of provenance that
+        # survives `ls`, a glob, and a drag into MATLAB.
+        prefix = "" if frame.is_science else "diagnostic_"
+        stem = (f"{prefix}{tag}_{frame.cam_id}_{n:06d}_"
+                f"{datetime.now().strftime('%H%M%S_%f')}")
 
         try:
             img_path, img_bytes = self._write_image(stem, frame)
@@ -483,6 +493,11 @@ class SessionWriter:
             "t_wall": frame.t_wall,
             "t_iso": datetime.fromtimestamp(frame.t_wall).isoformat(),
             "space": frame.space,
+            # 'science' or 'diagnostic'. The one field an offline reader must
+            # check before fitting anything: `space: raw` says the ISP was
+            # bypassed, which is a statement about the PATH, not about whether
+            # the values that came down it are sensor counts.
+            "validity": frame.validity,
             "dtype": str(frame.data.dtype),
             "shape": list(frame.data.shape),
             "sensor_metadata": _jsonable(frame.meta),

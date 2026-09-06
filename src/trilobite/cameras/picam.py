@@ -14,10 +14,17 @@ sensor reads and no CPU resize, and a still capture can pull the full frame
 out of the *same* request that produced the preview, so the metadata matches
 the pixels exactly. That coherence matters when you are calibrating and the
 exposure is being swept.
+
+Nothing here decides what a raw buffer MEANS. The format is chosen at open time
+and every buffer is put through `cameras/rawformat.py` before it can call
+itself science data; this module only talks to the driver and applies the
+orientation. That split exists so the admission rules can be tested from a byte
+array with no Pi attached, which is where they get the attention they need.
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 from typing import Any
@@ -25,21 +32,11 @@ from typing import Any
 import numpy as np
 
 from ..config import CameraConfig
-from ..types import CameraInfo, Frame
+from ..types import DIAGNOSTIC, SCIENCE, CameraInfo, Frame
 from .base import CameraSource
+from .rawformat import RawFormatError, admit, best_format, classify, describe_refusal
 
 log = logging.getLogger(__name__)
-
-
-def _is_compressed_raw(name: str) -> bool:
-    """Is this raw format one of the Pi 5 pipeline's COMPRESSED transports?
-
-    `MONO_PISP_COMP1`, `PISP_COMP1_*` and friends carry compressed bytes, not
-    pixel values. Matched by name because that is what libcamera exposes, and
-    the naming is stable: everything compressed carries PISP and COMP.
-    """
-    u = name.upper()
-    return "PISP" in u or "COMP" in u
 
 
 class Picamera2Source(CameraSource):
@@ -52,6 +49,14 @@ class Picamera2Source(CameraSource):
         self._full_res: tuple[int, int] = (0, 0)
         self._dropped_controls: list[str] = []
         self._last_meta: dict[str, Any] = {}
+        # How the raw format was arrived at, in words, for the sidecar.
+        self._raw_choice: str = "unknown"
+        # True only when the format was established admissible at open time.
+        # False means the escape hatch is open and everything raw this source
+        # produces is `diagnostic` -- carried as state rather than re-derived
+        # per capture, so a capture cannot accidentally be judged by a
+        # different rule than the one the camera was opened under.
+        self._raw_admissible: bool = False
 
     @staticmethod
     def _split_controls(picam: Any, controls: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -113,7 +118,16 @@ class Picamera2Source(CameraSource):
         )
 
         raw_stream: dict[str, Any] = {"size": sensor_res}
-        chosen = self._choose_raw_format(picam)
+        try:
+            chosen = self._choose_raw_format(picam)
+        except RawFormatError:
+            # A refusal here means the camera must not open at all. Release the
+            # device before the exception leaves, or the next attempt -- after
+            # the operator has fixed the config -- finds libcamera reporting no
+            # cameras and goes looking at ribbon cables.
+            with contextlib.suppress(Exception):
+                picam.close()
+            raise
         if chosen:
             raw_stream["format"] = chosen
 
@@ -163,13 +177,15 @@ class Picamera2Source(CameraSource):
         self._picam = picam
         self._open = True
         log.info(
-            "%s: opened %s at %sx%s (mono=%s), preview %sx%s",
+            "%s: opened %s at %sx%s (mono=%s), preview %sx%s, raw %s -> %s",
             self.cam_id,
             self._info.get("Model", "unknown"),
             self._full_res[0],
             self._full_res[1],
             self._mono,
             *self.cfg.preview_resolution,
+            self._raw_choice,
+            "science" if self._raw_admissible else "DIAGNOSTIC ONLY",
         )
 
     def close(self) -> None:
@@ -290,24 +306,28 @@ class Picamera2Source(CameraSource):
         # and those are indistinguishable by inspection -- which is exactly how
         # a session was recorded in MONO_PISP_COMP1 and only noticed later.
         meta["raw_format"] = self._raw_format_name()
-        meta["raw_format_choice"] = getattr(self, "_raw_choice", "unknown")
+        meta["raw_format_choice"] = self._raw_choice
+        meta["allow_unvalidated_raw"] = bool(
+            getattr(self.cfg, "allow_unvalidated_raw", False))
+
+        validity = SCIENCE
         if raw:
-            # Trim BEFORE orienting, and this order is load-bearing. The stride
-            # padding is on the right of the buffer as it comes off the sensor;
-            # flip first and it would be on the left, rotate first and it would
-            # be along the bottom -- and cropping the right would then remove
-            # real image. So padding is removed against the NATIVE sensor width
-            # and the frame is turned afterwards.
-            data, pad = self._trim_stride(data)
-            meta.update(pad)
+            data, evidence, validity = self._admit_raw(data)
+            meta.update(evidence)
+            # image_* describes the frame the caller ends up holding, so it is
+            # the POST-rotation size; the raw_* keys stay in the sensor's own
+            # terms, because that is the frame the padding lives in.
+            out_w, out_h = self.oriented_size(self._full_res)
+            meta["image_width"] = int(out_w)
+            meta["image_height"] = int(out_h)
         meta.update(self.orientation)
         return Frame.now(
             np.ascontiguousarray(self._orient(data)), self.cam_id,
-            self._next_seq(), space=space, **meta
+            self._next_seq(), space=space, validity=validity, **meta
         )
 
     def _choose_raw_format(self, picam: Any) -> str | None:
-        """Pick an uncompressed raw format, and never a PiSP-compressed one.
+        """Pick a raw format that is established sensor counts, or refuse to open.
 
         **This is the bug that corrupted a whole recording session.** On a Pi 5
         libcamera's default raw format for the mono IMX296 is
@@ -324,159 +344,126 @@ class Picamera2Source(CameraSource):
         is the worst possible failure mode. Every value is wrong, so anything
         fitted to those pixels is fitted to an artefact.
 
-        So the format is chosen here rather than left to libcamera:
+        The old version of this method **logged an error and continued** in
+        both of the cases that matter -- a configured format that looked
+        compressed, and no admissible format advertised at all. A log line is
+        not a control: nobody reads the journal of a rig that appears to be
+        working. So both are now refusals at open time:
 
-          * an explicit `raw_format` in the config always wins, but is checked
-            and warned about if it looks compressed;
-          * otherwise the sensor's advertised modes are searched for an
-            uncompressed one, preferring the **unpacked** variant (`R10` over
-            `R10_CSI2P`) so the array comes back as plain uint16 with no
-            bit-unpacking left to do;
-          * if nothing suitable is advertised, libcamera's default is used and
-            a loud warning is logged, because silence is what caused this.
+          * an explicit `raw_format` in the config wins, but only if
+            `rawformat.classify` says it is known, uncompressed and unpacked;
+          * otherwise the sensor's advertised modes are put through
+            `rawformat.best_format`, which takes the widest bit depth among the
+            unpacked ones, so a 10-bit sensor is not quietly recorded at 8;
+          * if neither yields an admissible format, `RawFormatError` is raised
+            and the camera does not open.
 
-        Returns the format string to request, or None to accept the default.
+        `allow_unvalidated_raw: true` in the config turns each refusal back
+        into a warning, and the source then produces `diagnostic` frames for
+        the rest of its life. That is the only way past this, and it is
+        recorded in every sidecar it touches.
+
+        Returns the format string to request, or None to accept the driver's
+        default (only reachable with the hatch open).
         """
+        hatch = bool(getattr(self.cfg, "allow_unvalidated_raw", False))
+
+        def refuse(reason: str, choice: str) -> None:
+            """Raise, or -- with the hatch open -- warn and mark diagnostic."""
+            if not hatch:
+                raise RawFormatError(f"{self.cam_id}: {reason}")
+            log.error(
+                "%s: %s -- opening anyway because allow_unvalidated_raw is set. "
+                "Every raw capture from this camera will be tagged DIAGNOSTIC, "
+                "named as such on disk, and refused by the offline readers.",
+                self.cam_id, reason,
+            )
+            self._raw_choice = choice
+
         configured = (self.cfg.raw_format or "").strip()
         if configured:
-            if _is_compressed_raw(configured):
-                log.error(
-                    "%s: raw_format is set to %r, which is a PiSP COMPRESSED "
-                    "format. Captures will contain compressed bytes, not pixel "
-                    "values -- they will look like a damaged image. Set an "
-                    "uncompressed format (run scripts/probe_cameras.py to see "
-                    "what this sensor offers) or remove the setting to let one "
-                    "be chosen automatically.",
-                    self.cam_id, configured,
-                )
-            self._raw_choice = f"{configured} (from config)"
-            return configured
+            fmt = classify(configured)
+            if fmt is None or not fmt.admissible:
+                refuse(describe_refusal(configured),
+                       f"{configured} (from config, UNVALIDATED)")
+                return configured
+            self._raw_admissible = True
+            self._raw_choice = f"{fmt.name} (from config)"
+            log.info("%s: raw format %s (from config; %d-bit, uncompressed)",
+                     self.cam_id, fmt.name, fmt.bits)
+            return fmt.name
 
         candidates: list[str] = []
         try:
             for mode in picam.sensor_modes or []:
                 # picamera2 gives both the packed transport format and the
-                # unpacked name; the unpacked one is what we want to be handed.
+                # unpacked name; either may be the admissible one, so both are
+                # offered to best_format and it decides.
                 for key in ("unpacked", "format"):
                     name = str(mode.get(key) or "").strip()
-                    if name and not _is_compressed_raw(name) and name not in candidates:
+                    if name and name not in candidates:
                         candidates.append(name)
         except Exception as exc:                       # pragma: no cover - driver
             log.debug("%s: cannot read sensor_modes: %s", self.cam_id, exc)
 
-        # Prefer unpacked (no _CSI2P suffix), then the widest bit depth, so a
-        # 10-bit sensor is not quietly recorded at 8.
-        def rank(name: str) -> tuple[int, int]:
-            packed = 1 if name.upper().endswith("_CSI2P") else 0
-            digits = "".join(c for c in name if c.isdigit())
-            return (packed, -int(digits or 0))
-
-        for name in sorted(candidates, key=rank):
-            log.info("%s: raw format %s (chosen; uncompressed)", self.cam_id, name)
-            self._raw_choice = f"{name} (auto)"
-            return name
-
-        log.error(
-            "%s: no uncompressed raw format is advertised by this sensor, so "
-            "libcamera's default will be used -- on a Pi 5 that is very likely "
-            "MONO_PISP_COMP1, which is COMPRESSED and will make every capture "
-            "look like a corrupted image. Run scripts/probe_cameras.py and set "
-            "'raw_format' in the config by hand.",
-            self.cam_id,
-        )
-        self._raw_choice = "libcamera default (UNCHECKED)"
-        return None
-
-    def _trim_stride(self, data: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
-        """Turn a raw buffer into an image: strip the row padding, and get the
-        pixel size right.
-
-        A raw buffer's rows are padded out to a hardware-friendly stride --
-        64 bytes on this pipeline -- and `make_array` shapes the array by that
-        stride **in bytes**, not in pixels, and hands it back as uint8 whatever
-        the real pixel size is. Two things therefore have to be undone, and the
-        second one is the one that was missed:
-
-            8-bit  (R8)   1456 px = 1456 bytes -> stride 1472 -> array 1472 wide
-            10-bit (R10)  1456 px = 2912 bytes -> stride 2944 -> array 2944 wide
-
-        In the second case the array is not "1456 pixels plus padding", it is
-        1472 *uint16* pixels laid out as 2944 bytes. Treating its width as a
-        pixel count and cropping to 1456 would keep the first 728 pixels and
-        half of the 729th -- structure, at the wrong scale, which is what a
-        2.022:1.000 aspect ratio in the reader was reporting.
-
-        So: work out the bytes per pixel from the row length, re-view the
-        buffer at that pixel size, and only then remove the padding columns.
-
-        Left undone, the padding does two things, both silent: it makes any
-        rescale of the MLA grid onto the frame anisotropic, and it moves the
-        frame *centre* -- which the whole grid hangs off -- by half the padding,
-        putting every micro-image out by a quarter of a checkerboard square.
-
-        A format whose row length matches no whole bytes-per-pixel is left
-        alone and flagged. Packed 10-bit (5 bytes per 4 pixels) is the case
-        that matters: its width is not a pixel count at any scale, and cropping
-        it would be nonsense.
-        """
-        full_w, full_h = self._full_res
-        if data.ndim < 2:
-            return data, {}
-        h, w = data.shape[:2]
-        # image_* describes the frame the caller will end up holding, so it is
-        # the post-rotation size; the raw_* keys below stay in the sensor's own
-        # terms, because that is the frame the padding lives in.
-        out_w, out_h = self.oriented_size((full_w, full_h))
-        note: dict[str, Any] = {"image_width": int(out_w), "image_height": int(out_h)}
-
-        if w == full_w and h == full_h:
-            return data, note
-        if h != full_h:
-            return data, {**note, **self._unexpected(data)}
-
-        row_bytes = w * data.dtype.itemsize
-        # 64-byte stride alignment means at most 63 bytes of padding; the
-        # allowance is generous because the alignment is not ours to promise.
-        for bpp in (1, 2):
-            want = full_w * bpp
-            if not (want <= row_bytes <= want + 256):
-                continue
-            out = data
-            if bpp == 2 and data.dtype.itemsize == 1:
-                if w % 2:
-                    break                       # cannot be whole uint16 pixels
-                # A C-contiguous uint8 row of 2*N bytes IS N little-endian
-                # uint16 pixels. This is a re-view, not a conversion: no copy,
-                # no arithmetic, and the values become the 10-bit counts the
-                # sensor actually produced instead of their halves.
-                out = np.ascontiguousarray(data).view(np.uint16)
-            px_w = out.shape[1]
-            note.update(
-                raw_stride_bytes=int(row_bytes),
-                raw_bytes_per_pixel=int(bpp),
-                raw_stride_px=int(px_w),
-                raw_padding_px=int(px_w - full_w),
+        chosen = best_format(candidates)
+        if chosen is None:
+            refuse(
+                f"no admissible raw format among the {len(candidates)} this "
+                f"sensor advertises ({', '.join(candidates) or 'none'}), so "
+                f"libcamera's default would be used -- on a Pi 5 that is very "
+                f"likely MONO_PISP_COMP1, which is COMPRESSED and makes every "
+                f"capture look like a corrupted image. Run "
+                f"scripts/probe_cameras.py and set 'raw_format' by hand.",
+                "libcamera default (UNVALIDATED)",
             )
-            if px_w < full_w:
-                return data, {**note, **self._unexpected(data)}
-            return out[:, :full_w], note
+            return None
 
-        return data, {**note, **self._unexpected(data)}
+        self._raw_admissible = True
+        self._raw_choice = f"{chosen} (auto)"
+        log.info("%s: raw format %s (chosen; uncompressed, unpacked)",
+                 self.cam_id, chosen)
+        return chosen
 
-    def _unexpected(self, data: np.ndarray) -> dict[str, Any]:
-        """Record and complain about a buffer shape we cannot interpret."""
-        h, w = data.shape[:2]
-        full_w, full_h = self._full_res
-        log.warning(
-            "%s: raw buffer is %dx%d of %s (%d bytes per row) and the sensor is "
-            "%dx%d. That is not a whole number of bytes per pixel plus a stride "
-            "pad, so it is being saved untouched -- most likely a PACKED format "
-            "(10-bit as 5 bytes per 4 pixels), whose width is not a pixel count "
-            "at any scale. Set 'raw_format' to an unpacked one; "
-            "scripts/probe_cameras.py lists what this sensor offers.",
-            self.cam_id, w, h, data.dtype, w * data.dtype.itemsize, full_w, full_h,
-        )
-        return {"raw_buffer_shape": [int(h), int(w)], "raw_unexpected_shape": True}
+    def _admit_raw(self, data: np.ndarray) -> tuple[np.ndarray, dict[str, Any], str]:
+        """Establish that a buffer is sensor counts, or say it is not.
+
+        Returns (pixels, evidence, validity). The evidence goes in the sidecar
+        either way: a refusal is a finding worth recording, not just a reason
+        to stop.
+
+        Admission runs on the buffer exactly as the sensor delivered it, BEFORE
+        orientation, and that order is load-bearing. The stride padding is on
+        the right of the buffer as it comes off the sensor; flip first and it
+        would be on the left, rotate first and it would be along the bottom --
+        and cropping the right would then remove real image.
+        """
+        fmt_name = self._raw_format_name()
+        try:
+            got = admit(data, fmt_name, self._full_res)
+        except RawFormatError as exc:
+            if not self._raw_admissible:
+                # Expected: the hatch is open and the format was already known
+                # inadmissible at open time. One line, not a stack trace.
+                log.warning("%s: raw buffer not admitted as science data: %s",
+                            self.cam_id, exc)
+            else:
+                # NOT expected, and worse than the hatch case: the format was
+                # checked and accepted at open, and the buffer still does not
+                # reconcile with it. That indicts the driver, so it is loud
+                # even though the capture is still returned to look at.
+                log.error(
+                    "%s: raw format %r was validated at open time and the "
+                    "delivered buffer still does not reconcile with it: %s",
+                    self.cam_id, fmt_name, exc,
+                )
+            return data, {
+                "raw_admitted": False,
+                "raw_refusal": str(exc),
+                "raw_buffer_shape": [int(n) for n in data.shape],
+                "raw_buffer_dtype": str(data.dtype),
+            }, DIAGNOSTIC
+        return got.array, {"raw_admitted": True, **got.meta}, SCIENCE
 
     def describe(self) -> CameraInfo:
         return CameraInfo(
@@ -494,6 +481,11 @@ class Picamera2Source(CameraSource):
             detail={
                 **{k: str(v) for k, v in self._info.items()},
                 "dropped_controls": ", ".join(self._dropped_controls) or "none",
+                # In the manifest and on the UI card, because "what are these
+                # pixels" is not answerable after the fact and the answer
+                # changed silently once already.
+                "raw_format": self._raw_choice,
+                "raw_validity": "science" if self._raw_admissible else "diagnostic",
             },
         )
 

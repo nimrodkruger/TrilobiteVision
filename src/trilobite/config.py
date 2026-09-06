@@ -82,10 +82,10 @@ class CameraConfig(BaseModel):
     # rotation. `describe()` is the single place the post-rotation size is
     # decided; nothing else may assume a landscape frame.
     #
-    # The raw stride trim is the one thing that must NOT see the rotation: row
+    # Raw admission is the one thing that must NOT see the rotation: row
     # padding is a property of the buffer as the sensor delivers it, so it is
     # removed against the native sensor width first and the frame is turned
-    # afterwards. See PiCamera2Source._trim_stride.
+    # afterwards. See cameras/rawformat.py:admit.
     #
     # Like the mirrors, changing this invalidates an MLA alignment: pitch is
     # unchanged by a quarter turn but the offsets swap axes and one changes
@@ -115,6 +115,22 @@ class CameraConfig(BaseModel):
     # anything that fits a model to pixel values. Set an uncompressed format
     # here once probe_cameras.py has told you which ones this sensor offers.
     raw_format: str | None = None
+
+    # The escape hatch, and it is deliberately awkward to reach.
+    #
+    # By default the camera REFUSES TO OPEN if the raw format it would capture
+    # in cannot be established as linear sensor counts -- compressed, packed,
+    # or simply a name this code does not know. That is the opposite of the old
+    # behaviour, which logged an error and carried on, and it is the change
+    # that closes the failure that cost a recording session: 1,400 files of
+    # MONO_PISP_COMP1 that looked like slightly damaged pictures.
+    #
+    # Setting this true says "open anyway, I want to look at something". What
+    # comes back is then tagged `diagnostic` rather than `science`: it is named
+    # `diagnostic_...` on disk, `validity: diagnostic` goes in every sidecar it
+    # touches, and both offline readers refuse it for anything that fits a
+    # model. It is for bringing a new sensor up, not for capturing data.
+    allow_unvalidated_raw: bool = False
 
     # Camera controls passed straight to libcamera, e.g.
     #   {ExposureTime: 5000, AnalogueGain: 1.0, AeEnable: false}

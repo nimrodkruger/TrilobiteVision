@@ -13,6 +13,14 @@ from typing import Any
 
 import numpy as np
 
+# The two values `Frame.validity` may take. Defined here rather than in
+# cameras/rawformat.py, where they are used most, because `types` is the layer
+# everything else sits on: the other direction would have `types` importing
+# from `cameras`, and `cameras.base` already imports `types`. That cycle is
+# latent today only because `cameras/__init__.py` happens to be empty.
+SCIENCE = "science"
+DIAGNOSTIC = "diagnostic"
+
 
 @dataclass(slots=True)
 class Frame:
@@ -67,11 +75,25 @@ class Frame:
     t_mono: float
     t_wall: float
     space: str = "mono8"
+    # Whether these pixels may be fitted to. A first-class field rather than a
+    # metadata key because it is a claim about the data's admissibility, and a
+    # claim like that should be impossible to lose by forgetting to copy a
+    # dictionary entry. `derive` carries it automatically.
+    #
+    #   'science'     the format was negotiated, known, uncompressed, unpacked,
+    #                 its geometry reconciles with the sensor's and its values
+    #                 fit the bit depth it claims. See cameras/rawformat.py.
+    #   'diagnostic'  something about that could not be established. The pixels
+    #                 may be useful to look at; they are not measurements, they
+    #                 are named as such on disk, and the offline readers refuse
+    #                 them for anything that fits a model.
+    validity: str = SCIENCE
     meta: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def now(
-        cls, data: np.ndarray, cam_id: str, seq: int, space: str = "mono8", **meta: Any
+        cls, data: np.ndarray, cam_id: str, seq: int, space: str = "mono8",
+        validity: str = SCIENCE, **meta: Any
     ) -> Frame:
         return cls(
             data=data,
@@ -80,8 +102,13 @@ class Frame:
             t_mono=time.monotonic(),
             t_wall=time.time(),
             space=space,
+            validity=validity,
             meta=dict(meta),
         )
+
+    @property
+    def is_science(self) -> bool:
+        return self.validity == SCIENCE
 
     def derive(self, data: np.ndarray, space: str | None = None, **meta: Any) -> Frame:
         """Return a new Frame with different pixels but the same provenance.

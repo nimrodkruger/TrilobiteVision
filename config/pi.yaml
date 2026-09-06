@@ -47,6 +47,30 @@ cameras:
     rotate_deg: 0
     flip_horizontal: false
     flip_vertical: false
+    # See the left camera for what these two mean and why the default is a
+    # refusal rather than a warning.
+    # raw_format: R10
+    allow_unvalidated_raw: false
+    # RAW FORMAT. Leave unset and the widest UNPACKED format the sensor
+    # advertises is chosen -- R10 on the IMX296 -- and named in the log at
+    # startup. Set it by hand only from what scripts/probe_cameras.py reports.
+    #
+    # The camera now REFUSES TO OPEN if the format cannot be established as
+    # linear sensor counts: compressed (anything PISP/COMP), packed (*_CSI2P),
+    # or a name this code does not know. That is deliberate. libcamera's
+    # default on a Pi 5 for this sensor is MONO_PISP_COMP1, the imaging
+    # pipeline's compressed transport, and a buffer of it has the right shape
+    # and visible structure -- it looks like a slightly damaged picture, not
+    # like a decode failure. A whole session was recorded that way.
+    #
+    # raw_format: R10
+    #
+    # allow_unvalidated_raw turns each of those refusals back into a warning,
+    # for bringing a new sensor up. Everything the camera then produces is
+    # tagged `diagnostic`, named `diagnostic_...` on disk, and refused by
+    # scripts/read_capture.py and the MATLAB readers. It is not a way to
+    # capture data.
+    allow_unvalidated_raw: false
     # How often the PIPELINE runs. null follows server.preview_fps (12 here),
     # which is the only rate anything consumes. The sensor is still drained at
     # `fps` -- it has to be, or the request pool starves -- but stats, levels,

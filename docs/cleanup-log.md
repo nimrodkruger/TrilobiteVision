@@ -12,6 +12,168 @@ git checkout .              # everything back to HEAD
 
 ---
 
+## 2026-09-06 (p) — review stage 2: a raw buffer must earn the word "science"
+
+Stage 2 of `docs/implementation-plan.md`, closing review finding **F7** and
+gate **G1**. This is the first stage that changes what the rig acquires and
+what it puts on disk.
+
+### The finding, restated
+
+The review's generalisation across the whole failure log:
+
+> The common pattern is **accepting plausible structure as proof of correct
+> meaning**: shaped arrays accepted as sensor counts, named files accepted as
+> complete data, writable paths accepted as the selected disk.
+
+A raw buffer is the first of those. It arrives with the right shape and, at a
+glance, obvious structure, and that says nothing about whether its values are
+sensor counts.
+
+### What changed
+
+**A new module with no camera dependency: `src/trilobite/cameras/rawformat.py`.**
+That independence is the point — every rejection path is reachable from a byte
+array in a test, with no Pi and no libcamera, so the code that decides what
+counts as measurement data is as testable as the code that fits models to it.
+
+| Piece | What it decides |
+| --- | --- |
+| `KNOWN_FORMATS` / `classify()` | an **allowlist**. An unrecognised name is refused, not assumed ordinary. Compressed names are matched by the stable PISP/COMP pattern and returned as a `RawFormat` rather than `None`, so a refusal can say "this is compressed" instead of "unknown" |
+| `RawFormat.admissible` | known, **not** compressed, **not** packed, whole bytes per pixel |
+| `best_format()` | widest bit depth among the unpacked candidates |
+| `admit()` | the boundary itself: four checks, then the pixels plus the evidence |
+| `describe_refusal()` | why, in terms that say what to do about it |
+
+**`admit()` reverses the direction of the stride reconciliation, and that is
+the substantive fix.** The old `_trim_stride` *inferred* the bytes per pixel
+from the row length: it tried 1, then 2, and took the first that fitted inside
+a plausible pad. That cannot distinguish "10-bit, 1456 wide, padded" from
+"8-bit, 2944 wide" — it is the same mistake one level down, deducing meaning
+from shape. Now the negotiated format **states** the pixel size and the shape
+**confirms** it; disagreement is the finding, not something to resolve by
+picking whichever reading fits. The four checks, each against something
+independent of the buffer's own shape:
+
+1. the format is known, uncompressed and unpacked;
+2. the row **count** equals the sensor height — padding is a per-row
+   phenomenon, so a row count that disagrees means this is not the frame it
+   claims to be, and no reshaping of it is legitimate;
+3. the row length in **bytes** equals width × bytes-per-pixel plus a bounded
+   stride pad (256 bytes: generous because the alignment is not ours to
+   promise, bounded because an unbounded allowance would accept a buffer of an
+   entirely different format whose row happens to be longer);
+4. no value exceeds the declared bit depth. This is the one with teeth against
+   a driver that hands back something other than what it negotiated: R10 that
+   is really R12 has the right stride, shape and dtype and differs only in its
+   values. About 1 ms on a 1.6 Mpx frame, so it is on the still path and off
+   the preview path — and whether it ran is recorded, so a sidecar never
+   implies a check that did not happen.
+
+**`Frame.validity` — `science` or `diagnostic`.** A first-class field rather
+than a metadata key, because it is a claim about admissibility and a claim like
+that should be impossible to lose by forgetting to copy a dictionary entry.
+`derive` carries it automatically, so it survives the pipeline. The two
+constants live in `types.py` rather than in `rawformat.py`, where they are used
+most: `cameras.base` already imports `types`, so the other direction would be a
+latent import cycle waiting for the day `cameras/__init__.py` stops being
+empty.
+
+**`_choose_raw_format` refuses instead of warning.** Both of its old
+carry-on-anyway paths — a configured format that looks compressed, and no
+uncompressed format advertised at all — now raise at open time and the camera
+does not start. A log line is not a control: nobody reads the journal of a rig
+that appears to be working, which is precisely how 1,400 files of compressed
+transport came to be recorded. The device is released before the exception
+leaves, or the next attempt finds libcamera reporting no cameras and sends the
+operator to the ribbon cables.
+
+**`allow_unvalidated_raw`** is the one way past, per camera, in the config. It
+turns each refusal into a warning and marks the source diagnostic for the rest
+of its life. Bringing up a new sensor needs to be possible; what must not be
+possible is producing something that calls itself science. Setting it is
+permission, not a mode: a camera that *can* be validated still is.
+
+**On disk.** A diagnostic capture is named `diagnostic_` **first**, ahead of
+the tag, and carries `validity` in its sidecar. The prefix leads because the
+failure being guarded against is a directory of `.npy` files picked up by glob
+and fitted to — exactly how the compressed session was used — and a leading
+prefix is the one piece of provenance that survives `ls`, a glob and a drag
+into MATLAB.
+
+**Saved previews are now diagnostic too.** A processed preview is gamma-shaped,
+downsampled and may have a grid drawn on it. That it is not measurement data
+was a sentence in a docstring plus two fields a reader had to think to check.
+It is now the same closed claim as everything else.
+
+**Both offline readers refuse it.** `scripts/read_capture.py --detect` exits
+with the recorded reason unless `--allow-diagnostic` is passed; the new
+`matlab/tv_require_science.m` does the same and `tv_micro_images` calls it.
+Both readers also skip their legacy stride-trim when the sidecar says
+`raw_admitted`, since re-deriving it could only disagree with the boundary that
+already ran against the negotiated format.
+
+**`space` and `validity` are deliberately different questions.** `space: raw`
+says the ISP was bypassed — a claim about the *path* the pixels took, not about
+what the values mean. A compressed PiSP buffer is `space: raw` and is not
+measurable. Conflating the two is what let the session happen.
+
+### Removed
+
+| Removed | Was in | Replaced by |
+| --- | --- | --- |
+| `_trim_stride` (infers bytes per pixel from the row length) | `cameras/picam.py` | `rawformat.admit`, which is told the pixel size and checks it |
+| `_unexpected` (log a warning, save the buffer untouched) | `cameras/picam.py` | a refusal with the reason recorded in the sidecar |
+| `_is_compressed_raw` | `cameras/picam.py` | `rawformat.classify`, which also knows packed and unknown |
+| the `_FakeRaw` trim harness and its 11 tests | `tests/test_detection.py` | `tests/test_rawformat.py`, with no camera fake at all |
+
+Rolling back is `git checkout -- src/trilobite/cameras/ src/trilobite/types.py
+src/trilobite/storage/writer.py src/trilobite/app.py src/trilobite/config.py
+scripts/read_capture.py matlab/ tests/ config/pi.yaml`, but note that the
+`validity` field then disappears from sidecars written afterwards while
+remaining in ones written before, and `diagnostic_`-prefixed files stay named
+that way.
+
+### Testing
+
+`tests/test_rawformat.py` (32 assertions across 26 tests) exercises the
+boundary from byte arrays: golden fixtures for R8, R10 unpacked, R10 padded to
+a 2944-byte stride and a `MONO_PISP_COMP1` sample built as a smooth gradient
+rather than noise — a random fixture would be testing an easier problem than
+the real one, since what cost the session is that a compressed buffer *looks
+like an image*. `tests/test_orientation.py` covers the open-time choice and the
+`capture_full` wiring with a fake picamera2; `tests/test_storage_devices.py`
+covers the naming and the sidecar.
+
+**Mutation testing, 15 mutants, all caught.** One survived first time and is
+worth recording: removing `not self.compressed` from `RawFormat.admissible`
+changed nothing, because every compressed entry in `KNOWN_FORMATS` happens to
+carry `bytes_per_pixel = 0` and was refused by that clause instead. The
+table-driven tests could not see the difference. Fixed by testing the invariant
+directly — a compressed format with a perfectly ordinary pixel size is still
+inadmissible, because the objection is to what the bytes *mean*, not to how
+many there are.
+
+Suite: **375 passed, 10 skipped**, plus 10 browser scenarios. Ruff clean.
+
+### Bench test for this stage
+
+1. Normal capture on both cameras: files unchanged in name and byte count,
+   `"validity": "science"` in every sidecar, and `raw_admitted: true` with
+   `raw_format`, `raw_stride_bytes` and `raw_padding_px` beside it.
+2. Set `raw_format: MONO_PISP_COMP1` in `config/pi.yaml` deliberately. The
+   camera must **refuse to open**, naming the format and saying what to do,
+   rather than recording anything.
+3. Add `allow_unvalidated_raw: true` alongside it. The camera opens, the log
+   says `DIAGNOSTIC ONLY`, and a capture lands as
+   `diagnostic_still_left_…​.npy` with the refusal quoted in its sidecar.
+4. Remove both settings. The log must name the auto-chosen format (`R10`
+   expected) at startup.
+5. `python scripts/read_capture.py <the diagnostic file> --detect --board 4x3`
+   must refuse and print the reason.
+
+---
+
 ## 2026-09-06 (o) — review stages 0 and 1: trustworthy evidence, honest status
 
 First two stages of `docs/implementation-plan.md`, responding to

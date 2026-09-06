@@ -489,3 +489,90 @@ def test_verify_device_fails_when_the_bytes_come_back_wrong(tmp_path, monkeypatc
     r = W.verify_device(tmp_path, size_bytes=1 << 16)
     assert r["ok"] is False
     assert "corrupting" in r["message"]
+
+
+# -- admissibility on disk ---------------------------------------------------
+#
+# A capture the rig could not establish as sensor counts must be
+# distinguishable from one it could, by somebody who never opens the sidecar.
+# The failure being guarded against is a directory of .npy files loaded by
+# glob and fitted to -- which is exactly how the compressed session was used.
+
+
+def test_a_science_capture_is_named_and_recorded_as_one(writer):
+    out = writer.save_still(frame())
+    assert out["validity"] == "science"
+    assert not out["file"].startswith("diagnostic_")
+
+
+def test_a_diagnostic_capture_is_named_diagnostic_first(writer):
+    from trilobite.types import DIAGNOSTIC
+
+    f = Frame.now(np.zeros((8, 8), dtype=np.uint8), "left", 1,
+                  validity=DIAGNOSTIC)
+    out = writer.save_still(f, tag="raw")
+
+    assert out["validity"] == DIAGNOSTIC
+    assert out["file"].startswith("diagnostic_raw_left_"), out["file"]
+    # The prefix leads, ahead of the tag, so it survives `ls`, a glob and a
+    # drag into MATLAB -- the three ways these files actually get picked up.
+    from pathlib import Path as _P
+    assert _P(out["metadata"]).name.startswith("diagnostic_")
+
+
+def test_the_two_kinds_sort_apart_in_a_directory_listing(writer):
+    from pathlib import Path as _P
+
+    from trilobite.types import DIAGNOSTIC
+
+    writer.save_still(frame(), tag="raw")
+    writer.save_still(Frame.now(np.zeros((8, 8), dtype=np.uint8), "left", 2,
+                                validity=DIAGNOSTIC), tag="raw")
+    names = sorted(p.name for p in (_P(writer.session_dir) / "left").glob("*.npy"))
+    assert len(names) == 2
+    assert names[0].startswith("diagnostic_"), names
+
+
+def test_a_saved_preview_is_diagnostic_however_it_is_tagged(tmp_path):
+    """A processed preview is gamma-shaped, downsampled and may have a grid
+    drawn on it. That it is not measurement data used to be a sentence in a
+    docstring plus two fields a reader had to think to check -- `space` and the
+    pipeline block. It is now the same closed claim as everything else, so the
+    file is named `diagnostic_view_...` and both offline readers refuse it.
+    """
+    from trilobite.app import CameraRuntime
+    from trilobite.config import CameraConfig
+
+    w = SessionWriter(StorageConfig(root=str(tmp_path / "d")), tmp_path / "d")
+    cam = CameraRuntime(CameraConfig(
+        cam_id="left", backend="synthetic", full_resolution=(32, 24),
+        preview_resolution=(32, 24), synthetic_drift_px=0.0), writer=w)
+    cam.source.open()
+    try:
+        cam.preview.publish(cam.pipeline(cam.source.read_preview()))
+        out = cam.capture_preview()
+    finally:
+        cam.source.close()
+
+    assert out["validity"] == "diagnostic"
+    assert out["file"].startswith("diagnostic_view_"), out["file"]
+
+
+def test_a_full_capture_from_the_same_runtime_stays_science(tmp_path):
+    """The counterpart, so the preview rule cannot be satisfied by marking
+    everything diagnostic."""
+    from trilobite.app import CameraRuntime
+    from trilobite.config import CameraConfig
+
+    w = SessionWriter(StorageConfig(root=str(tmp_path / "d")), tmp_path / "d")
+    cam = CameraRuntime(CameraConfig(
+        cam_id="left", backend="synthetic", full_resolution=(32, 24),
+        preview_resolution=(32, 24), synthetic_drift_px=0.0), writer=w)
+    cam.source.open()
+    try:
+        out = cam.capture_still(raw=True)
+    finally:
+        cam.source.close()
+
+    assert out["validity"] == "science"
+    assert out["file"].startswith("still_left_"), out["file"]

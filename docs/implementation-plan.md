@@ -172,7 +172,7 @@ Revert; nothing else depends on it.
 
 ---
 
-## Stage 2 — validated raw-frame admission *(F7, gate G1)*
+## Stage 2 — validated raw-frame admission *(F7, gate G1)* — **IMPLEMENTED 6 Sep**
 
 Closes the failure class that cost a whole recording session.
 
@@ -211,6 +211,28 @@ that calls itself a science frame:
 ### Acceptance
 
 G1. No path admits a buffer whose meaning is not established.
+
+### As implemented
+
+`src/trilobite/cameras/rawformat.py` is the boundary, deliberately with no
+camera dependency so every rejection path is reachable from a byte array.
+`Frame.validity` is a first-class field (`science` / `diagnostic`) carried
+through `derive`; its constants live in `types.py` to keep the import direction
+right. `_choose_raw_format` raises `RawFormatError` at open time and releases
+the device; `allow_unvalidated_raw` per camera is the only way past.
+Diagnostic captures are named `diagnostic_…` ahead of the tag and carry
+`validity` in the sidecar. Saved previews are diagnostic too, which was not in
+the plan and follows from the same argument. `scripts/read_capture.py --detect`
+and the new `matlab/tv_require_science.m` refuse them.
+
+The substantive change beyond what the plan asked for is the **direction** of
+the stride reconciliation: the old code inferred bytes-per-pixel from the row
+length, which cannot distinguish "10-bit padded" from "8-bit wide". The format
+now states it and the shape confirms it.
+
+15 mutants, all caught — one only after adding a test for the invariant rather
+than the table. See `docs/cleanup-log.md` 2026-09-06 (p) for the full record
+and the bench-test steps.
 
 ---
 

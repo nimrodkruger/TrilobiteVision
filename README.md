@@ -751,6 +751,12 @@ python scripts/read_capture.py ... --tile 3,-2 --zoom 6         # one micro-imag
 python scripts/read_capture.py ... --detect --board 4x3 --csv corners.csv
 ```
 
+`--detect` refuses a capture the rig tagged `diagnostic` — see **validity**
+under [Things that will bite you](#things-that-will-bite-you). Pass
+`--allow-diagnostic` to look anyway; the corner positions are then not
+measurements. The MATLAB path does the same thing through
+`tv_require_science`, which `tv_micro_images` calls for you.
+
 The sidecar's pitch and offsets are quoted against whichever frame the stage
 was configured on, so the reader converts them to the array it is actually
 holding — a raw frame and a preview of the same pose need no different
@@ -919,6 +925,7 @@ matlab/                    the same reading path in MATLAB, base install only
   tv_read_capture.m        image + metadata, MLA geometry rescaled to the frame
   tv_micro_images.m        M×N cell of X×Y micro-images, de-rotated
   tv_sub_apertures.m       the permute: X×Y sub-aperture images, each M×N
+  tv_require_science.m     refuse a capture the rig tagged diagnostic
   demo_read_capture.m      the whole chain, with figures
   tv_selftest.m            19 assertions, headless
 systemd/trilobite.service  run as a service
@@ -1062,10 +1069,17 @@ rescaled — see [Orientation](#orientation).
 padded to a 64-byte stride, and the array is shaped by that stride *in bytes*
 and delivered as uint8 whatever the real pixel size is — so 10-bit `R10` at
 1456 px arrives as 1088 × **2944** uint8, which is 1472 uint16 pixels, not 1456
-pixels plus padding. The capture path works out the bytes per pixel from the
-row length, re-views the buffer, then trims. Left undone, the padding makes any
-rescale of the MLA grid anisotropic and moves the frame centre — which the grid
-hangs off — by half the padding.
+pixels plus padding. Left undone, the padding makes any rescale of the MLA grid
+anisotropic and moves the frame centre — which the grid hangs off — by half the
+padding.
+
+The *direction* of that reconciliation matters and used to be backwards. The
+capture path once inferred the bytes per pixel from the row length: it tried 1,
+then 2, and took the first that fitted. That cannot distinguish "10-bit, 1456
+wide, padded" from "8-bit, 2944 wide" — it is the same mistake one level down,
+deducing meaning from shape. Now the negotiated format *states* the pixel size
+and the shape must confirm it; when they disagree, that disagreement is the
+finding rather than something to resolve by picking whichever reading fits.
 
 **The Pi 5's default raw format is COMPRESSED.** libcamera hands the mono
 IMX296 `MONO_PISP_COMP1` unless told otherwise — the imaging pipeline's
@@ -1073,9 +1087,32 @@ compressed transport, one byte per pixel, not sensor counts. `make_array`
 returns it as a plain uint8 image, so captures have the right shape and obvious
 structure and every value wrong. It looks like a picture that has gone slightly
 wrong rather than like a decode failure, which is why a whole session was
-recorded that way before anyone noticed. The backend now picks an uncompressed
-format itself, records which one in every sidecar, and logs an error if it
-cannot find one. The same code on a Pi 4 got `R10` and was fine.
+recorded that way before anyone noticed. The same code on a Pi 4 got `R10` and
+was fine.
+
+The backend now picks the widest **unpacked** format the sensor advertises,
+records which one in every sidecar — and **refuses to open the camera** if it
+cannot establish one. That last part is the change that matters: the previous
+version logged an error and carried on, and a log line is not a control.
+Nobody reads the journal of a rig that appears to be working.
+
+**Every capture says whether it may be measured.** `validity` is `science` or
+`diagnostic`, in the sidecar of every file the rig writes. `science` means the
+raw format was known, uncompressed and unpacked, its geometry reconciled with
+the sensor's, and no value exceeded the bit depth it claimed. Anything else is
+`diagnostic`: named `diagnostic_…` on disk, and refused by
+`scripts/read_capture.py --detect` and by the MATLAB readers.
+
+This is deliberately **not** the same question as `space`. `space: raw` says
+the ISP was bypassed — a claim about the path the pixels took, not about what
+the values mean. A compressed PiSP buffer is `space: raw` and is not
+measurable. Saved previews are `diagnostic` too, for the same reason: gamma
+shaping and a drawn-on grid are not measurement data, and that used to be a
+sentence in a docstring rather than something enforced.
+
+Producing a diagnostic capture at all requires `allow_unvalidated_raw: true`
+in the camera's config block. It exists for bringing a new sensor up, and it
+is recorded in every sidecar it touches.
 
 **The rig's IP address will change.** DHCP does that. Reach it by name
 (`flyeye.local`), or give it a reservation in your router. When it has moved

@@ -608,6 +608,12 @@ class CaptureSession:
                     "shape": list(frame.data.shape),
                     "dtype": str(frame.data.dtype),
                     "space": frame.space,
+                    # Recorded here as well as on captures so a reader has ONE
+                    # field to check across every file the rig writes. A pose
+                    # is the ISP's mono output rather than raw sensor counts,
+                    # which is legitimate for corner GEOMETRY and is not
+                    # radiometric data -- `space` is what says which it is.
+                    "validity": frame.validity,
                     "forced": forced,
                     "sensor": {k: v for k, v in frame.meta.items()
                                if k in ("ExposureTime", "AnalogueGain", "DigitalGain",

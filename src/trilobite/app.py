@@ -12,6 +12,7 @@ import logging
 import threading
 import time
 from collections import deque
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +27,7 @@ from .optics.orientation import Orientation
 from .processing.pipeline import Pipeline
 from .state import StateStore
 from .storage.writer import SessionWriter
-from .types import Frame
+from .types import DIAGNOSTIC, Frame
 
 log = logging.getLogger(__name__)
 
@@ -225,14 +226,20 @@ class CameraRuntime:
         Distinct from capture_still on purpose. This is low-resolution, gamma
         shaped, possibly with a grid drawn on it: a record of *what you were
         looking at*, useful for lab notes and for documenting an alignment
-        state. It is not measurement data, and the sidecar says so via
-        `space` and the pipeline block. Never fit anything to these.
+        state. It is not measurement data. Never fit anything to these.
+
+        That last sentence is now enforced rather than written down: the frame
+        is stamped `diagnostic` on its way out, so it is named
+        `diagnostic_view_...` on disk and both offline readers refuse it. It
+        used to rely on the reader noticing `space` and the pipeline block,
+        which is the same shape of mistake as trusting a buffer because it has
+        plausible structure -- correct information, in a place nobody checks.
         """
         frame = self.latest()
         if frame is None:
             raise RuntimeError(f"{self.cam_id}: no preview frame yet")
         return self.writer.save_still(
-            frame,
+            replace(frame, validity=DIAGNOSTIC),
             pipeline_settings=self.pipeline.settings_snapshot(),
             camera_info=self.source.describe().as_dict(),
             tag=tag,
