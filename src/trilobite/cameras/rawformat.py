@@ -44,9 +44,30 @@ are sensor counts. Ways it can fail to be, all of which were once admitted:
 So: nothing is admitted as `science` unless its format is known, uncompressed
 and unpacked, its samples are unsigned integers in native byte order, its
 geometry and stride reconcile with what the driver actually negotiated, and its
-values fit the depth and alignment it claims. A buffer that fails is refused --
-`allow_unvalidated_raw` in the config is the only thing that lets a refused
-buffer be captured at all, and then only as `diagnostic`.
+values fit the depth and alignment it claims.
+
+**But failing that is graded, not refused, and the distinction is the whole
+shape of this module.** An earlier version treated every failure as a refusal
+and handed the buffer back untouched, which put pairs of bytes on screen as
+pixels -- white noise with row structure -- for the ordinary case of a 10-bit
+buffer whose stride did not reconcile. That was wrong twice over: it conflated
+"we cannot vouch for these values" with "we will not interpret these bytes",
+and it made the rig undiagnosable at exactly the moment somebody needed to
+diagnose it.
+
+The split now follows what a person can SEE:
+
+  * **Refused** (`RawFormatError`, needs `allow_unvalidated_raw` to capture at
+    all, tagged `diagnostic`): the format says the bytes are not pixel values.
+    Compressed, packed, or unknown. There is no reading to produce, and the
+    failure is invisible by construction -- a PiSP buffer looks like a slightly
+    damaged photograph. This is the one with a body count.
+  * **Graded** (`unvalidated`, with the reasons recorded): a row count that
+    disagrees, a stride that does not match, values past the ceiling, a dtype
+    that cannot hold unsigned samples. The pixels come back as the best reading
+    available. Every one of these is visible on screen -- wrong alignment is
+    64x too bright, wrong stride skews the aspect ratio -- so refusing to
+    produce a frame buys no protection and costs the diagnosis.
 
 **Three separate quantities, kept separate on purpose.** The sensor sample
 depth (nominal, from the format name -- evidence of nothing on its own), the
@@ -234,53 +255,61 @@ def best_format(candidates: list[str]) -> str | None:
 
 @dataclass(frozen=True)
 class Admitted:
-    """A buffer that has been established to be pixel values, plus the evidence."""
+    """A buffer read as an image, plus what could and could not be established.
+
+    `validity` is `science` only when nothing was left unresolved. Anything
+    unresolved goes in `reservations` and the verdict drops to `unvalidated` --
+    which is a grade, not a rejection. The array is still the best reading of
+    the buffer this code can produce, because a frame nobody can look at helps
+    nobody, and "we cannot vouch for these values" is a different statement
+    from "we will not interpret these bytes".
+    """
 
     array: np.ndarray
     meta: dict[str, object]
+    validity: str
+    reservations: tuple[str, ...] = ()
+
+    @property
+    def is_science(self) -> bool:
+        return self.validity == SCIENCE
 
 
-def _check_representation(data: np.ndarray, fmt: RawFormat) -> None:
-    """Is this array a plausible container for unsigned sensor samples at all?
+def _representation_reservations(data: np.ndarray, fmt: RawFormat) -> list[str]:
+    """Is this array a plausible container for unsigned sensor samples?
 
     Supervisory review R3. The original check was `data.dtype.itemsize`, which
     is not a check on the dtype: `int16`, `float16` and `uint16` are all two
-    bytes wide. Probes admitted `int16(-1)` and `float16(0.5)` as 10-bit sensor
-    counts. A negative count and a fractional count are both impossible, so
-    accepting them means the stated invariant was simply false.
-    """
-    if data.ndim != 2:
-        raise RawFormatError(
-            f"raw buffer is {data.ndim}-dimensional; a raw frame is one plane")
+    bytes wide, and probes admitted `int16(-1)` and `float16(0.5)` as 10-bit
+    sensor counts. A negative count and a fractional count are both impossible,
+    so the invariant this module advertised was false.
 
+    These are reservations rather than refusals. A buffer of the wrong dtype
+    is certainly not admissible as science, and it is still something an
+    operator may want to look at while working out what the driver is doing.
+    """
+    out: list[str] = []
     if data.dtype.kind != "u":
         kinds = {"i": "signed integer", "f": "floating point", "b": "boolean",
                  "c": "complex"}
         what = kinds.get(data.dtype.kind, f"kind {data.dtype.kind!r}")
-        raise RawFormatError(
-            f"raw buffer is {data.dtype} -- {what}, not unsigned. A sensor "
-            f"count cannot be negative or fractional, so this buffer is not "
-            f"sensor data whatever its shape and item size say.")
-
-    # '|' means the type has no byte order (uint8); '=' is native. Anything
-    # else has the right item size and the wrong values.
+        out.append(f"buffer is {data.dtype} -- {what}, not unsigned; a sensor "
+                   f"count cannot be negative or fractional")
     if data.dtype.byteorder not in ("=", "|"):
-        raise RawFormatError(
-            f"raw buffer is {data.dtype} with non-native byte order "
-            f"({data.dtype.byteorder!r}). Every value would be byte-swapped.")
-
+        out.append(f"buffer is {data.dtype}, non-native byte order; every "
+                   f"value would be byte-swapped")
     if fmt.bytes_per_pixel == 1 and data.dtype.itemsize != 1:
-        raise RawFormatError(
-            f"{fmt.name} is one byte per pixel and the buffer is {data.dtype}")
+        out.append(f"{fmt.name} is one byte per pixel and the buffer is "
+                   f"{data.dtype}")
     if fmt.bytes_per_pixel == 2 and data.dtype.itemsize not in (1, 2):
-        raise RawFormatError(
-            f"{fmt.name} is two bytes per pixel; a {data.dtype} buffer cannot "
-            f"be a view of it")
+        out.append(f"{fmt.name} is two bytes per pixel; a {data.dtype} buffer "
+                   f"cannot be a view of it")
+    return out
 
 
-def _check_values(
+def _value_evidence(
     trimmed: np.ndarray, fmt: RawFormat, alignment: str,
-) -> dict[str, object]:
+) -> tuple[dict[str, object], list[str]]:
     """Do the values fit the depth and alignment the format claims?
 
     The check with teeth against a driver that hands back something other than
@@ -293,46 +322,47 @@ def _check_values(
       * **LSB.** A 10-bit sample lives in 0..1023, so anything above that is
         proof of a disagreement. Strong.
       * **MSB.** A 10-bit sample left-shifted by six lives in 0..65472 in steps
-        of 64. The ceiling still catches R12-in-R10 (which would reach 65520),
-        but the low six bits are the real evidence and some pipelines replicate
-        the high bits into them rather than zero-filling. So a non-zero low
-        field is RECORDED, not refused.
+        of 64. The ceiling still catches R12-in-R10 (which reaches 65520), but
+        the low six bits are the real evidence and some pipelines replicate the
+        high bits into them rather than zero-filling, so a non-zero low field
+        is recorded, never held against the buffer.
+
+    A value over the ceiling is a **reservation**, not a refusal, and the
+    reason is worth being explicit about: it is a visible failure. A frame read
+    with the wrong alignment is 64x too bright or too dark and an operator sees
+    that immediately. The failure this module exists for -- a compressed
+    transport that looks like a slightly damaged photograph -- is invisible,
+    and that is the one that still stops the capture.
     """
     shift = fmt.shift_for(alignment)
     peak = int(trimmed.max()) if trimmed.size else 0
     ceiling = fmt.max_value << shift
 
-    evidence: dict[str, object] = {
+    meta: dict[str, object] = {
         "raw_values_checked": True,
         "raw_observed_max": peak,
         "raw_value_ceiling": int(ceiling),
     }
+    out: list[str] = []
 
     if peak > ceiling:
+        other = fmt.max_value << (fmt.container_bits - fmt.bits)
         hint = ""
-        if alignment == LSB and peak <= (fmt.max_value << (fmt.container_bits - fmt.bits)):
-            hint = (f" The peak IS consistent with a {fmt.bits}-bit sample "
+        if alignment == LSB and peak <= other:
+            hint = (f"; the peak IS consistent with a {fmt.bits}-bit sample "
                     f"left-shifted into a {fmt.container_bits}-bit word, which "
-                    f"is what the Picamera2 manual describes for the Pi 5 -- if "
-                    f"that is this pipeline, set 'raw_alignment: msb' in the "
-                    f"camera config. Do not assume it; confirm it against a "
-                    f"known target.")
-        raise RawFormatError(
-            f"buffer contains a value of {peak}, above the {ceiling} maximum "
-            f"for a {fmt.bits}-bit {fmt.name} sample {alignment}-aligned in a "
-            f"{fmt.container_bits}-bit container. The negotiated format and "
-            f"the delivered data do not agree, and the data is not what it "
-            f"says it is.{hint}")
+                    f"is what the Picamera2 manual describes for the Pi 5 -- "
+                    f"if that is this pipeline, set 'raw_alignment: msb'")
+        out.append(
+            f"peak value {peak} exceeds the {ceiling} maximum for a "
+            f"{fmt.bits}-bit {fmt.name} sample {alignment}-aligned in a "
+            f"{fmt.container_bits}-bit container{hint}")
 
     if shift and trimmed.size:
-        # Recorded because it distinguishes a zero-filled pipeline from one
-        # that replicates the high bits downward, and because it is the only
-        # positive evidence available that the alignment declared is the
-        # alignment delivered.
         low = int(np.bitwise_and(trimmed, (1 << shift) - 1).max())
-        evidence["raw_low_bits_max"] = low
-        evidence["raw_low_bits_zero_filled"] = low == 0
-    return evidence
+        meta["raw_low_bits_max"] = low
+        meta["raw_low_bits_zero_filled"] = low == 0
+    return meta, out
 
 
 def admit(
@@ -344,7 +374,7 @@ def admit(
     alignment: str = LSB,
     check_values: bool = True,
 ) -> Admitted:
-    """Turn a raw buffer into an image, or raise saying why it is not one.
+    """Read a raw buffer as an image and grade what could be established.
 
     `raw_size` is the (width, height) in PIXELS **of the raw stream as the
     driver negotiated it** -- not the main stream's, and not what the config
@@ -353,23 +383,37 @@ def admit(
     the sensor delivered it, because row padding is on the right at that moment
     and on some other edge afterwards.
 
-    `stride_bytes`, when the driver reports it, is the row length that must be
-    matched EXACTLY. Without it the bounded-pad rule below is the fallback, and
-    the evidence records which of the two was used.
+    **Two very different outcomes, and the split is the point.**
 
-    Every check is against something independent of the buffer's own shape:
+    `RawFormatError` is raised only when the FORMAT says the bytes are not
+    pixel values at all -- compressed, packed, or a name this code does not
+    know. There is no reading of such a buffer to produce, the failure is
+    invisible by construction (a PiSP buffer looks like a slightly damaged
+    photograph), and it is the one that cost a recording session. That stays a
+    hard stop.
 
-      1. the format is known, uncompressed and unpacked;
-      2. the samples are unsigned integers in native byte order (R3);
+    Everything else -- a row count that disagrees, a stride that does not match
+    what the driver reported, values past the declared ceiling, a dtype that
+    cannot hold unsigned samples -- comes back as a **reservation** on an
+    `Admitted` whose validity is `unvalidated`. The pixels are still the best
+    reading available. Every one of those failures is VISIBLE: a wrong
+    alignment is 64x too bright, a wrong stride skews the aspect ratio, and an
+    operator sees both at a glance. Refusing to produce a frame for them buys
+    no protection and costs the ability to diagnose the rig at all.
+
+    The checks, each against something independent of the buffer's own shape:
+
+      1. the format is known, uncompressed and unpacked  *(hard)*
+      2. the samples are unsigned integers in native byte order  *(R3)*
       3. the geometry is positive and the row count equals the negotiated
          height -- rows are not padded, so a row COUNT that disagrees means
-         this is not the frame it claims to be;
+         this is not the frame it claims to be
       4. the row length in BYTES equals the negotiated stride, or failing that
          width x bytes-per-pixel plus a bounded pad. Note the direction: the
          format states the pixel size and the shape confirms it. Inferring the
          pixel size from the shape, which is what this replaced, cannot
-         distinguish "10-bit, 1456 wide, padded" from "8-bit, 2944 wide";
-      5. the values fit the depth AND the declared alignment (R3).
+         distinguish "10-bit, 1456 wide, padded" from "8-bit, 2944 wide"
+      5. the values fit the depth AND the declared alignment  *(R3)*
 
     The pixels are returned **unshifted**. For MSB alignment the sample is
     `value >> raw_sample_shift`, and that shift is recorded rather than
@@ -379,75 +423,82 @@ def admit(
     fmt = classify(format_name)
     if fmt is None or not fmt.admissible:
         raise RawFormatError(describe_refusal(format_name))
-
     if alignment not in ALIGNMENTS:
         raise RawFormatError(
             f"raw alignment {alignment!r} is not one of {ALIGNMENTS}. It says "
             f"where the sensor sample sits inside its container word and "
             f"cannot be guessed from the data.")
+    if data.ndim != 2:
+        raise RawFormatError(
+            f"raw buffer is {data.ndim}-dimensional; a raw frame is one plane")
 
-    _check_representation(data, fmt)
+    reservations = _representation_reservations(data, fmt)
 
     sensor_w, sensor_h = int(raw_size[0]), int(raw_size[1])
     if sensor_w <= 0 or sensor_h <= 0:
         raise RawFormatError(
             f"negotiated raw size is {sensor_w}x{sensor_h}; a frame cannot "
-            f"have a non-positive dimension")
+            f"have a non-positive dimension, and there is nothing to trim to")
 
     height, row_len = data.shape
     if height != sensor_h:
-        raise RawFormatError(
-            f"raw buffer has {height} rows and the negotiated raw stream is "
-            f"{sensor_h} tall. Row padding is a per-row phenomenon; a row "
-            f"COUNT that disagrees means this is not the frame it claims to be.")
+        reservations.append(
+            f"buffer has {height} rows and the negotiated raw stream is "
+            f"{sensor_h} tall; row padding is a per-row phenomenon, so a row "
+            f"COUNT that disagrees means this is not the frame it claims to be")
 
     row_bytes = row_len * data.dtype.itemsize
     want_bytes = sensor_w * fmt.bytes_per_pixel
 
     if stride_bytes is not None:
         stride_bytes = int(stride_bytes)
-        pad_bytes = stride_bytes - want_bytes
-        if pad_bytes < 0 or pad_bytes > MAX_STRIDE_PAD_BYTES:
-            raise RawFormatError(
-                f"the driver reports a {stride_bytes}-byte raw stride, and "
-                f"{fmt.name} at {sensor_w} px wide needs {want_bytes} plus at "
-                f"most {MAX_STRIDE_PAD_BYTES} of padding. The negotiated "
-                f"configuration is internally inconsistent; nothing here can "
-                f"reconcile it.")
-        if row_bytes != stride_bytes:
-            raise RawFormatError(
-                f"raw buffer rows are {row_bytes} bytes and the driver "
-                f"negotiated a stride of {stride_bytes}. The buffer is not the "
-                f"one the configuration describes.")
         stride_source = "negotiated"
+        if row_bytes != stride_bytes:
+            reservations.append(
+                f"buffer rows are {row_bytes} bytes and the driver negotiated "
+                f"a stride of {stride_bytes}")
+        pad = stride_bytes - want_bytes
+        if pad < 0 or pad > MAX_STRIDE_PAD_BYTES:
+            reservations.append(
+                f"the negotiated {stride_bytes}-byte stride is not "
+                f"{want_bytes} plus at most {MAX_STRIDE_PAD_BYTES} of padding, "
+                f"so the configuration is internally inconsistent")
     else:
-        pad_bytes = row_bytes - want_bytes
-        if pad_bytes < 0 or pad_bytes > MAX_STRIDE_PAD_BYTES:
-            raise RawFormatError(
-                f"raw buffer rows are {row_bytes} bytes; {fmt.name} at "
-                f"{sensor_w} px wide needs {want_bytes} plus at most "
-                f"{MAX_STRIDE_PAD_BYTES} of stride padding. Off by {pad_bytes}. "
-                f"If that is close to a factor of two, the negotiated format "
-                f"and the delivered buffer disagree about the pixel size.")
         stride_source = "inferred"
+        pad = row_bytes - want_bytes
+        if pad < 0 or pad > MAX_STRIDE_PAD_BYTES:
+            reservations.append(
+                f"buffer rows are {row_bytes} bytes; {fmt.name} at {sensor_w} "
+                f"px wide needs {want_bytes} plus at most "
+                f"{MAX_STRIDE_PAD_BYTES} of stride padding, off by {pad}. If "
+                f"that is close to a factor of two, the negotiated format and "
+                f"the delivered buffer disagree about the pixel size")
 
     # Re-view to the format's own dtype. A C-contiguous uint8 row of 2N bytes
     # IS N little-endian uint16 pixels: no copy, no arithmetic, and the values
     # become the counts the sensor produced rather than their halves.
+    #
+    # Attempted even when there are reservations, because this is exactly the
+    # step whose absence produced white noise on screen: a 10-bit buffer left
+    # as uint8 is pairs of bytes displayed as pixels.
     out = data
     if fmt.bytes_per_pixel == 2 and data.dtype.itemsize == 1:
         if row_len % 2:
-            raise RawFormatError(
+            reservations.append(
                 f"{fmt.name} is two bytes per pixel but the buffer row is "
-                f"{row_len} bytes, an odd number -- it cannot be whole pixels")
-        out = np.ascontiguousarray(data).view(np.uint16)
+                f"{row_len} bytes, an odd number -- it cannot be whole pixels, "
+                f"so it is left as bytes")
+        else:
+            out = np.ascontiguousarray(data).view(np.uint16)
 
     stride_px = out.shape[1]
     if stride_px < sensor_w:
-        raise RawFormatError(
-            f"raw buffer is {stride_px} px wide and the negotiated raw stream "
-            f"is {sensor_w}")
-    trimmed = out[:, :sensor_w]
+        reservations.append(
+            f"buffer is {stride_px} px wide and the negotiated raw stream is "
+            f"{sensor_w}, so nothing was trimmed")
+        trimmed = out
+    else:
+        trimmed = out[:, :sensor_w]
 
     meta: dict[str, object] = {
         "raw_format": fmt.name,
@@ -468,12 +519,20 @@ def admit(
         "raw_height": sensor_h,
     }
 
-    if check_values:
-        meta.update(_check_values(trimmed, fmt, alignment))
+    if check_values and trimmed.dtype.kind == "u":
+        value_meta, value_reservations = _value_evidence(trimmed, fmt, alignment)
+        meta.update(value_meta)
+        reservations.extend(value_reservations)
     else:
         # About 1 ms on a 1.6 Mpx frame, which is why it can be skipped on a
         # preview path. Recorded, so a sidecar never implies a check that did
         # not happen.
         meta["raw_values_checked"] = False
 
-    return Admitted(array=trimmed, meta=meta)
+    validity = SCIENCE if not reservations else UNVALIDATED
+    meta["raw_admitted"] = validity == SCIENCE
+    meta["raw_reservations"] = list(reservations)
+    return Admitted(array=trimmed, meta=meta, validity=validity,
+                    reservations=tuple(reservations))
+
+

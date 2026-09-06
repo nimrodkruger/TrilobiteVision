@@ -92,15 +92,18 @@ def test_an_explicitly_false_admission_is_refused(rc, tmp_path):
 # -- the cases that used to pass --------------------------------------------
 
 
-def test_a_missing_validity_field_is_refused(rc, tmp_path):
-    """The archive case. Refusing it is the point: nothing in a pre-boundary
-    file establishes that anyone ever checked it, and inferring that they did
-    is the same act as inferring meaning from shape."""
+def test_a_missing_validity_field_is_not_science(rc, tmp_path):
+    """The archive case. Nothing in a pre-boundary file establishes that anyone
+    ever checked it, so it cannot be `science` -- but it is perfectly readable,
+    so positions stay measurable and the reader says what is missing rather
+    than refusing to open it."""
     cap = rc.load(capture(tmp_path, omit_validity=True, admitted=True))
     assert cap.validity == "unknown"
-    assert not cap.is_science and not cap.geometry_ok
+    assert not cap.is_science
+    assert cap.geometry_ok, "readable, so positions are measurable"
     with pytest.raises(SystemExit, match="no recognised validity"):
-        cap.require_geometry("corner detection")
+        cap.require_science("reading these values as sensor counts")
+    cap.require_geometry("corner detection")       # must not raise
 
 
 def test_a_misspelled_validity_is_refused_and_reported(rc, tmp_path, capsys):
@@ -112,10 +115,13 @@ def test_a_misspelled_validity_is_refused_and_reported(rc, tmp_path, capsys):
     assert "does not recognise" in capsys.readouterr().err
 
 
-def test_a_validity_from_a_newer_schema_is_refused(rc, tmp_path):
-    """Forward compatibility that fails open is not compatibility."""
+def test_a_validity_from_a_newer_schema_is_not_science(rc, tmp_path):
+    """Forward compatibility that fails open is not compatibility -- for the
+    strict question. The frame is still a frame."""
     cap = rc.load(capture(tmp_path, validity="provisional", admitted=True))
-    assert not cap.is_science and not cap.geometry_ok
+    assert not cap.is_science
+    with pytest.raises(SystemExit):
+        cap.require_science("a radiometric fit")
 
 
 def test_a_null_validity_is_refused(rc, tmp_path):
@@ -127,12 +133,17 @@ def test_a_null_validity_is_refused(rc, tmp_path):
 # -- diagnostic -------------------------------------------------------------
 
 
-def test_a_diagnostic_capture_is_refused_for_both_kinds(rc, tmp_path):
+def test_a_diagnostic_capture_is_the_one_thing_refused_outright(rc, tmp_path):
+    """The only hard stop left, and the only one that earns it: `diagnostic`
+    means the rig established these bytes are not pixel values, so there is no
+    reading of them to measure."""
     cap = rc.load(capture(tmp_path, validity="diagnostic", admitted=False,
                           refusal="MONO_PISP_COMP1 is a COMPRESSED transport"))
     assert not cap.is_science and not cap.geometry_ok
     with pytest.raises(SystemExit, match="COMPRESSED"):
         cap.require_geometry("corner detection")
+    with pytest.raises(SystemExit, match="COMPRESSED"):
+        cap.require_science("a radiometric fit")
 
 
 # -- geometry is a different question from radiometry -----------------------
@@ -149,22 +160,33 @@ def test_an_isp_pose_is_geometrically_usable_but_not_radiometrically(rc, tmp_pat
     cap.require_geometry("corner detection")       # must not raise
 
     assert not cap.is_science
-    with pytest.raises(SystemExit, match="admitted 'science' capture"):
+    with pytest.raises(SystemExit, match="refusing"):
         cap.require_science("reading these values as sensor counts")
 
 
-def test_an_unvalidated_frame_from_an_unknown_source_is_refused(rc, tmp_path):
-    """`unvalidated` alone is not a pass for geometry either. It is the ISP
-    SOURCE that makes the positions trustworthy, and a frame that does not say
-    where it came from has not established that."""
-    cap = rc.load(capture(tmp_path, validity="unvalidated"))
-    assert not cap.geometry_ok
+def test_an_unreconciled_raw_frame_is_still_measurable_for_geometry(rc, tmp_path, capsys):
+    """The loosening that unblocked the bench. A raw buffer whose stride or
+    values did not reconcile is `unvalidated` with the reasons recorded -- and
+    it is still a frame. Refusing it would have been protection against
+    nothing: a wrong stride skews the aspect ratio and a wrong alignment is 64x
+    too bright, both of which you find by LOOKING."""
+    cap = rc.load(capture(
+        tmp_path, validity="unvalidated", source_kind="raw",
+        extra_sensor={"raw_reservations": [
+            "peak value 64000 exceeds the 1023 maximum for a 10-bit R10 "
+            "sample lsb-aligned in a 16-bit container"]}))
+    assert cap.geometry_ok
+    cap.require_geometry("corner detection")
+    assert "64000 exceeds" in capsys.readouterr().err, (
+        "the reason has to be said, not merely not enforced")
 
 
-def test_a_rendered_frame_is_not_measurable_at_all(rc, tmp_path):
-    cap = rc.load(capture(tmp_path, validity="unvalidated",
-                          source_kind="synthetic"))
-    assert not cap.geometry_ok and not cap.is_science
+def test_the_reservations_are_carried_through_to_the_reader(rc, tmp_path):
+    cap = rc.load(capture(
+        tmp_path, validity="unvalidated",
+        extra_sensor={"raw_reservations": ["one", "two"]}))
+    assert cap.reservations == ("one", "two")
+    assert "one" in cap.why_not_science and "two" in cap.why_not_science
 
 
 # -- what the report says ---------------------------------------------------
@@ -185,6 +207,15 @@ def test_the_report_names_the_alignment_and_that_no_shift_was_applied(rc, tmp_pa
     assert "msb-aligned in 16" in out
     assert "NOT applied" in out
     assert "observed max 64000" in out
+
+
+def test_the_report_lists_every_reservation(rc, tmp_path, capsys):
+    """A grade with no reason attached makes the next person rediscover it."""
+    rc.describe(rc.load(capture(
+        tmp_path, validity="unvalidated",
+        extra_sensor={"raw_reservations": ["stride disagrees", "peak too high"]})))
+    out = capsys.readouterr().out
+    assert "stride disagrees" in out and "peak too high" in out
 
 
 def test_the_report_distinguishes_unrecorded_from_diagnostic(rc, tmp_path, capsys):

@@ -1,0 +1,755 @@
+PAGE 1
+Modelling dynamic systems transfer functions 
+from events in computational neuromorphic 
+imaging
+Nimrod Kruger
+International Centre for Neuromorphic Systems
+Western Sydney University
+Sydney, Australia
+n.kruger@westernsydney.edu.au
+Gregory Cohen
+International Centre for Neuromorphic Systems
+Western Sydney University
+Sydney, Australia
+g.cohen@westernsydney.edu.au
+Abstract—Event Vision Sensing  (EVS) report threshold crossings of log-irradiance, so a static optical system imaging a 
+static scene produces no output at all. The classical procedure for measuring a Point Spread Function  (PSF), illuminating 
+the system with a constant point source, therefore has no event-based equivalent: the probe must carry a temporal profile, 
+and that profile becomes part of the measurement. A growing body of Computational Neuromorphic Imaging  (CNI) work 
+already exploits this, pairing engineered or modulated optics with event sensing, but each system adopts a particular 
+excitation together with a particular reading of the event stream without the correspondence between the two being stated. 
+We examine that correspondence directly within a analytical framework of an Linear Shift-Invariant (LSI) optical system 
+with a specified Modulation Transfer Function  (MTF), a first-order filter EVS pixel model, and three different temporal 
+probes: a step function, a linear ramp and an exponential ramp. By analysing the inverse of the entire chain for different 
+event-statistic, and comparing the results to the specified MTF, we identify the context where each probe is most relevant. 
+We consider how photon-noise and cross-array threshold mismatch effects the analytical accuracy of the probe-inverse. 
+Results show that the widely used step probe is highly susceptible to mismatch while resilient to photon shot-noise, while a 
+linear rise probe and exponential rise probe retain their ability to infer signal levels even with high mismatch. We discuss 
+the potential of dynamic- PSFs as components of a full forward operator from scene to events. In this, we use this analytical 
+description to define dynamic-PSFs around EVS, and discuss the gaps toward a unified pixel model and a scene-composition 
+framework required for CNI.
+Index Terms—Event Vision Sensors, Computational Imaging, Point Spread Function
+I. Introduction
+A. Computational imaging with event sensors
+Computational Imaging (CI) infers scene information by jointly designing an optical projection and the computation 
+that inverts it [1]. The successful optical system design will produce a scene projection so information of interest 
+becomes separable, ideally low-rank, under noisy measurement and with tractable compute. In this respect CI differs 
+from signal processing, which handles temporal signals, and from image processing, which handles spatial ones, in that 
+it must treat the full spatiotemporal problem while carrying the additional abstraction layer of the optical hardware.
+EVS, or neuromorphic sensing, reports asynchronous per-pixel threshold crossings of log-irradiance [2], [3], rather 
+than an integrated intensity value. The sampling is sparse, continuous in time and high in dynamic range, at the cost 
+of limited sensitivity, since contrast thresholds are set relatively high to accommodate hardware mismatch [4]. This 
+sampling mode fits neither the static image nor the isolated time-series picture, and it can be argued that neuromorphic 
+sensing constitutes a CI problem from the outset, even behind a conventional imaging lens [5]. Challenging the narrative 
+of CI presented above, now the on-sensor asynchronous log-irradiance threshold-crossing sampling modes introduces 
+an additional layer of abstraction to the design, while the output sensor data is not trivially sparable in space and in 
+time as with most CI approaches.
+The emerging body of work for considering EVS-CI, collectively termed CNI, now spans multiple domains and 
+applications. Noted, a property of EVS is that a static optical system imaging a static scene produces no events. 
+Therefore, three distinct CNI approaches can be mentioned: Internally supplied system dynamics appear as coded 
+apertures switched during a single measurement [6], [7] and as steered or multiplexed ray paths for light-field capture 
+[8]. Active illumination underlies event-based light-field microscopy [9]. Information extracted from scene dynamics 
+alone covers wavefront sensing [10] and image reconstruction posed as a linear inverse problem [11].
+PAGE 2
+The promise of CNI is the ability to uniquely deliver high bandwidth and low latency scene information, not readily 
+available by frame-based imaging systems, often with imposed design constraints. The question raised when developing 
+such systems is “how to design an optical projection and algorithm for maximal separability of the event-statistics?”. 
+These event-statistics must represent both the spatial and temporal behaviour of the camera, however, the literature 
+traditionally addresses either-or.
+B. The gap addressed
+PSF engineering has recently been extended to event cameras for 3D localisation and tracking, including task-specific 
+mask design optimised against Cramér-Rao bounds [12]. However, this tool gets only a light touch in current literature, 
+partly due to an incomplete picture of its role. Dynamic phase masks have also been used to build time-averaged PSFs 
+whose attainable set is richer than that of any static mask [13]. There, the optics themselves vary in time and the 
+Fig. 1. Computational Neuromorphic Imaging framework, and the role of spatial-temporal probes in it. (a) A scene is projected through the optical 
+components onto the Focal-Plane Array (FPA), and the corresponding spatial temporal signal is converted into an event-stream. This forward pass 
+can be described by a spatial operation in the optics (ℋ︀) and a temporal point-process operator through the event-pixel model ℳ︀. (b) A backward 
+pass must then disassociate these spatial and temporal operations by observing the statistics of the event-stream (often coined the “time-surface”), 
+to successfully perform any inference or reconstruction task of the input scene. Useful tools to probe the relation between event-stream statistics 
+and the spatial and temporal operations are the (c) MTF (related to the Optical Transfer Function (OTF)), (d) its corresponding PSF, and the (e) 
+temporal impulse response. Shown here is an example of a trivial 1D rectangular pupil, giving a sinc-squared intensity PSF and a triangular MTF, 
+and a selection of temporal impulses - a step function, a linear rise, and an exponent rise (all presented in log-intensity)
+PAGE 3
+variation is integrated away by frame exposure, which is the opposite limit to the case considered here. Event sensing 
+has been combined with Fourier light-field microscopy for ultrafast volumetric imaging [9], where a 3D PSF and its 
+spectrum are recovered from events generated by a translating bead. There the probe is uncontrolled motion, and the 
+statistic is not chosen or inverted, so no correspondence between excitation and statistic is established.
+Notably, utilising a PSF needs to pair a particular temporal excitation with a particular way of reading the event 
+stream. Some present accumulated events / event-rates as the log-intensity output equivalent, others consider inter-
+event intervals as intensity or log-intensity derivative, and others yet consider last-event timing when relating to a 
+reference modulated illumination source. Event representations, sensor models and PSF engineering have each been 
+studied in isolation [3], [14], [12]. What has not been examined is the connection between event statistics, given 
+various temporal signals, and the spatial transfer function - and accordingly, the inverse to recover it. In the broader 
+CNI context, as in Fig. 1(b), the event-stream statistics are reduced to a specific time-surface, while Fig. 1(a) shows 
+the transfer from scene irradiance through an optical operator, ℋ︀, and then through a pixel model, ℳ︀ (performing a 
+point-process realisation from FPA-irradiance). Building a time-surface from only a single statistical tool from the list 
+above (accumulation, Inter-Spike Interval (ISI), etc.), and without a mapping to the specific type of forward operators, 
+ℋ︀ & ℳ︀, is a gap the literature is yet to address.
+The aim of this work is to discuss the potential of various event-statistics that may populate a time-surface (and thus 
+represent the PSF of the optics and sensor), and how these correspond to various spatio-temporal probes. While such 
+a probe would be a full spatio-temporal function, we lean into the order-wise separation of these forward operators 
+through which the signal passes – first the optics, and then the sensor – and suggest a sparable spatial-temporal function 
+for constructing each probe.
+We specify an optical system by a given MTF ( Fig. 1(c)) and derive the corresponding PSF, ℋ︀ ( Fig. 1(d)). For a 
+simple imaging optics, a point source Dirac-delta function is best suited to spatially examine pixel response, with a 
+variety of temporal function explored. The expected event-stream output is simulated with a simple first-order filter 
+EVS model, ℳ︀, where the only noise source is the photon shot noise. For simplicity, the analysis is performed on 
+a 1-D spatial domain. We follow three probes, as in Fig. 1(e): a step-function, a rising linear intensity, and a rising 
+exponential intensity - all triggered at a known time, 𝑡0, and starting from a finite background intensity value, 𝐼bg. 
+By identifying the relation where each statistics becomes a natural interpretation of parameters of ℋ︀ and ℳ︀ - we 
+may observe inverse functions that help relate events to either scene information, or identifying our system (retrieving 
+the MTF, or characterising sensor parameters). The validity of this inverse is tested through the reconstruction of the 
+specific MTF input.
+This work represents an important step towards a full mapping framework from scene-components input to event 
+statistic, and can inform joint sensor and optics characterisation, design of useful optical projections for various EVS 
+pixel models, develop performance evaluation tools, and design efficient processing pipelines for CNI applications.
+II. A dynamic imaging model
+We treat the optical system as an operator ℋ︀ mapping a scene distribution 𝑈(𝒓,𝑡) to the irradiance on the FPA. 
+Where the system is a LSI, this operator is a convolution with a PSF kernel ℎ(𝒓,𝑡),
+𝐼(𝒓,𝑡)= ℋ︀[𝑈](𝒓,𝑡)= (ℎ ∗ 𝑈)(𝒓,𝑡), (1)
+where ∗ denotes spatial convolution and the kernel is permitted to depend on time. The analysis is restricted 
+throughout to a spatially shift-invariant, irradiance-linear optical system. Extending it to space-variant optics would 
+replace the convolution in equation (1) with the corresponding space-variant operator.
+Because an event sensor responds to temporal change, the quantity of interest is not 𝐼 but its temporal derivative. 
+Differentiating equation (1) gives
+𝜕𝐼
+𝜕𝑡 = 𝜕ℎ
+𝜕𝑡 ∗ 𝑈 + ℎ ∗ 𝜕𝑈
+𝜕𝑡 , (2)
+so the irradiance change at any pixel receives a contribution from the optical system evolving and a contribution 
+from the scene evolving. Both terms produce events, and the event stream alone does not distinguish them. The probe, 
+in essence, is a representation of 𝑈, and when no dynamics in the optics, we are left with the second term only and 
+must ensure our scene is dynamic to get a signal. The literature mostly considers a translating point-source when doing 
+analytical derivations for this problem, and as will be discussed later, this imposes challenges and restricts the range 
+of what can be derived.
+The pixel converts irradiance to events in three stages. The photoreceptor is logarithmic, so the sensed quantity is
+PAGE 4
+𝐿(𝒓𝑖,𝑡)= log 𝐼(𝒓𝑖,𝑡), (3)
+where 𝐼(𝒓𝑖,𝑡) is understood as the irradiance spatially-integrated over the active area of pixel 𝑖. The source-follower 
+buffer then applies a low-pass response. Circuit-derived models generally require a second-order description, with 
+the photoreceptor and buffer contributing separate poles [15], with one pole typically dominating [16], and intensity 
+dependant [17], [18]. In this analysis we retain only one dominant pole,
+𝜏pr𝑉̇+ 𝑉 = 𝐿, (4)
+with 𝜏pr representing front-end time constant. We emphasise the order of these two stages: the logarithm precedes 
+the filter, so 𝑉 is a filtered log-irradiance and not the logarithm of a filtered irradiance.
+The change detector compares 𝑉 against a stored reference. Neglecting second order pixel latency mechanisms, an 
+event is emitted at the first instant the departure reaches the contrast threshold,
+𝑡𝑘 = inf{𝑡 > 𝑡𝑘−1 + 𝜌 : |𝑉(𝒓𝑖,𝑡)− 𝑉ref| ≥ 𝐶}, (5)
+with polarity 𝑝𝑘 given by the sign of the departure. Here inf{} denotes the infimum, and reads as the first instant at 
+which the threshold is reached, while also covering the case where no crossing occurs with inf{∅} = +∞. The pixel 
+is then inactive for a refractory period 𝜌, after which the reference is updated to the current value,
+𝑉ref ← 𝑉(𝒓𝑖,𝑡𝑘 + 𝜌). (6)
+For convenience, thresholds are taken to be symmetric, 𝐶+1 = 𝐶−1 = 𝐶, as we will mostly discuss monotonously 
+rising signals. The output is the event stream 𝑒𝑣 = {𝑒𝑘} with 𝑒𝑘 = (𝒓𝑘,𝑡𝑘,𝑝𝑘). We note that the reset convention in 
+relation (6) costs one refractory period of signal per event: under a constant “drift” signal 𝑔 in 𝑉, successive events 
+are separated by
+Δ𝑡 = 𝐶/𝑔 + 𝜌 (7)
+rather than by 𝐶/𝑔, and offsets every statistic reported below by a predictable amount.
+The one noise source retained is photon shot noise, on the grounds that it belongs to the light rather than to any 
+particular circuit model. Photon arrival is Poisson, so the count collected in an interval Δ𝑡 is
+𝑁(𝒓𝑖,𝑡)∼ Poisson(Φ𝐼(𝒓𝑖,𝑡)Δ𝑡), (8)
+with Φ the photoelectrons per second per unit irradiance. This noise enters before the logarithm and before the filter.
+We omit, for now, event latency, higher-order front-end dynamics, and all noise sources other than photon statistics. 
+In-depth pixel-model treatment [15], [16], [19], [18], [20] can help develop the details of how each statistics carries 
+the optical weight - while the aim of this work is to treat analytical statistical relations between input and output, and 
+perhaps assist in developing newer models [21]. We will, however, discuss aspects of threshold non-uniformity across 
+the array [22], and how they may introduce MTF errors, as this aspect is mostly overlooked in the literature.
+III. Probes and event statistics
+A. Specifying the system and the probe
+For an incoherent LSI system the OTF is the Fourier transform of the intensity PSF, normalised at zero frequency 
+[23],
+𝐻̂(𝜈)= ℱ︀{ℎ}(𝜈)
+ℱ︀{ℎ}(0), (9)
+and the MTF is its modulus, 𝑀(𝜈)= |𝐻̂(𝜈)|. The normalisation at zero frequency, dividing out the total flux 
+transferred by the system, ensures the MTF describes how contrast, rather than absolute irradiance, is transferred as a 
+function of spatial frequency.
+The PSF and the MTF are therefore two representations of one quantity, and either may be measured directly (A 
+point source for PSF and sinusoidal target for MTF). This equivalence is a result of the linearity in irradiance on 
+the FPA, which is a property of the LSI optics. However, for EVS a direct access to each will require an additional 
+step. We will later examine each probe’s statistical projection by its ability to reproduce a linear transformation from 
+a PSF-based measurement to a MTF. For a one-dimensional diffraction-limited system with a clear rectangular pupil 
+the MTF (Fig. 1(c)) is the autocorrelation of that pupil,
+𝑀(𝜈)= max(0,1− |𝜈| /𝜈𝑐), (10)
+with 𝜈𝑐 the cutoff frequency, and the corresponding intensity PSF (Fig. 1(d)) follows by inverse transform as
+PAGE 5
+ℎ(𝑥)= 𝜈𝑐sinc2(𝜈𝑐𝑥). (11)
+We adopt equations (10) and (11) for every numerical result below. This will supply a ground truth against which 
+each statistic can be benchmarked, by recovering the original MTF from the spatial Fourier transform on a function 
+of the event statistics.
+The classical PSF measurement illuminates the system with a constant point source and records the intensity 
+distribution on the sensor. For an event sensor the probe must also carry a temporal profile, and we write it as a spatial 
+Dirac impulse at 𝒓0 modulated by an as-yet-unspecified profile 𝑑(𝑡),
+𝐷(𝒓,𝑡)= 𝛿(𝒓 − 𝒓0)𝑑(𝑡). (12)
+Acting with the optical operator, and adding a uniform ambient background 𝐼bg, gives the focal-plane irradiance
+𝐼(𝒓,𝑡)= ℎ(𝒓 − 𝒓0)𝑑(𝑡)+ 𝐼bg. (13)
+We refer to 𝐼(𝒓,𝑡) as the spatio-temporal point response under the probe 𝑑(𝑡), and to 𝑤𝑖 = ℎ(𝒓𝑖 − 𝒓0) as the optical 
+weight at pixel 𝑖. Recovering the set {𝑤𝑖} is what is meant here by measuring the PSF from events.
+The background, 𝐼bg in equation (13) is key to ensuring the weight 𝑤𝑖 is not cancelled out during the log-
+differentiation at the pixel. Always 𝐼bg > 0, otherwise the weight becomes an additive constant that every difference 
+cancels. In actual measurements, 𝐼bg is always strictly positive as a pixel will always have at least a dark current floor, 
+𝐼dark, to sit on. Stated physically, an event sensor cannot see static multiplicative gain.
+Now, each pixel sees a one-dimensional signal whose temporal shape is the known profile 𝑑(𝑡), and whose only 
+free parameter is 𝑤𝑖. The pixel model of Section II converts that signal to the event stream, ℳ︀: 𝐼(𝒓𝑖,⋅)→ 𝑒𝑣(𝒓𝑖), 
+from which we read a statistic
+𝑺𝑖 ≡ 𝑆[𝑒𝑣(𝒓𝑖)]∈ ℝ𝑚. (14)
+The statistic is computed directly from event times and polarities; counts, intervals, latencies, a response phase, or 
+several of these together. We use event-statistic surface for a per-pixel field of counts, intervals, latencies or related 
+quantities. This is broader than the conventional meaning of a time-surface, which encodes recency through the 
+timestamp of the most recent event, typically with temporal decay [14], [24].
+Because the pixel model acts on each pixel independently, and because the probed signal at a pixel is parametrised 
+by the single scalar 𝑤𝑖, the composite map from weight to statistic is a pointwise monotone encoding function of 
+that weight,
+𝑺𝑖 = 𝑓𝑑(𝑤𝑖), 𝑓𝑑 : ℝ → ℝ𝑚, (15)
+with the form of 𝑓𝑑 set by the probe and by the pixel parameters. Here this encoding function maps into a 𝑚
+-dimensional space of statistical values - however, the literature typically maps into just one, while a higher 𝑚-
+dimensional mapping is genuinely underexplored. We can then write the chain from real weight, 𝑤𝑖, to estimated 
+weight, 𝑤̂𝑖, and to a recovered OTF:
+𝑤𝑖 ⟶ 𝑺𝑖 ⟶ 𝑤̂𝑖 = 𝑓−1
+𝑑 (𝑺𝑖)⟶ 𝐻̂𝑑(𝜈), (16)
+with the recovered OTF
+𝐻̂𝑑(𝜈)= ℱ︀{𝑤̂}(𝜈)
+ℱ︀{𝑤̂}(0). (17)
+We apply the benchmark to each statistic by evaluating |𝐻̂𝑑(𝜈)| against the specified MTF of (10). The fact that 
+𝑓𝑑 is a function of sensor parameters means its identification requires a sensor characterisation step. By laying out 
+several probes and their corresponding independent statistical components, the aim is to build a toolset to enable both 
+characterisation of sensor parameters and the optic transfer function.
+The order of operations described by the chain in (16) is the substantive point. The nonlinearity acts on each pixel 
+independently and is not a convolution, so it is invertible pixel by pixel. Because 𝑓𝑑 is nonlinear,
+ℱ︀{𝑓−1
+𝑑 (𝑺)} ≠ 𝑓−1
+𝑑 (ℱ︀{𝑺}), (18)
+so a Fourier transform applied to the raw statistic yields the transform of a warped PSF, which is not the OTF and 
+does not converge to it as noise is reduced. Inverting first and transforming second recovers the OTF, often at the cost 
+of requiring the probe and the pixel parameters to be known. We will discuss in detail what each statistic requires in 
+that regard.
+We note an important aspect of this chain: the pointwise property of relation (15) holds because the probe supplies 
+the entire temporal variation, so that a pixel’s history is abstracted out. This allows the typically stateful behaviour of 
+PAGE 6
+ℳ︀ to be disentangled, and directly relate the measured time-surface to the optical weight and the pixel parameters. And 
+although 𝑤𝑖 is the elementary component from which an extended object would classically be composed, recovering 
+{𝑤𝑖} does not by itself make the equations chain (16) a scene-reconstruction procedure for a general input. Due to 
+the log operation of ℳ︀ the response to two sources is not the sum of the responses to each. Equations chain (16) 
+is established here first and foremost to interrogate the optics and the sensor, and discussing its role as an inverse 
+function to restore a scene is taken up in Section V, as a hypothesis.
+B. The step probe
+The simplest probe is a step in irradiance,
+𝑑(𝑡)= 𝐴 𝑢(𝑡− 𝑡0), (19)
+which is a standard stimulus for measuring contrast threshold and latency in event sensors [25], [2], and the closest 
+analogue of the classical constant point source illumination used in static image pipelines. Its derivative is the impulse 
+response, and therefore justifying its use for many EVS characterisation problems. As shown in Fig. 2(a), each pixel’s 
+log-irradiance mean makes jumps from log 𝐼bg to log(𝐼bg + 𝑤𝑖𝐴), and a finite burst of ON events is emitted before 
+falling silent. The range of that step for each pixel is
+Δ𝐿𝑖 = log( 1+ 𝑤𝑖𝐴
+𝐼bg
+) , (20)
+and every statistic below is a function of this local excitation. The natural statistic is the event count, and without 
+accounting for the refractory period it is approximated by the range divided by the threshold,
+𝑁𝑖 ≈ Δ𝐿𝑖
+𝐶 . (21)
+We may then approximate the optical weight by the inverse
+𝑤̂𝑖 = 𝐼bg
+𝐴 (𝑒Δ𝐿𝑖 − 1)= 𝐼bg
+𝐴 (𝑒𝑁𝑖𝐶 − 1). (22)
+Introducing the refractory period 𝜌 requires returning to the crossing condition of equation (5), since the reference is 
+established only at the end of the refractory period and whatever the signal does during 𝜌 is never measured against any 
+threshold. For the single-pole model of equation (4) the response to a step is 𝑉(𝑡)= Δ𝐿𝑖(1− 𝑒−𝑡/𝜏pr), and writing 
+𝑥𝑘 = 𝑒−𝑡𝑘/𝜏pr turns the condition 𝑉(𝑡𝑘+1)− 𝑉(𝑡𝑘 + 𝜌)= 𝐶 into the linear recursion
+𝑥𝑘+1 = 𝑒−𝜌/𝜏pr𝑥𝑘 − 𝐶/Δ𝐿𝑖, (23)
+with 𝑥1 = 1− 𝐶/Δ𝐿𝑖, since no refractory window precedes the first event. The burst ends when 𝑥𝑘 reaches zero, 
+at which point the source-follower voltage has settled and no further crossing occurs. Solving the recursion about its 
+fixed point and taking that limit gives the expected event count,
+𝑁𝑖 = 𝜏pr
+𝜌 log
+(
+ 1+
+Δ𝐿𝑖(1− 𝑒−𝜌/𝜏pr)
+𝐶 )
+ . (24)
+Being a monotone function, we may invert to estimate the optical weight similar to equation (22), providing us with
+𝑤̂𝑖 = 𝐼bg
+𝐴 (𝑒Δ𝐿̂ 𝑖 − 1),
+Δ𝐿̂𝑖 = 𝐶
+1− 𝑒−𝜌/𝜏pr
+(𝑒𝑁𝑖𝜌/𝜏pr − 1).
+(25)
+Two cascaded exponentials appear here, with the outer following the logarithmic photoreceptor, and the inner due 
+to a refractory-limited burst for the single-pole pixel model.
+For pixel 𝑖 we write the event times following onset as 𝑡𝑖,1 < 𝑡𝑖,2 < … < 𝑡𝑖,𝑁𝑖
+, all of ON polarity, with intervals 
+Δ𝑡𝑖,𝑘 = 𝑡𝑖,𝑘+1 − 𝑡𝑖,𝑘. Three components of 𝑺𝑖 are considered for this probe:
+• the event count 𝑁𝑖, of (24);
+• the onset latency ℓ𝑖 = 𝑡𝑖,1 − 𝑡0, the delay of the first event from the probe onset;
+• and the first interval Δ𝑡𝑖,1.
+The aim is to show how a useful set is arrived at and what each member on this list contributes, first to probe-based 
+characterisation and later to event-based processing pipelines. With more complex pixel models, additional statistics 
+PAGE 7
+Fig. 2. A step probe. (a) The simulated log-irradiance of a pixel (gray line), its source-follower voltage (blue), and the emitted events (green triangles) 
+with their corresponding reference voltage (dashed line) as responding to a step function increase of intensity from 𝐼bg = 2.5 ⋅ 106 photons/sec to 
+𝐼 = 1.8 ⋅ 109 photons/sec, and a a contrast threshold of 𝐶 = 0.25 log units. (b) For the full 1-D sensor response to the step, with a spatial intensity 
+distribution profile as in Fig. 1(d), where events per pixel are presented as green marks - with a maximal event count of 9 for the highest intensity 
+step, and an overall count of 173 events over the 101 simulated pixels. (c) The pixel-intensity weight estimation (normalised) from equation (25), 
+compared to the ground truth pixel weights, and a dashed line to rks expected for ideal reconstruction. (d) The estimated MTF from the inverted 
+event-count from equation (17) (blue line), compared to the non-inverted attempt to measure MTF from counts (brown line), and the specified 
+ground-truth MTF (dashed line). Similarly, the non-inverted and inverted estimation of MTF are presented for (e) the latency from step onset, and 
+(f) first ISI. Corresponding RMS error for the estimation across the entire band is 7.7%, 10.8%, and 5% for the count-based, first event latency, 
+and first ISI respectively.
+PAGE 8
+may be considered. Not every statistic here is defined at every pixel: the interval requires 𝑁𝑖 ≥ 2 and the latency 𝑁𝑖 ≥
+1, while a count of zero is itself a measurement.
+All three recover the same underlying log range Δ𝐿𝑖 of equation (20), and also share the outer inverse of equation 
+(25). They differ in how that range is read from the event stream,
+Δ𝐿̂𝑖 =
+{
+ 𝐶
+1− 𝑒−𝜌/𝜏pr
+(𝑒𝑁𝑖𝜌/𝜏pr − 1) (count)
+𝐶
+1− 𝑒−ℓ𝑖/𝜏pr
+(latency)
+𝐶(1+ 1
+𝑒−𝜌/𝜏pr − 𝑒−Δ𝑡𝑖,1/𝜏pr
+) (first interval).
+(26)
+The three differ in what must be known and in how they degrade. The count and the first interval each require the 
+three sensor parameters 𝐶, 𝜌 and 𝜏pr, as does the first interval measure. The latency fitting, however, requires only 
+𝐶 and 𝜏pr, but in exchange requires the probe onset 𝑡0 to be known exactly. Whether that is a saving depends on 
+the experiment: in a characterisation rig the onset is a trigger and is free, whereas an optical system driven by an 
+uncontrolled excitation supplies no such reference.
+Observing a sample simulation output for a single pixel in Fig. 2(a), the log-irradiance transitions from 𝐼bg = 2.5 ⋅
+106 photons/sec to 𝐼 = 1.8 ⋅ 109 at 𝑡0 = 0.5𝑠 as shown by the grey line. The blue line follows the simulated source-
+follower voltage, smoothed by the single-pole filter, and responding to the step with a delay according to 𝜏pr. The 
+emitted events are then plotted as green triangles whenever 𝑉 crosses a contrast threshold value, set here to be 0.25, 
+and a new static reference voltage is set (dashed line) after an additional 𝜌 = 300𝜇𝑠. For an array of 101 pixels exposed 
+to this step response through simulated optical operator ℎ(𝑥) as in equation (11), we get a raster plot of events across 
+time and pixel-space in Fig. 2(b).
+With the event-count statistic, and using the inverse of equation (25), we recover the illumination weight per pixel, 
+𝑤𝑖. Normalising this value to the maximal 𝑤𝑖 and plotting against the ground truth, as shown in Fig. 2(c), we note 
+a good fit generally for higher values and reduced performance for lower weights, fitting the floored-value nature of 
+an event count for low signals. Nonetheless, reconstructing the MTF using equations (16) - (17), as shown in the blue 
+line in Fig. 2(d), yields an estimate of the original MTF (dashed line) down to a 7.7% Root Mean Square (RMS) 
+error, and considerably better than the attempt to naively infer the MTF from counts alone. Higher frequency artefacts 
+are expected, as evident from the sidelobes of the reconstructed MTF. For a MTF reconstruction using the onset 
+latency alone we get an RMS error of 10.8% - resulting from a small variations in latency (due to photon shot-noise) 
+being amplified through the Δ𝐿̂𝑖 relation, but with evidently reduced high-frequency sidelobes in relation to the count 
+(Fig. 2(e)). Highest performance is achieved with the first ISI, reaching a 5% ground truth fitting to MTF with the 
+same data, and no sidelobes. however, all these reconstructions are highly unstable when variations in probe parameters 
+and noise is introduced, as will be discussed in Section IV, making this a finicky tool at best.
+C. The linear ramp
+A linear rise,
+𝑑(𝑡)= 𝛼(𝑡− 𝑡0), (27)
+produces a log-irradiance that rises monotonically but with an ever-decreasing slope. The major difference from the 
+step response is that a pixel continues to emit events throughout the record, which is both a blessing and a curse: 
+realising this probe in the laboratory requires a source with adequate range, but we will see that 𝑤𝑖 is better estimated 
+for a comparable event count to that of the step-probe.
+Writing 𝑠 = 𝑡− 𝑡0 and collecting the pixel-dependent terms into a characteristic time
+𝑇𝑖 = 𝐼bg
+𝑤𝑖𝛼, (28)
+the log-irradiance at pixel 𝑖 becomes
+𝐿𝑖(𝑠)= log 𝐼bg + log(1+ 𝑠/𝑇𝑖), (29)
+a function of 𝑠/𝑇𝑖 alone. In contrast to the step probe in equation (20), where the optical weight sets the amplitude 
+of the excursion, under a linearly rising ramp it sets its time scale . The input signal change itself is unbounded, so 
+there is no equivalent of Δ𝐿𝑖 to recover, and every statistic below estimates 𝑇𝑖 instead.
+PAGE 9
+Applying the crossing condition of equation (5) to equation (29), with the reference taken at the end of the refractory 
+window, gives
+𝑇𝑖 + 𝑠𝑘+1
+𝑇𝑖 + 𝑠𝑘 + 𝜌 = 𝑒𝐶. (30)
+To extract how this evolves over the event series per pixel we define the variable 𝑢𝑘 = 𝑇𝑖 + 𝑠𝑘 as the linear recursion 
+𝑢𝑘+1 = 𝑒𝐶(𝑢𝑘 + 𝜌). Before onset the irradiance is constant, so the reference has settled at log 𝐼bg and the first event 
+carries no preceding refractory window. The initial condition is therefore 𝑢1 = 𝑇𝑖𝑒𝐶, which is the statement that 𝑠1 =
+𝑇𝑖(𝑒𝐶 − 1)> 0. Solving the recursion about its fixed point gives 𝑢𝑘 = 𝑇̃𝑖𝑒𝑘𝐶 − 𝜌𝑒𝐶/(𝑒𝐶 − 1) and hence the ISIs
+Δ𝑡𝑖,𝑘 = 𝑇̃𝑖𝑒𝑘𝐶(𝑒𝐶 − 1), 𝑇̃𝑖 = 𝑇𝑖 + 𝜌
+𝑒𝐶 − 1. (31)
+It is worth being explicit about where the pixel model enters (31). The crossing condition is applied to the log-
+irradiance of (29) rather than to the source-follower voltage, under the assumption that the probe is slowly varying. 
+This means as 𝜏pr ≪ 𝑇𝑖 + 𝑠, the single pole filter of equation (4) acts as a pure delay, 𝑉(𝑠)≈ 𝐿(𝑠− 𝜏pr). What 
+follows is that while the source-follower pole-related delay is common to every crossing at every pixel (assuming 
+array uniformity), it cancels between consecutive events, as long as the slow slope condition applies. The practical 
+outcome is that whenever it is not (steep slope signals), we may just wait, and consider events at regions where the 
+slope flattens enough.
+Inverting (31) at the first interval gives
+𝑤̂𝑖 = 𝐼bg 𝑒𝐶(𝑒𝐶 − 1)
+𝛼(Δ𝑡𝑖,1 − 𝜌𝑒𝐶). (32)
+No exponential of a measured quantity appears. Where the step required the amplitude of (20) to be brought back 
+through the logarithm, a time scale is read from event times directly, and the inverse is affine in the measurement 
+followed by a reciprocal.
+As in Section III.B we take three components of 𝑺𝑖, now the first interval Δ𝑡𝑖,1, the onset latency ℓ𝑖 = 𝑡𝑖,1 − 𝑡0, 
+and the mean inverse interval, or event rate, 𝑅𝑖 = (𝑁𝑖 − 1)−1∑𝑘1/Δ𝑡𝑖,𝑘. Their inverses follow from (31),
+𝑤̂𝑖 = 𝐼bg
+𝛼 ⋅
+{
+ 𝑒𝐶(𝑒𝐶 − 1)
+Δ𝑡𝑖,1 − 𝜌𝑒𝐶 (first interval)
+𝑒𝐶 − 1
+ℓ𝑖 − 𝜏pr
+(latency)
+[Γ(𝑁𝑖)/𝑅𝑖 − 𝜌/(𝑒𝐶 − 1)]
+−1
+(rate)
+Γ(𝑁)≡ (1− 𝑒−(𝑁−1)𝐶)/((𝑁 − 1)(𝑒𝐶 − 1)
+2
+).
+(33)
+Only one number in each of these inverses has to be known. The recovered OTF of equation (17) is normalised 
+at zero frequency, so any factor shared by every pixel divides out before the transform is taken. In the inverse set 
+(33) the perfector 𝐼bg/𝛼 and every numerator are shared in this way. Recovering the transfer function under a ramp 
+therefore requires a single additive time offset: 𝜌𝑒𝐶 for the first interval, where the front-end delay has cancelled 
+and only the reset convention remains; 𝜏pr for the latency, where the delay survives and the reset convention has 
+not yet acted; and 𝜌/(𝑒𝐶 − 1) for the rate. This is in contrast to the step probe, that requires a pixel model to be 
+recovered as the exponential operation doesn’t scale across pixels, and is not normalised when examining the MTF. 
+Considering, however, more realistic pixel models with multiple-pole response, using steep linear slopes, or starting 
+from low illumination signal, does break some assumptions mentioned earlier. Therefore, examining the full interval 
+histogram and change over time may prove more useful for system identification problems.
+We also note that the inverse needed for the linear probe may often be small. For the first interval, for instance, 
+the offset is 𝜌𝑒𝐶. At the parameters used here it is no more than 4% of Δ𝑡𝑖,1 at the brightest pixel, and less at every 
+other, since dimmer pixels have longer intervals. The reciprocal first interval is therefore already close to proportional 
+to 𝑤𝑖, and the inverse removes a small bias rather than a warp. That bias grows with the ramp rate: a faster ramp 
+shortens the measurement time but makes knowledge of 𝜌 more important.
+For the latency the offset is 𝜏pr, roughly 6% of ℓ𝑖 at the brightest pixel for representative values chosen in our 
+simulation. The latency thus depends on its inverse more than the interval does. It returns something for that dependence: 
+PAGE 10
+Fig. 3. Monotonically rising probes. (a) For a liear rising probe in log-irradiance values, we see continuously emitted events with ever increasing 
+intervals. (b) For a full 1-D sensor simulated response to the input through ℎ(𝑥) the events per pixel are presented as green marks in relation to 
+time. Measurement time and slope value was tuned to produce the overall same count of events as in Fig. 2 - with a maximal event count of 17 
+for the highest intensity step, and an overall count of 174 events over the 101 simulated pixels. Estimation of the specified MTF is shown using 
+(c1) the first interval, (c2) mean rate, (c3) and first event latency, with error RMS roughly 5% for all those methods. For each, we present the 
+inverse-function based estimation (blue line), and direct-from-event estimation (teal-line), compared to the specified ground truth (where teal-line 
+not present, it is underneath the blue line, indicating no inverse is needed in practice). (d) Similarly, an exponentially rising input signal is analysed, 
+(e) also tuned to have a similar event count across the array (17 events at peak pixel, and 172 event in total), and an MTF reconstruction error of 
+(f1) 4.4% for first interval inverse, and (f2) 6.1% for first event delay. (g) Presenting the optical weight estimated from the first interval shows ideal 
+match to the expected value for each pixel, indicating the MTF error is only attributed to discretisation error (sub-threshold pixels).
+plotting ℓ𝑖 against 1/𝑤̂𝑖 gives a straight line whose intercept is 𝜏pr, so a ramp measurement can also report the front-
+end time constant.
+The rate statistic differs in its role. Every interval is proportional to the same 𝑇̃𝑖, so no interval beyond the first 
+carries new information about 𝑤𝑖, and averaging over them acts to only reduce the variance of the estimate. Averaging 
+does introduce one dependence: the reciprocal intervals form a geometric series that saturates after a few terms, while 
+the divisor 𝑁𝑖 − 1 keeps growing with the observation window. The factor Γ(𝑁𝑖) in equation (33) corrects for this. 
+The correction is mild, since 𝑁𝑖 varies only logarithmically with 𝑤𝑖 while 𝑇̃𝑖 varies over decades, so the raw rate 
+already tracks the weight closely. What might be uncovered through tracking this rate, are higher-order pixel model 
+parameters, and specifically those illusive intensity dependant ones.
+Compared with the step probe of Section III.B, the ramp recovers the MTF more accurately from every statistic 
+considered, and does so without the quantisation that limits an integer-valued count. The reason is visible in equation 
+(33): each estimate is a continuous function of a measured time, so its resolution is set by the temporal precision of 
+the sensor rather than by the contrast threshold. The cost is that the probe must be constructed so the ramp is sustained 
+over the measurement period.
+D. The exponential ramp
+An exponentially rising irradiance,
+𝑑(𝑡)= 𝐴 (𝑒(𝑡−𝑡0)/𝜏𝛼 − 1), (34)
+is the probe matched to a logarithmic photoreceptor. Writing 𝑠 = 𝑡− 𝑡0 as before, the irradiance at pixel 𝑖 is 𝐼𝑖(𝑠)=
+𝐼bg + 𝑤𝑖𝐴(𝑒𝑠/𝜏𝛼 − 1), and the sensed quantity is
+𝐿𝑖(𝑠)= log[(𝐼bg − 𝑤𝑖𝐴)+ 𝑤𝑖𝐴 𝑒𝑠/𝜏𝛼 ]. (35)
+Once the second term dominates, this tends to
+𝐿𝑖(𝑠)→ log(𝑤𝑖𝐴)+ 𝑠/𝜏𝛼. (36)
+The consequence is the defining property of this probe. The log-irradiance approaches a straight line whose slope 
+is 1/𝜏𝛼 at every pixel , and the optical weight only applies an additive offset to this slope.
+Applying the crossing condition of (5) to (36) gives
+(𝑠𝑘+1 − 𝑠𝑘 − 𝜌)/𝜏𝛼 = 𝐶 ⇒ Δ𝑡𝑘 = 𝐶𝜏𝛼 + 𝜌, (37)
+for every pixel at every event index, past the asymptotic first few events close to 𝐼bg. The weight, however, has not 
+been lost - it has moved into the timing of the burst. The first crossing occurs when 𝐿𝑖 has risen by 𝐶, and solving 
+equation (35) at that point, without any asymptotic approximation, gives the onset latency
+PAGE 11
+ℓ𝑖 = 𝜏𝛼 log( 1+ 𝐼bg(𝑒𝐶 − 1)
+𝑤𝑖𝐴 ) , (38)
+which inverts to
+𝑤̂𝑖 = 𝐼bg(𝑒𝐶 − 1)
+𝐴(𝑒ℓ𝑖/𝜏𝛼 − 1). (39)
+As under the linear ramp, the front-end pole adds a delay 𝜏pr to ℓ𝑖 once the signal is slowly varying, though it 
+scale against the probe exponential time constant. For relatively small 𝜏pr/𝜏𝛼, this delay can be made negligible. The 
+inverse of the measured latency in equation (39) contains the factor 𝐼bg(𝑒𝐶 − 1)/𝐴, which is shared by every pixel 
+and divides out under the zero-frequency normalisation of equation (17). Recovering the transfer function under this 
+probe therefore requires no sensor parameter at all, to within the small 𝜏pr/𝜏𝛼 assumption noted above.
+The defining probe property in equation (37) can be exploited in various imaginative ways. Because it holds at 
+every pixel regardless of illumination, the interval reports 𝐶𝜏𝛼 + 𝜌 across an array whose pixels differ by orders of 
+magnitude in the light they receive. Using this probe, for instance, with unstructured illumination (full frame - and 
+without managing illumination uniformity) will provide a measure of 𝐶𝜏𝛼 + 𝜌, and repeating the measurement with 
+another 𝜏𝛼, for instance, may retrieve pixel-level contrast threshold and refractory period variation across the array. 
+Threshold, photoreceptor bandwidth and refractory period are separately bias-controlled quantities that jointly set the 
+event rate [26], so a probe that separates them without requiring uniform illumination is of practical value.
+In essence, a simple EVS model ℳ︀ under an exponential ramp divides into a part that is stationary in time, 
+carrying only sensor parameters (equation (37)), and a phase, that carries only the optical weight (equation (38)). This 
+combination is useful beyond this statement. For one, equation (37) can be considered a null test - and as we predict 
+an interval independent of 𝑤𝑖, any measured dependence is a departure from the model. Following the evolution of 
+Δ𝑡𝑖,𝑘 will uncover instability or intensity dependant front-end bandwidth, contrast thresholds, or refractory periods. 
+Secondly, equation (38) has a knee at 𝑤𝑖𝐴 = 𝐼bg(𝑒𝐶 − 1), and this can be used to measure 𝐼bg - especially useful 
+when no background illumination is present to uncover dark current values. A third avenue for this tool is considered 
+as we return to equation (2), where we asserted that our optical transfer function, ℎ(𝑥), is static. This assumption 
+enabled the derivation under the evolution of 𝑈(𝑥) alone, but limited the usefulness of the probe to derive response 
+to a dynamic-OTF - where 𝜕ℎ/𝜕𝑡 ≠ 0. With such clear functional separation of components, analysis of dynamic-
+OTF may be fully explored.
+Practically, the exponential probe might be the least convenient to realise for characterisation purposes (potentially 
+a current-driven LED with a logarithmic driver, or a fine geometric staircase with high bit-depth digital controller), 
+but the above potential benefits argue for this probe’s case.
+IV. Noise and non-uniformity
+The analytics above considered the probes under a single noise condition, the photon rate Poisson limit, which is 
+mostly “muted” as the value is set high enough. In this section we vary two noise sources independently and consider 
+how they effect the relations shown above.
+The first is photon shot noise, which belongs to the light itself rather than any other noise introduced by the system. 
+Its effect on the sensed quantity is a fluctuation 𝜎𝑉 ∼ 1/√2Φ𝐼bg𝜏pr on the source-follower voltage, and we report it 
+as 𝜎𝑉 /𝐶, the fluctuation in units of the contrast threshold. The second is purely sensor-level component: the contrast-
+threshold mismatch. As a pixel specific threshold 𝐶𝑖 is a variation around a nominal 𝐶 value (emulated here with 
+normal distribution with standard deviation 𝜎𝐶), the inverses of Section III.B to Section III.D are calculated for the 
+nominal value alone. This type of “fixed-pattern noise” [22] does not average away over repeated measurements, and 
+we report it as 𝜎𝐶/𝐶. For each condition the weight is recovered separately in every noise realisation and the MTF 
+error computed from each, so we plot the expected error of a single measurement rather than the error for an average 
+of many repeated reconstruction experiments.
+A. Photon shot noise
+All statistics show a trend of degrading with 𝜎𝑉 /𝐶 and fail between 𝜎𝑉 /𝐶 ≈ 1 and 2, which is the point at which 
+a fluctuation is comparable to the threshold itself and crossings cease to be signal driven. Two features of the ordering 
+are worth noting.
+PAGE 12
+Fig. 4. Noise mode analysis for probes and their statistics. We consider the evolution of MTF estimation error with increased Poisson shot-noise 
+for the (a) step function probe, (b) linear rise probe, and (c) exponential rise probe. The x-axis presents the standard deviation of the photon noise 
+(estimated as the square root of the inverse photon flux), and normalised to the contrast ratio. For each we considered how the different statistical 
+inverse chain performs, as detailed in Section III: event count 𝑁𝑖 (blue line), first latency value 𝑙𝑖,1 (red line), and first ISI Δ𝑡𝑖,1 (yellow line) for 
+step probe; first ISI Δ𝑡𝑖,1 (yellow line), Rate 𝑅𝑖 (purpel line), and first latency value 𝑙𝑖,1 (red line) for linear rise probe; first event time 𝑡𝑖,1 for 
+the exponential rise probe. Generally we see how the probes fail as the noise becomes equivalent to the contrast ratio (𝜎𝐶/𝐶 ∼ 1). Similarly, we 
+consider how cross-pixel contrast threshold mismatch effects the MTF error, with (d) a step function probe analysis failing with any variation above 
+5%, while (e) a linear rise probe maintaining sub 20% accuracy even with 15% mismatch values, and the (f) exponential rise performing well even 
+with around 20% normal mismatch.
+The under low noise, we see the ranking as shown in Fig. 2, where the first interval performs best, and then an 
+event count second (bounded by quantisation), and the latency performing the lowest (based on only a single event). 
+Then, when the relative noise reaches 𝜎𝑉 /𝐶 ≈ 0.4 we see all three statistics reaching the same level of performance 
+up until 𝜎𝑉 /𝐶 ≈ 1, where now the first interval fails first.
+For the ramp-based probes, the trend is monotone for all methods. We see the latency value for the linear slope 
+performs best across all noise levels within this probe - and the first event time for the exponential rise probe following 
+the same trend of this best performing statistic. These only fail after 𝜎𝑉 /𝐶 ≈ 1. The other metrics for the linear rise, 
+Δ𝑡1 and rate, fail somewhat earlier but, in opposed to the latency metric, do not need the reference “onset time” 𝑡0 to 
+be known. Having no such “independent” test for the exponent rise, we tested the delay value from a reference first-to-
+spike-pixel as the “onset time”, and see a similar good performance in low noise levels, with a similar earlier failing 
+point (data not shown).
+B. Contrast-threshold mismatch
+This is a system-level noise and chosen for analysis with 𝐶 being a central parameter of any inverse function above. 
+With this we see the step probe deteriorates very quickly, for any mismatch above with more than 5% of nominal 
+values quickly entering the a specified MTF reconstruction error of more than 20% across all statistical analysis modes.
+The reason is visible from the inverse function themselves. Under a step, the measured count carries the true per-
+pixel threshold, so substituting it into an inverse that assumes the nominal value gives Δ𝐿̂𝑖 = Δ𝐿𝑖𝐶/𝐶𝑖, and after 
+the outer exponential
+𝑤̂𝑖/𝑤𝑖 ≈ exp(−Δ𝐿𝑖𝛿𝐶𝑖/𝐶). (40)
+The error is exponential in the mismatch and amplified by the log range of the probe. Alternatively, under both 
+ramps the threshold appears in the inverse only through a factor shared by every pixel, which the zero-frequency 
+normalisation of equation (17) removes, and the residual sensitivity, 𝜅 ≡ d log(𝑤̂𝑖/𝑤𝑖)/ d(𝛿𝐶𝑖/𝐶), is
+PAGE 13
+𝜅 = {𝐶(1+ (1− 𝑒−𝐶)−1) first interval
+𝐶𝑒𝐶/(𝑒𝐶 − 1) latency
+(41)
+which is of order unity and, unlike equation (40), and independent of the probe’s dynamic range.
+A second consequence of equation (40) is that the per-pixel error is lognormal in the mismatch, so a step-probe 
+measurement will not fail gradually with mismatch distribution. A particular realisation of the mismatch pattern, for 
+instance with a scattered sensitive pixel and/or dead pixels, will prove detrimental for MTF retrieval from a step probe, 
+and such a sensor should be evaluated through ramp-based probes.
+C. Reading the two together
+The above shows how each probe varies with noise modes, with step-probe performing somewhat better under high 
+photon noise, and ramps resilient to sensor mismatch, but only while light is sufficient. This bears directly on how 
+a measured transfer function should be reported. A MTF recovered from an event stream is not a property of the 
+optics alone; it is a property of the optics, the sensor and the probe jointly, and two measurements of the same lens 
+through the same array under different probes will carry different sensitivity to the same non-uniformity. Recent calls 
+for shared calibration and metadata conventions in event-based vision [21] are, on this reading, partly a request for the 
+excitation to be reported alongside the result.
+These results are indicative and are not a noise analysis. Part of the degradation seen at high noise is the loss of 
+support (less participating pixels) rather than the corruption of the measurement. The error metric is bounded above, so 
+it does not distinguish degrees of failure once a reconstruction has failed. What we take from Fig. 4 is the ordering of 
+the probes and its explanation in (40) and (41), and an call to be explicit in defining noise modes, excitation methods, 
+and pixel model whenever benchmarking EVS performance.
+V. Discussion
+A. What is a dynamic- PSF
+The term “dynamic-PSF” might be attributed to various parts of a EVS-based system, and we start this section by 
+unmasking this definition. As in equation (2), the full change signal on the FPA will be built from both scene dynamics 
+and any dynamics introduced by the optical operator. Separating the two origins by definition is not an option, for 
+three reasons. The first is the frame of reference choice, where, for instance, a translating camera is scene motion in 
+the camera frame and optics motion in the world frame, while the event stream is identical in both. Any definition, 
+then, must nominate a frame - and this choice is arbitrary or stems from design considerations, and not from the core 
+definition of what a PSF is. Secondly, adding active control – when the OTF is also a function of the signal – as in 
+adaptive optics, autofocus or closed-loop steering, the two terms of (2) are not merely simultaneous but correlated. 
+The third is evident from (2) itself: the event stream is a functional of the sum of the two terms, and no operation 
+applied to that stream alone splits it.
+From this it follows that a dynamic-PSF is defined whenever 𝜕𝐼/𝜕𝑡 ≠ 0 at fixed 𝒓, irrespective of which term of 
+equation (2) supplied the derivative. The price of this choice is that the PSF ceases to be a property of the optics 
+alone, so every use of it must be accompanied by the excitation that produced it. When working with frame-based 
+sensors, this aspect didn’t often pose an issue, as the senor integrated over a time-frame, and any changes in the optics 
+where instantaneous and time-averaged [13]. However, for EVS there is no such luxury, and a dynamic-PSF should be 
+reported together with the origin of its dynamics, scene-based, optics-based, or both.
+B. From a probe to a scene
+The reprocussions of the fused definition above is most sever when considering the classical signals-and-systems 
+approach used to describe a LSI system only by its response to specific probes, and then predict its response to any 
+input. In CI, for instanse, a PSF is a powerful tool used to represent the optics’ response to a “component” of a scene, 
+and this is often used to computationally predict the response of a full multi-component scene and, moreover, to later 
+solve the inverse problem.
+In this work, the chain of equation (16) holds because the probe supplies the entire temporal variation, and because 
+every pixel of the array shares a single onset 𝑡0. Those two conditions make the encoding function of equation 
+(15) pointwise in the optical weight and any signal with a shared onset time, such as can be manufactured by a 
+characterisation rig, satisfies both conditions. A dynamic scene, however, does not satisfy these conditions. Components 
+at different positions carry different temporal profiles and arrive at different times, so a pixel sees a superposition
+PAGE 14
+𝐿𝑖(𝑡)= log( 𝐼bg + ∑
+𝑗
+𝑤𝑖𝑗 𝑑𝑗(𝑡− 𝑡𝑗)) , (42)
+with the index 𝑗 running over scene components. Two properties of Section III are lost at once. The excitation at a 
+pixel is no longer parametrised by the single scalar 𝑤𝑖, so equation (15) is a functional of the superposition rather than 
+a function of a weight; and because the photoreceptor is logarithmic, the response to two components is not the sum 
+of the responses to each. Recovering {𝑤𝑖} under a single probe is accordingly not a scene reconstruction procedure, 
+and none of the inverses of Section III should be read as such.
+What is missing is a composition rule. A decomposition tool requires, first, an operation on the statistic space under 
+which the statistic of a superposition is built from the statistics of its components. This to say, we find a probe and 
+statistic pair for which 𝑓𝑑 becomes an eigenfunction of a given event statistic, and then relating scene composition to 
+statistic composition, rather than merely an invertible map on a single weight. It requires, second, that onset diversity 
+enter as a variable of the framework rather than as the fixed parameter it is here. None of these are supplied by 
+the probes listed in this work, and the progress needed to supply them is analytical rather than experimental (for the 
+simplified pixel model at first). Third, it requires that the statistic set carry both what and when, and in a mode that is 
+fundomentally separable. We expect that accumulative statistics that are stationary in time report only that a component 
+is present, while phase-like statistics place it on the time axis, and a spatio-temporal decomposition needs to observe 
+both channels at once.
+Such behaviour is seen, to a limited extent, in the statistics of the exponential rise probe, and might hint at similarly 
+derived probes to deliver this scene composition. There, a simple pixel model divides into a part that is stationary 
+in time and carries only sensor parameters, equation (37), and a phase that carries only the optical weight, equation 
+(38). A separation of that kind is what a decomposition needs, an amplitude-like channel that identifies a component 
+and a phase-like channel that places it in time, obtained in a domain where the logarithmic nonlinearity has already 
+been absorbed.
+This work uses the bare probe to interrogate the optics and the sensor with no full spatio-temporal scene present. 
+The second phase to follow on must consider a scene as a superposition of probe components with the event statistics 
+deciding whether that decomposition is recoverable under noise. A probe chosen as an eigenfunction of a given event 
+statistic is our conjecture for a full CNI framework.
+C. The moving point source is a time-limited step
+We address here a widely used translating point source - where an illumination source is moved across the array, and 
+presents each pixel with a rise and a fall of its local irradiance. Per pixel the excitation is a step up followed by a step 
+down, with a dwell time set by the transit speed and the width of the PSF. Everything derived in Section Section III.B 
+therefore applies, subject to two constraints that the step probe does not carry. The excursion is time-limited, so the 
+burst may be truncated before Δ𝐿𝑖 of equation (20) is reached; and adjacent pixels see the same excitation at different 
+times, so the array is not probed simultaneously and the single-onset condition used above does not hold.
+A large fraction of event-camera characterisation uses a moving dot, a rotating disc or a translating target. The 
+connection between this work to those may curtail any overreaching and generalised claims on EVS performance by 
+a limited-step-probe test (to better of worse), while also stating where this connection work and where not. When 
+dwell time exceeds the burst duration, the count statistic reaches the same Δ𝐿𝑖 as a clean step and the inverse of 
+equation (25) applies unchanged. Where the transit is fast relative to 𝜏pr and the burst is truncated, the count saturates 
+below Δ𝐿𝑖/𝐶 and the inverse under-reports the weight. The dimmer the pixel, the earlier this bites, so the truncation 
+is weight-dependent and does not divide out under the zero-frequency normalisation of equation (17). The recovered 
+PSF is narrowed at its tails, and the recovered MTF correspondingly overstates transfer at high spatial frequency.
+Here is an example of where such details matter. Event-based Fourier light-field microscopy calibrates a 3D PSF 
+from an event stream generated by a translating bead, takes its spectrum as an MTF, and reports agreement with frame-
+based reference alongside an observed axial narrowing [9]. At the transit speed used there, the dwell-limited effect 
+above is negligible - but two effects that are not remain: pixels below 𝑤min = (𝐼bg/𝐴)(𝑒𝐶 − 1) report nothing, and 
+a statistic taken as a proxy for irradiance without the inverse of equation (18) carries the log warp. The first narrows 
+the recovered support, the second broadens the apparent profile, and their balance depends on where the threshold sits 
+within the profile, making the achieved correlation difficult to extrapolate to other parameter domains (faster objects, 
+different illumination regimes, etc.).
+PAGE 15
+D. Polarity, modulation and composite probes
+Two choices in Section II reflect a conveniences for deriving the observations in this work, and an additional step 
+must be taken to expand the results out to hardware-relevant results. Thresholds were taken symmetric, 𝐶+1 = 𝐶−1 =
+𝐶, and every probe considered is monotonically rising, so the analysis is carried entirely by ON events. Real devices 
+bias the two polarities independently and the asymmetry is routinely tens of percent, so a probe with both rising and 
+falling segments makes polarity an additional axis of 𝑺𝑖 at no measurement cost, and the inverses must be derived per 
+polarity. We leave that to future work, and note only that the derivation follows the same route as Section III rather 
+than needing a new one.
+The natural continuation is the periodic probe. Modulated illumination is already used across the field: for bias 
+and event-rate control [26], for radiance recovery from event frequency [27], for frequency-tagged structured light 
+[28], and for contrast-threshold calibration by a linear intensity ramp [29]. The contribution available there is not the 
+stimulus but the correspondence: which statistic of the modulated stream carries the spatial transfer function, what 
+its inverse is, and which sensor parameters that inverse requires. A companion observation on the temporal axis, that 
+the frequancy components of an event stream attenuates coefficients below the peak signal frequency and injects non-
+physical harmonics [30], is the direct analogue of equation (18) and indicates what such an analysis has to control for.
+Composite probes follow from the same treatment. A staircase (combining the step and ramp probes), a modulated 
+square wave and a chirp trade dynamic range, frequency coverage, and correlated statistics against each other, and 
+each admits the same chain of equation (16) once its statistic is nominated.
+E. Pixel models, simulators and hardware
+The pixel model of Section  II retains a single front-end pole. A second-order front end will directly influence 
+the early intervals, since the transient is where the second pole lives. The linear-ramp derivation of Section  III.C 
+assumes that the single pole acts as a pure delay which cancels between consecutive events; a second pole breaks that 
+cancellation, and the first-interval inverse acquires a term that does not divide out under equation (17). The question 
+is whether the first-interval statistic remains the strongest of the three under a two-pole front end, or whether the rate 
+statistic overtakes it.
+Characterised-parameter simulators [18], [19] are not the route to re-deriving the inverses under a more complete 
+model, which is unlikely to be tractable in closed form. Their use is to measure how far the closed-form inverse 
+departs from the simulated truth as each non-ideality is switched on, which yields a validity envelope for each probe 
+and statistic pair. The closed-form derived statistics should be used as first-order parameters for informed design (for 
+instance), while elaborate models provide an envelope, rather than a new set of formulas, for these to work within 
+under more realistic scenarios. This approach can be imperative for parametrising universal EVS pixel models [21], 
+using agreed upon coefficients (analytical in first order, and experimental second order values). Hardware in the loop 
+is where this coefficient-based modelling is trully benchmarked. Testing where any closed-form or simulated inverses 
+holds is obviously needed. It is important to ensure in any such future work that readout-level effects (outside every 
+pixel model) such as bus arbitration, timestamp quantisation and event-rate-dependent latency, are properly separated 
+from the internal elements.
+VI. Conclusions
+An event-measured PSF is not the optical one. It is a pointwise nonlinear warp of the optical weight, set jointly 
+by the probe, the pixel model and the statistic read from the stream, and equation (16) states the order of operation 
+that must be taken before any inference on the events can be made physically-relevant. Working that chain through 
+for an idealised EVS sensor, three probes shows the inverses are not equally demanding: the step returns the relative 
+amplitude and needs the full set of pixel parameters to undo an exponential, while the ramps return a time scale and 
+need only a single additive offset, with the exponential ramp requiring no sensor parameter at all once its stationary 
+interval and its phase are read separately. The practical aspect that follows this argument is that any event transfer 
+function that acts to reduce the output dimension in relation to the event stream through a specific statistic – generally 
+call a time-surface – must match excitation to inferred information.
+Acknowledgements
+Use of AI tools.  Claude Opus 5 (Anthropic) was used as an interactive collaborator. Its contributions: literature 
+retrieval and cross-checking against primary sources; independent derivation and verification of the closed-form 
+expressions; review and debugging of the simulation code; structured critique of the manuscript’s argument; and 
+PAGE 16
+drafting of manuscript prose from structure and content specified by the author. All AI-based derivations were checked 
+by the author against the stated pixel model, all claims were verified numerically or traced to a cited source, and all 
+scientific judgements, scope decisions and interpretations are the author’s. The author takes full responsibility for the 
+content. The simulation code for all numerical result is available online1.
+References
+[1] A. Bhandari, A. Kadambi, and R. Raskar, Computational Imaging. Cambridge, MA, USA: MIT Press, 2022.
+[2] P. Lichtsteiner, C. Posch, and T. Delbruck, “A 128\times 128 120 dB 15 μs Latency Asynchronous Temporal Contrast Vision Sensor,” IEEE 
+Journal of Solid-State Circuits , vol. 43, no. 2, pp. 566–576, Feb. 2008, doi: 10.1109/JSSC.2007.914337.
+[3] G. Gallego et al., “Event-based Vision: A Survey,” IEEE Transactions on Pattern Analysis and Machine Intelligence , vol. 44, no. 1, pp. 154–
+180, Jan. 2022, doi: 10.1109/TPAMI.2020.3008413.
+[4] R. Graca, S. Zhou, B. McReynolds, and T. Delbruck, “SciDVS: A Scientific Event Camera with 1.7% Temporal Contrast Sensitivity 
+at 0.7 lux,” in 2024 IEEE European Solid-State Electronics Research Conference (ESSERC) , Sept. 2024, pp. 205–208. doi: 10.1109/
+ESSERC62670.2024.10719521.
+[5] N. Kruger, N. O. Ralph, G. Cohen, and P. Hurley, “Optical linear systems framework for event sensing and computational neuromorphic 
+imaging,” Frontiers in Neuroscience, vol. 20, May 2026, doi: 10.3389/fnins.2026.1831543.
+[6] S. Habuchi, K. Takahashi, C. Tsutake, T. Fujii, and H. Nagahara, “Time-Efficient Light-Field Acquisition Using Coded Aperture and Events.” 
+Accessed: April 2, 2025. [Online]. Available at: http://arxiv.org/abs/2403.07244
+[7] T. Tsuchida, K. Takahashi, C. Tsutake, T. Fujii, and H. Nagahara, “Coded-E2LF: Coded Aperture Light Field Imaging from Events.” Accessed: 
+April 18, 2026. [Online]. Available at: http://arxiv.org/abs/2602.22620
+[8] Z. Qu, Z. Zou, V. Boominathan, P. Chakravarthula, and A. Pediredla, “Event fields: Capturing light fields at high speed, resolution, and 
+dynamic range.” Accessed: June 24, 2025. [Online]. Available at: http://arxiv.org/abs/2412.06191
+[9] R. Guo et al., “EventLFM: event camera integrated Fourier light field microscopy for ultrafast 3D imaging,” Light: Science & Applications , 
+vol. 13, no. 1, p. 144, June 2024, doi: 10.1038/s41377-024-01502-5.
+[10] F. Kong, A. Lambert, D. Joubert, and G. Cohen, “Shack-Hartmann wavefront sensing using spatial-temporal data from an event-based image 
+sensor,” Optics Express, vol. 28, no. 24, p. 36159, Nov. 2020, doi: 10.1364/OE.409682.
+[11] Z. Zhang, A. Yezzi, and G. Gallego, “Formulating Event-based Image Reconstruction as a Linear Inverse Problem with Deep Regularization 
+using Optical Flow,” IEEE Transactions on Pattern Analysis and Machine Intelligence , pp. 1–18, 2022, doi: 10.1109/TPAMI.2022.3230727.
+[12] S. Shah et al., “CodedEvents: Optimal Point-Spread-Function Engineering for 3D-Tracking with Event Cameras.” Accessed: March 2, 2026. 
+[Online]. Available at: http://arxiv.org/abs/2406.09409
+[13] S. Shah, S. Kulshrestha, and C. A. Metzler, “TiDy-PSFs: Computational Imaging with Time-Averaged Dynamic Point-Spread-Functions.” 
+Accessed: August 14, 2026. [Online]. Available at: http://arxiv.org/abs/2303.17583
+[14] X. Lagorce, C. Meyer, S.-H. Ieng, D. Filliat, and R. Benosman, “Asynchronous Event-Based Multikernel Algorithm for High-Speed Visual 
+Features Tracking,” IEEE Transactions on Neural Networks and Learning Systems , vol. 26, no. 8, pp. 1710–1720, Aug. 2015, doi: 10.1109/
+TNNLS.2014.2352401.
+[15] R. Graca and T. Delbruck, “Towards a physically realistic computationally efficient DVS pixel model.” Accessed: December 10, 2025. [Online]. 
+Available at: http://arxiv.org/abs/2505.07386
+[16] A. J. Hendrickson and D. P. Haefner, “Beyond Discretization: A Continuous-Time Framework for Event Generation in Neuromorphic Pixels.” 
+Accessed: December 10, 2025. [Online]. Available at: http://arxiv.org/abs/2504.02803
+[17] B. J. McReynolds, R. P. Graca, and T. Delbruck, “Experimental methods to predict dynamic vision sensor event camera performance,” Optical 
+Engineering, vol. 61, no. 7, p. 74103, July 2022, doi: 10.1117/1.OE.61.7.074103.
+[18] Y. Hu, S.-C. Liu, and T. Delbruck, “v2e: From Video Frames to Realistic DVS Events,” in 2021 IEEE/CVF Conference on Computer Vision 
+and Pattern Recognition Workshops (CVPRW) , June 2021, pp. 1312–1321. doi: 10.1109/CVPRW53098.2021.00144.
+[19] D. Joubert, A. Marcireau, N. Ralph, A. Jolley, A. van Schaik, and G. Cohen, “Event Camera Simulator Improvements via Characterized 
+Parameters,” Frontiers in Neuroscience, vol. 15, 2021, Accessed: March 11, 2023. [Online].  Available at: https://www.frontiersin.org/articles/
+10.3389/fnins.2021.702765
+[20] H. Rebecq, D. Gehrig, and D. Scaramuzza, “ESIM: an Open Event Camera Simulator.”
+[21] S. S. Yadav, A. van Schaik, and C. S. Thakur, “Time to standardize event-based vision processing,” Nature Sensors, pp. 1–4, Aug. 2026, doi: 
+10.1038/s44460-026-00100-9.
+[22] Z. Wang, Y. Ng, P. van Goor, and R. Mahony, “Event Camera Calibration of Per-pixel Biased Contrast Threshold.” Accessed: July 19, 2025. 
+[Online]. Available at: http://arxiv.org/abs/2012.09378
+[23] J. W. Goodman, Introduction to Fourier optics , 3rd ed. Englewood, Colo: Roberts & Co. Publishers, 2004.
+[24] A. Sironi, M. Brambilla, N. Bourdis, X. Lagorce, and R. Benosman, “HATS: Histograms of Averaged Time Surfaces for Robust Event-
+Based Object Classification,” in 2018 IEEE/CVF Conference on Computer Vision and Pattern Recognition , June 2018, pp. 1731–1740. doi: 
+10.1109/CVPR.2018.00186.
+[25] B. J. McReynolds, R. Graca, L. Kulesza, and P. McMahon-Crabtree, “Re-interpreting the step-response probability curve to extract 
+fundamental physical parameters of event-based vision sensors,” in Unconventional Optical Imaging IV , SPIE, June 2024, pp. 127–140. 
+doi: 10.1117/12.3022308.
+[26] T. Delbruck, R. Graca, and M. Paluch, “Feedback control of event cameras.” Accessed: August 22, 2026. [Online]. Available at: http://arxiv.
+org/abs/2105.00409
+[27] J. Han, Y. Asano, B. Shi, Y. Zheng, and I. Sato, “High-fidelity Event-Radiance Recovery via Transient Event Frequency,” in 2023 IEEE/
+CVF Conference on Computer Vision and Pattern Recognition (CVPR) , Vancouver, BC, Canada: IEEE, June 2023, pp. 20616–20625. doi: 
+10.1109/CVPR52729.2023.01975.
+1https://github.com/nimrodkruger/EVS_dynamic_transfer_functions.git
+PAGE 17
+[28] T. Leroux, S.-H. Ieng, and R. Benosman, “Event-Based Structured Light for Depth Reconstruction using Frequency Tagged Light Patterns.” 
+Accessed: August 23, 2026. [Online]. Available at: http://arxiv.org/abs/1811.10771
+[29] R. Maeda, Y. Moon, and S.-H. Baek, “Event Ellipsometer: Event-based Mueller-Matrix Video Imaging.” Accessed: August 23, 2026. [Online]. 
+Available at: http://arxiv.org/abs/2411.17313
+[30] E. Thacher, A. G. Mychkovsky, and S. A. Mäkiharju, “Error quantification of frequency based measurements with event cameras,” Measurement 
+Science and Technology, vol. 37, no. 23, p. 235302, June 2026, doi: 10.1088/1361-6501/ae70a4.

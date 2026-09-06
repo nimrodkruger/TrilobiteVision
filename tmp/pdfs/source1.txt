@@ -1,0 +1,166 @@
+PAGE 1
+Appendix: Derivation of the probe inverse functions
+A. The step probe
+The step probe is 𝑑(𝑡)= 𝐴𝑢(𝑡− 𝑡0) (19), giving the per-pixel log-irradiance range Δ𝐿𝑖 = log(1+
+𝑤𝑖𝐴/𝐼bg) (20). Time is measured from onset, 𝑡0 = 0, throughout this section, matching the main
+text’s convention for (23)-(26). Under the single-pole model (4), the step response is
+𝑉 (𝑡)= Δ𝐿𝑖(1− 𝑒{−𝑡/𝜏pr}), 𝑡≥ 0. (S1)
+This is the standard first-order step response of 𝜏pr ̇𝑉 + 𝑉 = Δ𝐿𝑖 with 𝑉 (0)= 0.
+A.1 Event count 𝑁𝑖
+Write 𝑥𝑘 = 𝑒{−𝑡𝑘 /𝜏pr} and 𝑟 = 𝑒{−𝜌/𝜏pr}. No refractory window precedes the first event, so it fires the
+instant 𝑉  reaches 𝐶:
+𝑉 (𝑡1)= 𝐶⟹ Δ𝐿𝑖(1− 𝑥1)= 𝐶⟹ 𝑥1 = 1− 𝐶/Δ𝐿𝑖, (S2)
+matching the initial condition quoted for (23). For 𝑘 ≥ 1, the reference resets to 𝑉 (𝑡𝑘 + 𝜌) (6), and
+the (𝑘 + 1)-th event fires when 𝑉  has climbed a further 𝐶 above it:
+𝑉 (𝑡{𝑘+1})− 𝑉 (𝑡𝑘 + 𝜌)= 𝐶. (S3)
+Substitute the step response into both terms. Since 𝑒{−(𝑡𝑘 +𝜌)/𝜏pr} = 𝑟𝑥𝑘,
+Δ𝐿𝑖(1− 𝑥{𝑘+1})− Δ𝐿𝑖(1−𝑟𝑥𝑘 )= 𝐶⟹ 𝑥{𝑘+1} = 𝑟𝑥𝑘 − 𝐶/Δ𝐿𝑖, (S4)
+which is (23), with 𝑥1 = 1− 𝐶/Δ𝐿𝑖 as above.
+This is a linear (affine) recursion, not a bare geometric one: writing 𝛽 ≡ 𝐶/Δ𝐿𝑖, it is 𝑥{𝑘+1} =
+𝑟𝑥𝑘 − 𝛽. Its fixed point is
+𝑥∗ = −𝛽/(1− 𝑟), (S5)
+found by setting 𝑥∗ = 𝑟𝑥∗ − 𝛽. The deviation 𝜑𝑘 ≡ 𝑥𝑘 − 𝑥∗ obeys the homogeneous recursion
+𝜑{𝑘+1} = 𝑟𝜑𝑘, so
+𝑥𝑘 = 𝑥∗ + (𝑥1 − 𝑥∗)𝑟{𝑘−1}. (S6)
+The burst ends at the count 𝑁𝑖 where 𝑥{𝑁𝑖} reaches zero — the source-follower has settled and no
+further crossing occurs. Setting 𝑥𝑁 = 0 and solving for 𝑁 (treated as continuous, “taking the limit”
+of the recursion) gives, after substituting 𝑥1 = 1− 𝛽,
+𝑟{𝑁−1} = 𝛽/[(1− 𝑟)+ 𝛽𝑟]⟹ 𝑁 = 1+ 𝜏pr/𝜌⋅ log(𝑟 + Δ𝐿𝑖(1− 𝑟)/𝐶). (S7)
+This is exact for the recursion above. In the regime relevant to real sensors — many refractory
+periods elapse before the burst ends, 𝜌≪ 𝜏pr, so 𝑁𝑖 ≫ 1 and 𝑟 = 𝑒{−𝜌/𝜏pr} ≈ 1 — the leading “+1” is
+negligible against 𝑁𝑖 itself, and 𝑟 may be replaced by 1 inside the logarithm (the exact refractory
+factor (1− 𝑟) is kept, not linearised). Equation 7 then reduces to (24),
+𝑁𝑖 = 𝜏pr/𝜌⋅ log(1+ Δ𝐿𝑖(1−𝑒{−𝜌/𝜏pr})/𝐶). (S8)
+Both forms agree closely once 𝜌/𝜏pr ≪ 1 (checked numerically: at 𝜌/𝜏pr = 0.01 they differ by under
+1% in 𝑁𝑖; the “+1”/exact-recursion form should be preferred if 𝜌 is not small compared to 𝜏pr).
+Inverting (24) for the optical weight gives (25),
+PAGE 2
+̂𝑤𝑖 = 𝐼bg/𝐴(𝑒{Δ ̂𝐿𝑖} − 1), Δ̂𝐿𝑖 = 𝐶/(1− 𝑒{−𝜌/𝜏pr})(𝑒{𝑁𝑖𝜌/𝜏pr} − 1). (S9)
+A.2 Onset latency ℓ𝑖
+This needs only the first-event condition from A.1, no recursion. With ℓ𝑖 ≡ 𝑡1,
+𝑉 (ℓ𝑖)= 𝐶⟹ Δ𝐿𝑖(1− 𝑒{−ℓ𝑖/𝜏pr})= 𝐶⟹ Δ̂𝐿𝑖 = 𝐶/(1− 𝑒{−ℓ𝑖/𝜏pr}), (S10)
+exactly the second case of (26) — exact, no approximation, since it uses only the 𝑘 = 1 crossing
+condition already derived above.
+A.3 First interval Δ𝑡{𝑖,1}
+Apply the general recursion once, at 𝑘 = 1: 𝑥2 = 𝑟𝑥1 − 𝛽. Writing 𝑥2 = 𝑥1𝑒{−Δ𝑡{𝑖,1}/𝜏pr} (since 𝑡2 =
+𝑡1 + Δ𝑡{𝑖,1}) and substituting 𝑥1 = 1− 𝛽,
+(1− 𝛽)𝑒{−Δ𝑡{𝑖,1}/𝜏pr} = 𝑟(1− 𝛽)− 𝛽. (S11)
+Let 𝑞 ≡ 𝑟 − 𝑒{−Δ𝑡{𝑖,1}/𝜏pr} (non-negative, since Δ𝑡{𝑖,1} ≥ 𝜌). Rearranging the line above gives 𝛽 =
+(1− 𝛽)𝑞, so
+𝛽(1+ 𝑞)= 𝑞 ⟹ 𝛽 = 𝑞/(1+ 𝑞)⟹ Δ𝐿𝑖 = 𝐶(1+ 1/𝑞). (S12)
+Substituting 𝑞 back gives (26)‘s third case exactly,
+Δ̂𝐿𝑖 = 𝐶(1+ 1/(𝑒{−𝜌/𝜏pr} − 𝑒{−Δ𝑡{𝑖,1}/𝜏pr})). (S13)
+No approximation is needed here: it only uses the first application of the exact recursion (23), never
+the “many events” limit that A.1 required.
+B. The linear ramp
+The ramp is 𝑑(𝑡)= 𝛼(𝑡− 𝑡0) (27). Writing 𝑠= 𝑡− 𝑡0 and collecting the per-pixel terms into a
+characteristic time,
+𝑇𝑖 ≡ 𝐼bg/(𝑤𝑖𝛼), (S14)
+the irradiance is 𝐼𝑖(𝑠)= 𝐼bg + 𝑤𝑖𝛼𝑠= 𝐼bg(1+𝑠/𝑇𝑖), so, as in the main text’s (29),
+𝐿𝑖(𝑠)= log 𝐼bg + log(1+ 𝑠/𝑇𝑖), (S15)
+a function of 𝑠/𝑇𝑖 alone: the weight sets a time scale, not an amplitude, unlike the step. Every
+statistic below estimates 𝑇𝑖, then recovers 𝑤𝑖 = 𝐼bg/(𝛼𝑇𝑖).
+B.1 Characteristic time and the first-interval recursion
+Applying the crossing condition (5) to (29), with the reference taken at the end of the refractory
+window, 𝐿𝑖(𝑠{𝑘 +1})− 𝐿𝑖(𝑠𝑘 +𝜌)= 𝐶:
+log(1+ 𝑠{𝑘+1}/𝑇𝑖)− log(1+ (𝑠𝑘 + 𝜌)/𝑇𝑖)= 𝐶⟹ (𝑇𝑖 + 𝑠{𝑘+1})/(𝑇𝑖 + 𝑠𝑘 + 𝜌)= 𝑒𝐶,(S16)
+recovering the main text’s (30) directly. Define 𝑢𝑘 = 𝑇𝑖 + 𝑠𝑘: (30) becomes the linear recursion
+𝑢{𝑘+1} = 𝑒𝐶(𝑢𝑘 + 𝜌). (S17)
+Before onset the irradiance is constant, so the reference has settled at log 𝐼bg and the first event
+carries no preceding refractory window: 𝑢1 = 𝑇𝑖𝑒𝐶 (equivalently 𝑠1 = 𝑇𝑖(𝑒𝐶−1)> 0).
+PAGE 3
+Solve as in A.1: the fixed point is 𝑢∗ = 𝑒𝐶𝜌/(1− 𝑒𝐶)= −𝑒𝐶𝜌/(𝑒𝐶 − 1), and 𝑢𝑘 = 𝑢∗ + (𝑢1 −
+𝑢∗)𝑒{𝐶(𝑘−1)}. Writing ̃𝑇𝑖 ≡ (𝑢1 − 𝑢∗)𝑒{−𝐶},
+̃𝑇𝑖 = 𝑇𝑖𝑒𝐶 ⋅ 𝑒{−𝐶} − 𝑢∗𝑒{−𝐶} = 𝑇𝑖 + 𝜌/(𝑒𝐶 − 1), (S18)
+using 𝑢∗𝑒{−𝐶} = −𝜌/(𝑒𝐶 − 1), and
+𝑢𝑘 = ̃𝑇𝑖𝑒{𝑘𝐶} − 𝜌𝑒𝐶/(𝑒𝐶 − 1). (S19)
+The interval Δ𝑡{𝑖,𝑘} = 𝑢{𝑘+1} − 𝑢𝑘 = ̃𝑇𝑖𝑒{(𝑘+1)𝐶} − ̃𝑇𝑖𝑒{𝑘𝐶} = ̃𝑇𝑖𝑒{𝑘𝐶}(𝑒𝐶 − 1), exactly (31) — and
+this time exactly, with no “many events” limit anywhere: every step above is an identity, since the
+ramp recursion is multiplicative by the constant 𝑒𝐶 rather than the affine-in-a-decaying-𝑟𝑘 form the
+step required.
+For the first interval, Δ𝑡{𝑖,1} = 𝑢2 − 𝑢1 = 𝑒𝐶(𝑢1+𝜌)− 𝑢1 = 𝑢1(𝑒𝐶 − 1)+ 𝜌𝑒𝐶. With 𝑢1 = 𝑇𝑖𝑒𝐶,
+Δ𝑡{𝑖,1} = 𝑒𝐶[𝑇𝑖(𝑒𝐶−1)+ 𝜌]. (S20)
+Solving for 𝑇𝑖 and then 𝑤𝑖 = 𝐼bg/(𝛼𝑇𝑖) gives (32),
+̂𝑤𝑖 = (𝐼bg𝑒𝐶(𝑒𝐶 − 1))/(𝛼(Δ𝑡{𝑖,1} − 𝜌𝑒𝐶)). (S21)
+B.2 Onset latency ℓ𝑖
+As noted in the main text, once 𝜏pr ≪ 𝑇𝑖 + 𝑠 the single-pole filter acts as a pure delay, 𝑉 (𝑠)≈
+𝐿(𝑠− 𝜏pr): the front-end pole common to every crossing (array uniformity assumed) shifts the
+observed onset time by 𝜏pr without otherwise altering (29)‘s crossing algebra. The undelayed
+crossing of 𝐿𝑖 itself, 𝐿𝑖(𝑠)− log 𝐼bg = 𝐶, gives from (29)
+log(1+ 𝑠/𝑇𝑖)= 𝐶⟹ 𝑠= 𝑇𝑖(𝑒𝐶−1) (S22)
+(consistent with 𝑠1 above). The measured latency is this plus the front-end delay, ℓ𝑖 = 𝑇𝑖(𝑒𝐶−1)+
+𝜏pr, so
+𝑇𝑖 = (ℓ𝑖 − 𝜏pr)/(𝑒𝐶 − 1)⟹ ̂𝑤𝑖 = 𝐼bg/𝛼 ⋅ (𝑒𝐶 − 1)/(ℓ𝑖 − 𝜏pr), (S23)
+exactly (33)‘s latency case.
+B.3 Rate 𝑅𝑖
+𝑅𝑖 is the mean of 1/Δ𝑡{𝑖,𝑘} over the 𝑁𝑖 − 1 intervals following onset, 𝑅𝑖 =
+(𝑁𝑖 − 1){−1} ∑{𝑁𝑖−1}
+{𝑘=1} 1/Δ𝑡{𝑖,𝑘}. From B.1, 1/Δ𝑡{𝑖,𝑘} = 𝑒{−𝑘𝐶}/(̃𝑇𝑖(𝑒𝐶 − 1)), so with 𝑀 = 𝑁𝑖 −
+1,
+𝑅𝑖 = 1
+̃𝑇𝑖(𝑒𝐶 − 1)𝑀 ∑
+{𝑀}
+{𝑘=1}
+𝑒{−𝑘𝐶}. (S24)
+The sum is a finite geometric series. Multiplying numerator and denominator of the standard sum by
+𝑒𝐶,
+∑
+{𝑀}
+{𝑘=1}
+𝑒{−𝑘𝐶} = 𝑒{−𝐶} 1− 𝑒{−𝑀𝐶}
+1− 𝑒{−𝐶} = 1− 𝑒{−𝑀𝐶}
+𝑒𝐶 − 1 . (S25)
+This is the one non-trivial algebraic step in the whole appendix, so it is worth pausing on: it is the
+ordinary closed form for ∑𝑀
+{𝑘=1} 𝑟𝑘  with common ratio 𝑟 = 𝑒{−𝐶}, rewritten so the denominator
+PAGE 4
+matches the (𝑒𝐶 − 1) already carried by every Δ𝑡{𝑖,𝑘} — nothing about the pixel model enters this
+step, it is pure series algebra. Substituting back,
+𝑅𝑖 = 1− 𝑒{−(𝑁𝑖−1)𝐶}
+̃𝑇𝑖(𝑒𝐶 − 1)2(𝑁𝑖 − 1)
+= Γ(𝑁𝑖)/ ̃𝑇𝑖, (S26)
+where
+Γ(𝑁)≡ 1− 𝑒{−(𝑁−1)𝐶}
+(𝑁 − 1)(𝑒𝐶 − 1)2 (S27)
+is exactly the correction factor quoted in (33): it is nothing more than the average of the geometric
+series of inverse intervals, packaged so that ̃𝑇𝑖 = Γ(𝑁𝑖)/𝑅𝑖 reads as a direct rate-to-time-scale
+conversion. Recovering 𝑇𝑖 = ̃𝑇𝑖 − 𝜌/(𝑒𝐶 − 1) and then 𝑤𝑖 = 𝐼bg/(𝛼𝑇𝑖) gives (33)‘s rate case,
+̂𝑤𝑖 = 𝐼bg/𝛼 ⋅ [Γ(𝑁𝑖)/𝑅𝑖 − 𝜌/(𝑒𝐶 − 1)]
+{−1}
+. (S28)
+Unlike A.1′s count, no “many events” approximation is needed anywhere in B.1-B.3: the ramp’s
+recursion is exactly solvable at every step because its multiplier 𝑒𝐶 is constant, whereas the step’s
+multiplier 𝑟 competes with an additive term of comparable size only for a finite burst.
+C. The exponential ramp
+The exponential ramp is 𝑑(𝑡)= 𝐴(𝑒{ 𝑡−𝑡0
+𝜏𝛼 } − 1) (34), giving, with 𝑠= 𝑡− 𝑡0, the main text’s (35),
+𝐿𝑖(𝑠)= log[(𝐼bg − 𝑤𝑖𝐴)+ 𝑤𝑖𝐴𝑒{ 𝑠
+𝜏𝛼 }]. (S29)
+C.1 Onset latency ℓ𝑖
+No refractory window precedes the first event, so it fires the instant 𝐿𝑖 has risen by 𝐶 from log 𝐼bg:
+𝐿𝑖(ℓ𝑖)− log 𝐼bg = 𝐶⟹ log
+[
+[[ (𝐼bg − 𝑤𝑖𝐴)+ 𝑤𝑖𝐴𝑒{ ℓ𝑖
+𝜏𝛼 }
+𝐼bg
+]
+]] = 𝐶. (S30)
+Exponentiate and clear 𝐼bg:
+(𝐼bg − 𝑤𝑖𝐴)+ 𝑤𝑖𝐴𝑒{ ℓ𝑖
+𝜏𝛼 } = 𝐼bg𝑒𝐶 ⟹ 𝑤𝑖𝐴(𝑒{ ℓ𝑖
+𝜏𝛼 } − 1)= 𝐼bg(𝑒𝐶−1). (S31)
+Solving for ℓ𝑖 gives (38) exactly, with no asymptotic approximation (unlike (36), which is only the
+large-𝑠 limit of (35) and plays no part here):
+ℓ𝑖 = 𝜏𝛼 log(1+
+𝐼bg(𝑒𝐶−1)
+𝑤𝑖𝐴 ). (S32)
+Inverting the boxed relation above directly for 𝑤𝑖 gives (39),
+̂𝑤𝑖 =
+𝐼bg(𝑒𝐶−1)
+𝐴(𝑒{ ℓ𝑖
+𝜏𝛼 } − 1)
+. (S33)
+This is the simplest of the seven derivations: a single exact algebraic inversion of (35) at one point,
+since the exponential ramp’s first crossing needs no recursion at all — the burst-count and first-
+interval machinery of A and B has no analogue here because (37)‘s later intervals carry no weight-
+dependence to invert (every pixel’s post-transient interval is the same, Δ𝑡𝑘 = 𝐶𝜏𝛼 + 𝜌).

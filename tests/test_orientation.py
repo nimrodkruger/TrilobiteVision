@@ -370,18 +370,19 @@ def test_an_admitted_raw_capture_is_science_and_carries_its_evidence():
     assert f.meta["allow_unvalidated_raw"] is False
 
 
-def test_a_science_request_fails_rather_than_degrading_when_the_hatch_is_shut():
-    """Supervisory review R4, and the one that mattered most in this batch.
+def test_a_capture_of_non_pixel_bytes_fails_when_the_hatch_is_shut():
+    """Supervisory review R4. The runtime path caught every admission failure
+    and returned diagnostic pixels regardless, so a capture request was
+    answered -- and reported as a success -- with data the code had just
+    established were not pixel values at all. The opt-in was advertised as the
+    way that happens and was never consulted.
 
-    The runtime path caught every admission failure and returned diagnostic
-    pixels regardless, so a science capture request was answered -- and
-    reported as a success -- with data the code had just established were not
-    sensor counts. `allow_unvalidated_raw` was advertised as the way that
-    happens and was never consulted.
+    Scoped to the FORMAT failures. Those are the ones with no reading to
+    produce and no visible symptom; everything else is graded, not refused.
     """
     buf = np.full((1088, 1456), 128, np.uint8)
     src = _wired("MONO_PISP_COMP1", buf)
-    with pytest.raises(RawFormatError, match="no science capture to return"):
+    with pytest.raises(RawFormatError, match="not pixel values"):
         src.capture_full(raw=True)
     assert all(r.released for r in src._picam.requests), (
         "a refusal must not cost a request from the pool")
@@ -410,16 +411,26 @@ def test_a_compressed_capture_comes_back_diagnostic_only_with_the_hatch_open():
     assert f.data.shape == (1088, 1456)
 
 
-def test_a_buffer_that_betrays_a_validated_format_is_loud(caplog):
-    """Different from the hatch case and worse. The format was checked and
-    accepted at open time and the driver still delivered something that does
-    not reconcile with it -- that indicts the driver, not the config."""
+def test_a_buffer_that_does_not_reconcile_is_read_graded_and_logged(caplog):
+    """The regression that produced white noise on screen, as a test.
+
+    The format is fine; the row count is not. The old path refused, and with
+    the hatch open handed the buffer back UNTOUCHED -- 2944-wide uint8, which
+    is pairs of bytes displayed as pixels. The frame must come back readable,
+    graded `unvalidated`, with the reason recorded and logged once.
+    """
     import logging
 
     src = _wired("R10", np.zeros((1080, 2944), np.uint8))
-    with caplog.at_level(logging.ERROR), pytest.raises(RawFormatError):
-        src.capture_full(raw=True)
-    assert any("validated at open time" in r.message for r in caplog.records)
+    with caplog.at_level(logging.WARNING):
+        f = src.capture_full(raw=True)
+
+    assert f.validity == "unvalidated", "graded, not refused"
+    assert f.data.dtype == np.uint16, "re-viewed at the right pixel size"
+    assert f.data.shape == (1080, 1456), "and trimmed to the sensor width"
+    assert any("1080 rows" in r for r in f.meta["raw_reservations"])
+    assert any("reservation" in r.message for r in caplog.records)
+    assert f.meta["raw_admitted"] is False
 
 
 def test_admission_uses_the_raw_geometry_not_the_main_resolution():
@@ -434,14 +445,17 @@ def test_admission_uses_the_raw_geometry_not_the_main_resolution():
     assert (f.meta["image_width"], f.meta["image_height"]) == (1456, 1088)
 
 
-def test_a_stride_that_disagrees_with_the_negotiated_one_is_refused():
-    """Once the driver states its stride there is no bounded-pad guessing
-    left to do: the row length either matches it or the buffer is not the one
-    the configuration describes."""
-    _, delivered = _r10_bytes(1088, 1456, pad_px=16)          # 2944 bytes
+def test_a_stride_that_disagrees_with_the_negotiated_one_is_graded():
+    """Once the driver states its stride there is no bounded-pad guessing left
+    to do: the row length either matches it or the buffer is not the one the
+    configuration describes. That is worth recording and is not worth losing
+    the frame over -- a wrong stride skews the aspect ratio, which is visible."""
+    truth, delivered = _r10_bytes(1088, 1456, pad_px=16)      # 2944 bytes
     src = _wired("R10", delivered, stride=2912)               # driver says 2912
-    with pytest.raises(RawFormatError, match="negotiated a stride"):
-        src.capture_full(raw=True)
+    f = src.capture_full(raw=True)
+    assert f.validity == "unvalidated"
+    assert np.array_equal(f.data, truth), "still the best reading available"
+    assert any("negotiated a stride" in r for r in f.meta["raw_reservations"])
 
 
 def test_admission_runs_before_orientation():

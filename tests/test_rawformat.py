@@ -137,12 +137,22 @@ def test_best_format_takes_the_widest_unpacked_depth():
     assert best_format([]) is None
 
 
+def reserved(got, fragment):
+    """One reservation mentioning `fragment`, and the verdict downgraded."""
+    assert got.validity == UNVALIDATED, got.reservations
+    assert not got.is_science
+    assert any(fragment in r for r in got.reservations), got.reservations
+    assert got.meta["raw_admitted"] is False
+    return got
+
+
 # -- admission, the happy paths ---------------------------------------------
 
 
 def test_an_8_bit_buffer_loses_its_padding_and_nothing_else():
     got = admit(r8(), "R8", (W, H))
     assert isinstance(got, Admitted)
+    assert got.is_science and not got.reservations
     assert got.array.shape == (H, W)
     assert got.array.dtype == np.uint8
     assert got.array.max() == 0, "only the padding may be removed"
@@ -210,52 +220,58 @@ def test_an_unknown_format_is_refused_even_when_the_shape_fits_perfectly():
         admit(np.zeros((H, W), np.uint8), "R11", (W, H))
 
 
-def test_a_row_count_that_disagrees_is_the_finding_not_a_thing_to_fix():
-    """Padding is a per-row phenomenon. A row COUNT that disagrees with the
-    sensor means this is not the frame it claims to be, and no reshaping of it
-    is legitimate."""
-    with pytest.raises(RawFormatError, match="rows"):
-        admit(r8(height=1080), "R8", (W, H))
+def test_a_row_count_that_disagrees_is_recorded_not_swallowed():
+    """Padding is a per-row phenomenon, so a row COUNT that disagrees means
+    this is not the frame it claims to be. Recorded as a reservation: the
+    array is still readable and looking at it is how you find out why."""
+    reserved(admit(r8(height=1080), "R8", (W, H)), "1080 rows")
 
 
-def test_a_buffer_short_of_the_sensor_width_is_refused():
-    with pytest.raises(RawFormatError, match="Off by -"):
-        admit(np.zeros((H, W - 8), np.uint8), "R8", (W, H))
+def test_a_buffer_short_of_the_sensor_width_is_read_and_reserved():
+    got = reserved(admit(np.zeros((H, W - 8), np.uint8), "R8", (W, H)),
+                   "off by -8")
+    assert got.array.shape == (H, W - 8), "nothing to trim, so nothing trimmed"
 
 
-def test_padding_beyond_the_bound_is_refused():
+def test_padding_beyond_the_bound_is_reserved():
     """The allowance is generous because the alignment is not ours to promise,
     and bounded because an unbounded one would accept a buffer of an entirely
     different format whose row happens to be longer."""
-    admit(r8(stride_bytes=W + MAX_STRIDE_PAD_BYTES), "R8", (W, H))
-    with pytest.raises(RawFormatError, match="stride padding"):
-        admit(r8(stride_bytes=W + MAX_STRIDE_PAD_BYTES + 1), "R8", (W, H))
+    assert admit(r8(stride_bytes=W + MAX_STRIDE_PAD_BYTES), "R8", (W, H)).is_science
+    reserved(admit(r8(stride_bytes=W + MAX_STRIDE_PAD_BYTES + 1), "R8", (W, H)),
+             "stride padding")
 
 
 def test_the_two_readings_of_a_2944_byte_row_are_distinguished_by_the_format():
     """The direction of the check, asserted. The same bytes are a valid R10
-    frame and an invalid R8 one, and only the negotiated format decides which.
-    Inferring the pixel size from the row length -- which is what this
+    frame and an unreconciled R8 one, and only the negotiated format decides
+    which. Inferring the pixel size from the row length -- which is what this
     replaced -- cannot tell these apart."""
     buf = r10_unpacked(pad_px=16)
-    assert admit(buf, "R10", (W, H)).array.shape == (H, W)
-    with pytest.raises(RawFormatError, match="Off by 1488"):
-        admit(buf, "R8", (W, H))
+    good = admit(buf, "R10", (W, H))
+    assert good.is_science and good.array.shape == (H, W)
+    reserved(admit(buf, "R8", (W, H)), "off by 1488")
 
 
-def test_an_odd_row_length_cannot_be_whole_16_bit_pixels():
-    with pytest.raises(RawFormatError, match="odd number"):
-        admit(np.zeros((H, 2913), np.uint8), "R10", (W, H))
+def test_an_odd_row_length_is_left_as_bytes_and_says_so():
+    got = reserved(admit(np.zeros((H, 2913), np.uint8), "R10", (W, H)),
+                   "odd number")
+    assert got.array.dtype == np.uint8, "not re-viewed, because it cannot be"
 
 
-def test_a_value_above_the_declared_bit_depth_indicts_the_driver():
+def test_a_value_above_the_declared_bit_depth_is_reserved():
     """The check with teeth against a driver that hands back something other
     than what it negotiated: R10 that is really R12 has the right stride, the
-    right shape and the right dtype, and differs only in its values."""
+    right shape and the right dtype, and differs only in its values.
+
+    A reservation rather than a refusal because it is VISIBLE -- the frame is
+    64x too bright -- and because the operator needs to see it to act on it.
+    """
     truth = np.zeros((H, W), np.uint16)
     truth[10, 10] = 1024                     # one count past 10-bit
-    with pytest.raises(RawFormatError, match="above the 1023 maximum"):
-        admit(r10_unpacked(truth), "R10", (W, H))
+    got = reserved(admit(r10_unpacked(truth), "R10", (W, H)),
+                   "exceeds the 1023 maximum")
+    assert got.array.shape == (H, W), "still trimmed, still readable"
 
 
 def test_the_value_check_can_be_skipped_and_says_so_in_the_evidence():
@@ -351,35 +367,40 @@ def test_validity_and_source_survive_a_pipeline_stage():
     (np.int16, "signed integer"),
     (np.float16, "floating point"),
 ])
-def test_a_two_byte_buffer_that_is_not_unsigned_is_refused(dtype, why):
-    buf = np.zeros((H, W + 16), dtype)
-    with pytest.raises(RawFormatError, match=why):
-        admit(buf, "R10", (W, H))
+def test_a_two_byte_buffer_that_is_not_unsigned_is_reserved(dtype, why):
+    reserved(admit(np.zeros((H, W + 16), dtype), "R10", (W, H)), why)
 
 
-def test_a_negative_sample_is_refused_before_any_value_check():
+def test_a_negative_sample_is_never_science():
     """The exact probe from the review. It has the right item size, the right
     shape and the right stride, and -1 is not a photon count."""
-    buf = np.full((H, W + 16), -1, np.int16)
-    with pytest.raises(RawFormatError, match="cannot be negative or fractional"):
-        admit(buf, "R10", (W, H))
+    reserved(admit(np.full((H, W + 16), -1, np.int16), "R10", (W, H)),
+             "not unsigned")
 
 
-def test_a_fractional_sample_is_refused():
-    buf = np.full((H, W + 16), 0.5, np.float16)
-    with pytest.raises(RawFormatError, match="cannot be negative or fractional"):
-        admit(buf, "R10", (W, H))
+def test_a_fractional_sample_is_never_science():
+    reserved(admit(np.full((H, W + 16), 0.5, np.float16), "R10", (W, H)),
+             "not unsigned")
 
 
-def test_a_byte_swapped_buffer_is_refused():
+def test_the_value_check_is_skipped_when_the_dtype_cannot_hold_samples():
+    """`max()` on a float array is meaningless as a photon count, and running
+    the ceiling test on it would put a fabricated number in the record."""
+    got = admit(np.full((H, W + 16), 0.5, np.float16), "R10", (W, H))
+    assert got.meta["raw_values_checked"] is False
+    assert "raw_observed_max" not in got.meta
+
+
+def test_a_byte_swapped_buffer_is_never_science():
     """Right item size, right shape, every value wrong by a byte swap."""
-    buf = np.zeros((H, W + 16), np.dtype(">u2"))
-    with pytest.raises(RawFormatError, match="byte order"):
-        admit(buf, "R10", (W, H))
+    reserved(admit(np.zeros((H, W + 16), np.dtype(">u2")), "R10", (W, H)),
+             "byte order")
 
 
 @pytest.mark.parametrize("size", [(0, H), (W, 0), (-1, H)])
 def test_a_non_positive_negotiated_geometry_is_refused(size):
+    """One of the few hard refusals left, because there is genuinely nothing
+    to do: no width to trim to and no frame to produce."""
     with pytest.raises(RawFormatError, match="non-positive"):
         admit(r8(), "R8", size)
 
@@ -404,14 +425,18 @@ def test_the_three_quantities_are_recorded_separately():
 
 def test_left_aligned_samples_are_admitted_when_declared():
     """A 10-bit sample shifted into bits 6-15 reaches 65472, which the
-    right-aligned reading refuses outright."""
+    right-aligned reading cannot vouch for."""
     samples = np.full((H, W), 1000, np.uint16)
     buf = r10_unpacked(samples << 6, pad_px=16)
 
-    with pytest.raises(RawFormatError, match="above the 1023 maximum"):
-        admit(buf, "R10", (W, H), alignment="lsb")
+    wrong = reserved(admit(buf, "R10", (W, H), alignment="lsb"),
+                     "exceeds the 1023 maximum")
+    assert wrong.array.shape == (H, W), (
+        "the frame is still readable -- being 64x too bright is exactly how "
+        "an operator SEES that the alignment is wrong")
 
     got = admit(buf, "R10", (W, H), alignment="msb")
+    assert got.is_science
     assert got.meta["raw_sample_shift"] == 6
     assert got.meta["raw_value_ceiling"] == 1023 << 6
     assert got.meta["raw_observed_max"] == 64000
@@ -421,18 +446,17 @@ def test_left_aligned_samples_are_admitted_when_declared():
     assert int(got.array.max()) == 64000
 
 
-def test_a_left_aligned_refusal_names_the_setting_that_would_fix_it():
+def test_a_left_aligned_reservation_names_the_setting_that_would_fix_it():
     buf = r10_unpacked(np.full((H, W), 1000, np.uint16) << 6, pad_px=16)
-    with pytest.raises(RawFormatError, match="raw_alignment"):
-        admit(buf, "R10", (W, H), alignment="lsb")
+    reserved(admit(buf, "R10", (W, H), alignment="lsb"), "raw_alignment")
 
 
 def test_left_alignment_still_catches_a_wider_sample():
     """The ceiling is weaker under msb but not absent: 12-bit data delivered as
     R10 reaches 65520, past the 65472 a left-aligned 10-bit sample can hold."""
     buf = r10_unpacked(np.full((H, W), 4095, np.uint16) << 4, pad_px=16)
-    with pytest.raises(RawFormatError, match="above the 65472 maximum"):
-        admit(buf, "R10", (W, H), alignment="msb")
+    reserved(admit(buf, "R10", (W, H), alignment="msb"),
+             "exceeds the 65472 maximum")
 
 
 def test_non_zero_low_bits_are_recorded_rather_than_refused():
@@ -464,9 +488,9 @@ def test_alignment_is_moot_when_the_sample_fills_its_container():
 
 def test_the_negotiated_stride_must_match_exactly():
     buf = r10_unpacked(pad_px=16)                       # 2944 bytes per row
-    assert admit(buf, "R10", (W, H), stride_bytes=2944).array.shape == (H, W)
-    with pytest.raises(RawFormatError, match="negotiated a stride"):
-        admit(buf, "R10", (W, H), stride_bytes=2912)
+    good = admit(buf, "R10", (W, H), stride_bytes=2944)
+    assert good.is_science and good.array.shape == (H, W)
+    reserved(admit(buf, "R10", (W, H), stride_bytes=2912), "negotiated a stride")
 
 
 def test_which_stride_rule_was_applied_is_recorded():
@@ -477,8 +501,46 @@ def test_which_stride_rule_was_applied_is_recorded():
     assert admit(buf, "R10", (W, H)).meta["raw_stride_source"] == "inferred"
 
 
-def test_an_internally_inconsistent_negotiation_is_refused():
+def test_an_internally_inconsistent_negotiation_is_reserved():
     """A driver reporting a stride narrower than one row of pixels is
-    describing a configuration nothing here can reconcile."""
-    with pytest.raises(RawFormatError, match="internally inconsistent"):
-        admit(r10_unpacked(pad_px=16), "R10", (W, H), stride_bytes=100)
+    describing a configuration nothing here can reconcile. The buffer is still
+    read against the sensor geometry, and both facts go in the record."""
+    reserved(admit(r10_unpacked(pad_px=16), "R10", (W, H), stride_bytes=100),
+             "internally inconsistent")
+
+
+# -- the split: what is refused, and what is merely not vouched for ----------
+
+
+@pytest.mark.parametrize("name", ["MONO_PISP_COMP1", "R10_CSI2P", "R11"])
+def test_only_the_format_stops_a_capture(name):
+    """The one class of failure that is invisible on screen, and the one with a
+    body count. Everything else is graded."""
+    with pytest.raises(RawFormatError):
+        admit(np.zeros((H, W), np.uint8), name, (W, H))
+
+
+def test_a_graded_frame_is_still_a_frame():
+    """The regression this split exists to prevent, stated as a property.
+
+    An earlier version refused on any failure and handed the buffer back
+    untouched, so a 10-bit frame whose stride did not reconcile reached disk as
+    a 2944-wide uint8 array and displayed as white noise. Whatever the
+    reservations, the array must be the best reading available -- re-viewed at
+    the right pixel size and trimmed to the sensor width.
+    """
+    buf = r10_unpacked(np.full((H, W), 5000, np.uint16), pad_px=16)
+    got = admit(buf, "R10", (W, H), stride_bytes=2912)   # deliberately wrong
+    assert got.reservations
+    assert got.array.dtype == np.uint16, "re-viewed despite the reservation"
+    assert got.array.shape == (H, W), "trimmed despite the reservation"
+    assert int(got.array.max()) == 5000, "and the values are the sensor's"
+
+
+def test_every_reservation_reaches_the_metadata():
+    """The sidecar has to carry them, or the grade is a number with no reason
+    attached and the next person has to rediscover it."""
+    got = admit(r8(height=1080, stride_bytes=W + 999), "R8", (W, H))
+    assert len(got.reservations) == 2
+    assert got.meta["raw_reservations"] == list(got.reservations)
+    assert got.meta["raw_admitted"] is False

@@ -12,6 +12,80 @@ git checkout .              # everything back to HEAD
 
 ---
 
+## 2026-09-06 (r) — the boundary grades instead of refusing
+
+**Reported from the bench: every raw frame reads as white noise with row
+artefacts in MATLAB, and looking at a diagnostic capture errors out.** Both are
+my regression from (q), and both come from one bad decision.
+
+### The bug
+
+When admission refused a buffer, `_admit_raw` returned it **untouched** — not
+re-viewed as uint16, not trimmed. So a 10-bit frame whose stride or values did
+not reconcile reached disk as a 2944-wide **uint8** array. Displayed, that is
+pairs of bytes shown as pixels: white noise with row structure. Exactly the
+report.
+
+I wrote the justification into the code — *"there is no correct interpretation
+to apply, so applying none is the honest answer"* — and it was wrong. It
+conflates **we cannot vouch for these values** with **we will not interpret
+these bytes**. The first is worth saying. The second just makes the rig
+undiagnosable at the moment somebody is trying to diagnose it.
+
+### The change
+
+The split now follows what a person can SEE.
+
+| | outcome | why |
+| --- | --- | --- |
+| compressed, packed or unknown FORMAT | **refused** — `RawFormatError`, needs `allow_unvalidated_raw`, tagged `diagnostic` | no reading to produce, and the failure is invisible: a PiSP buffer looks like a slightly damaged photograph. This is the one with a body count |
+| row count, stride, values, dtype | **graded** — `unvalidated`, reasons in `raw_reservations`, frame returned re-viewed and trimmed | all visible on screen. Wrong alignment is 64× too bright; wrong stride skews the aspect ratio. Refusing the frame buys no protection and costs the diagnosis |
+
+`admit()` returns `Admitted(array, meta, validity, reservations)`. Every check
+still runs and every failure is still recorded — the verdict just stops being
+binary. The pixels are always the best reading available.
+
+Both readers loosen to match. `require_science` (VALUES) stays strict, because
+reading a value as a photon count with the alignment unresolved is silently
+wrong by 64× and nothing downstream catches it. `require_geometry`
+(POSITIONS) now refuses only `diagnostic` and warns on everything else, naming
+the reservations. Archive files with no recorded validity are readable again;
+`--allow-legacy` is gone because there is nothing left for it to unlock.
+
+### On the wider question
+
+The bench question was "are we not over-complicating this — a raw frame just
+needs to be a frame". Partly yes, and the part that was over-complicated is
+exactly the part removed here: I applied the review's fail-closed principle
+uniformly instead of asking which failures are silent. One is. The rest
+announce themselves on screen, and for those a recorded reservation does the
+same job as a refusal without stopping the work.
+
+What is kept, and why it is worth the machinery: refusing a compressed or
+packed format at open, and recording what the format, stride, geometry and
+alignment actually were. That is one hard stop and a handful of fields.
+
+### Testing
+
+`tests/test_rawformat.py` 63, with the former refusal cases rewritten as
+grading cases — the checks are the same, the verdicts changed. Two new
+properties: only the format stops a capture, and a graded frame is still a
+frame (re-viewed at the right pixel size, trimmed to the sensor width, values
+intact). `tests/test_reader_gate.py` covers the loosened geometry gate and that
+reservations reach the reader and the report.
+
+Suite: **440 passed, 13 skipped**. Ruff clean.
+
+### For the bench
+
+Old `diagnostic_*` files were written by the broken path and their .npy really
+is a byte buffer — re-capture rather than trying to rescue them. New captures
+that do not reconcile land as `unvalidated_raw_…`, open normally, and
+`python scripts/read_capture.py <file>` prints every reservation, which is the
+fastest way to see what the rig is actually negotiating.
+
+---
+
 ## 2026-09-06 (q) — supervisory review R1–R6: the boundary was bypassable
 
 `docs/stage-2-supervisory-review.md` reviewed the Stage 2 work and did not

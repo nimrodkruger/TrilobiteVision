@@ -34,7 +34,6 @@ import numpy as np
 from ..config import CameraConfig
 from ..types import (
     DIAGNOSTIC,
-    SCIENCE,
     SRC_ISP_MAIN,
     SRC_ISP_PREVIEW,
     SRC_RAW,
@@ -551,15 +550,27 @@ class Picamera2Source(CameraSource):
         return negotiated
 
     def _admit_raw(self, data: np.ndarray) -> tuple[np.ndarray, dict[str, Any], str]:
-        """Establish that a buffer is sensor counts, or refuse the capture.
+        """Read the buffer as an image and grade what could be established.
 
-        Returns (pixels, evidence, validity), and only reaches the diagnostic
-        return when `allow_unvalidated_raw` is set. Supervisory review R4: this
-        used to swallow every admission failure and hand back diagnostic data
-        regardless, so a science capture request could be answered -- reported
-        as successful -- with pixels the code had just established were not
-        sensor counts. The opt-in was advertised as the way that happens and
-        was not consulted.
+        Returns (pixels, evidence, validity). Three outcomes, not two:
+
+          * **science** -- everything reconciled.
+          * **unvalidated** -- it was read, and something did not reconcile.
+            The reasons are in `raw_reservations` and the pixels are the best
+            reading available. No opt-in needed: the capture succeeds, because
+            every failure in this class is visible on screen and an operator
+            needs the frame in order to see it.
+          * **diagnostic** -- the FORMAT says these bytes are not pixel values.
+            Compressed, packed or unknown. Needs `allow_unvalidated_raw`,
+            because there is no reading to produce and the failure is invisible
+            by construction. This is the case that cost a recording session.
+
+        The middle one is new and it fixes a real regression. The previous
+        version refused on any failure and, with the hatch open, handed back
+        the buffer UNTOUCHED -- so a 10-bit frame whose stride did not
+        reconcile went to disk as a 2944-wide uint8 array and displayed as
+        white noise with row structure. Refusing to vouch for values is not a
+        reason to refuse to interpret bytes.
 
         Admission runs on the buffer exactly as the sensor delivered it, BEFORE
         orientation, and that order is load-bearing. The stride padding is on
@@ -578,24 +589,13 @@ class Picamera2Source(CameraSource):
         except RawFormatError as exc:
             hatch = bool(getattr(self.cfg, "allow_unvalidated_raw", False))
             if not hatch:
-                # The science request fails. There is no silent downgrade: the
-                # caller asked for measurement data and none is available.
-                if self._raw_admissible:
-                    # Worse than the hatch case. The format was checked and
-                    # accepted at open and the buffer still does not reconcile
-                    # with it, which indicts the driver rather than the config.
-                    log.error(
-                        "%s: raw format %r was validated at open time and the "
-                        "delivered buffer still does not reconcile with it: %s",
-                        self.cam_id, fmt_name, exc)
                 raise RawFormatError(
-                    f"{self.cam_id}: this buffer cannot be admitted as sensor "
-                    f"data, so there is no science capture to return. {exc} "
-                    f"Set 'allow_unvalidated_raw: true' for this camera to "
-                    f"capture it as a diagnostic frame instead."
+                    f"{self.cam_id}: these bytes are not pixel values, so "
+                    f"there is no capture to return. {exc} Set "
+                    f"'allow_unvalidated_raw: true' for this camera to capture "
+                    f"them as a diagnostic frame instead."
                 ) from None
-            log.warning("%s: raw buffer not admitted as science data: %s",
-                        self.cam_id, exc)
+            log.warning("%s: raw buffer is not pixel data: %s", self.cam_id, exc)
             return data, {
                 "raw_admitted": False,
                 "raw_refusal": str(exc),
@@ -605,7 +605,16 @@ class Picamera2Source(CameraSource):
                 "raw_negotiated_size": list(neg.get("size") or self._full_res),
                 "raw_negotiated_stride": neg.get("stride"),
             }, DIAGNOSTIC
-        return got.array, {"raw_admitted": True, **got.meta}, SCIENCE
+
+        if got.reservations:
+            # Once per capture, at warning level, listing every reason. Not an
+            # error: the frame is usable for looking at and the operator is the
+            # one who has to decide what it means.
+            log.warning(
+                "%s: raw frame read but NOT admitted as science data (%d "
+                "reservation(s)): %s", self.cam_id, len(got.reservations),
+                "; ".join(got.reservations))
+        return got.array, dict(got.meta), got.validity
 
     def describe(self) -> CameraInfo:
         return CameraInfo(
