@@ -346,14 +346,29 @@ def _app(tmp_path, rotate_deg=0, grid_on=True, **grid):
     from trilobite.app import Application
 
     app = Application(cfg, state_path=None, restore=False)
-    cam = app.cameras["left"]
-    cam.source.open()
-    # What CameraRuntime.start() does after opening the device. Done here
-    # rather than starting the capture thread: these tests are about the
-    # endpoints, and a running thread would make them wall-clock dependent.
-    w, h = cam.source.describe().full_resolution
-    cam.mla_stage().bind_sensor(int(w), int(h), Orientation.of(cam.cfg))
+    # The capture thread runs for real now, because the camera has one owner
+    # and that owner IS the capture thread: an endpoint that sets a control is
+    # queueing work for it, and with no loop running nothing would service the
+    # queue. Started rather than faked, so these tests exercise the same
+    # threading the rig does. `_stop_started` below tears them down.
+    app.start()
+    _STARTED.append(app)
     return app, create_app(app)
+
+
+_STARTED: list = []
+
+
+@pytest.fixture(autouse=True)
+def _stop_started():
+    """Stop anything `_app` started, however the test ended.
+
+    Without this each test leaves a capture thread holding a synthetic camera
+    at 30 fps, and by the end of the file the suite is running dozens of them.
+    """
+    yield
+    while _STARTED:
+        _STARTED.pop().stop()
 
 
 def _client(api):

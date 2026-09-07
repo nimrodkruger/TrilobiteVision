@@ -577,6 +577,7 @@ def test_a_synthetic_capture_is_unvalidated_and_says_which(tmp_path):
         cam_id="left", backend="synthetic", full_resolution=(32, 24),
         preview_resolution=(32, 24), synthetic_drift_px=0.0), writer=w)
     cam.source.open()
+    cam.owner.adopt()
     try:
         out = cam.capture_still(raw=True)
     finally:

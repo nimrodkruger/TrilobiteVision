@@ -17,6 +17,11 @@ from pathlib import Path
 from typing import Any
 
 from . import net
+from .acquisition import (
+    CONTROL_DEADLINE_S,
+    STILL_DEADLINE_S,
+    CameraOwner,
+)
 from .bus import LatestFrame
 from .calibration import CalibrationSettings, DerivedOptics, readiness_report
 from .cameras.base import CameraSource
@@ -115,12 +120,29 @@ class CameraRuntime:
         self.last_error: str | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
-        self._capture_lock = threading.Lock()
+        # The single owner of `self.source`. Every call that reaches the SDK
+        # goes through it; see acquisition.py for why serialising with a mutex
+        # was not the same thing. Replaces the old `_capture_lock`, which made
+        # two threads take turns rather than making one responsible.
+        self.owner = CameraOwner(self.cam_id)
+        # Snapshotted at open, on the one thread that exists at that moment, so
+        # the UI can ask for it without a round-trip through the queue. It is
+        # a property of the configuration and does not change while running.
+        self._control_spec: dict[str, dict[str, Any]] = {}
+        # 'running' | 'stopped' | 'failed-stop'. The third is the one that
+        # matters: a camera whose thread would not join is NOT stopped, and
+        # closing it anyway races a thread that may be inside capture_request.
+        self.lifecycle = "stopped"
 
     # -- lifecycle ------------------------------------------------------
 
     def start(self) -> None:
+        # Opened here, before the capture thread exists, so there is still
+        # exactly one thread in the process touching this camera. That is why
+        # open does not need to go through the queue -- the invariant holds by
+        # construction rather than by enforcement.
         self.source.open()
+        self._control_spec = self.source.control_spec()
         # The MLA parameters are in SENSOR pixels, so the sensor frame has to be
         # declared before any of them mean anything -- here, once, from the
         # camera itself, rather than inferred from whatever frame arrives first.
@@ -136,13 +158,37 @@ class CameraRuntime:
             target=self._run, name=f"capture-{self.cam_id}", daemon=True
         )
         self._thread.start()
+        self.lifecycle = "running"
         log.info("%s: capture thread started", self.cam_id)
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 5.0) -> None:
+        """Stop the loop, then close -- and only ever in that order.
+
+        The old version joined with a timeout and closed the source regardless
+        of whether the join succeeded. That is a `close()` racing a thread that
+        may be inside `capture_request()`, which is a segfault rather than an
+        error message.
+
+        A join that times out is **failed-stop**, not stopped. The camera stays
+        held and says so. A device an operator can see is still held beats a
+        crash they cannot diagnose, and it is also the honest report: the
+        thread really is still running.
+        """
         self._stop.set()
+        # Refuse queued work first, so a caller blocked on a still is told the
+        # camera is going away instead of waiting out its deadline.
+        self.owner.retire()
         if self._thread:
-            self._thread.join(timeout=5.0)
+            self._thread.join(timeout=timeout)
+            if self._thread.is_alive():
+                self.lifecycle = "failed-stop"
+                self.last_error = (
+                    f"capture thread did not stop within {timeout:.0f} s; the "
+                    f"camera is still held and has NOT been closed")
+                log.error("%s: %s", self.cam_id, self.last_error)
+                return
         self.source.close()
+        self.lifecycle = "stopped"
         log.info("%s: stopped", self.cam_id)
 
     def _run(self) -> None:
@@ -161,10 +207,25 @@ class CameraRuntime:
         count of those is reported in status(): if `skipped` is not roughly
         (sensor fps - process fps) x uptime, the cap is not doing what it says.
         """
+        self.owner.adopt()
+        try:
+            self._loop()
+        finally:
+            # Whatever ended the loop -- stop, or an exception that escaped the
+            # per-iteration handler -- nothing else may now reach the camera
+            # through this owner, and anything queued must be told.
+            self.owner.retire()
+
+    def _loop(self) -> None:
         backoff = 0.1
         due = 0.0
         while not self._stop.is_set():
             try:
+                # Serviced before the preview read, so a still takes the next
+                # request rather than waiting a further frame period. Bounded,
+                # because the sensor has to be drained at its own rate whatever
+                # else is pending.
+                self.owner.service()
                 if self.process_interval > 0:
                     now = time.monotonic()
                     if now < due:
@@ -204,14 +265,21 @@ class CameraRuntime:
 
     # -- actions --------------------------------------------------------
 
-    def capture_still(self, raw: bool = True, tag: str = "still") -> dict[str, Any]:
-        """Full-resolution capture, saved with full provenance.
+    def grab_still(self, raw: bool = True) -> Frame:
+        """One full-resolution frame, taken by the owner thread.
 
-        Serialised per camera: two simultaneous still requests on one sensor
-        will fight over the request pool.
+        Split from the save deliberately. The camera work happens on the owner
+        thread and the disk work does not: a write to a slow USB stick must
+        never be holding an SDK request, and it must never be what a second
+        capture is queued behind.
         """
-        with self._capture_lock:
-            frame = self.source.capture_full(raw=raw)
+        return self.owner.submit(
+            "still", lambda: self.source.capture_full(raw=raw),
+            STILL_DEADLINE_S,
+        ).result
+
+    def save_frame(self, frame: Frame, tag: str) -> dict[str, Any]:
+        """Write a frame the owner already produced. Caller's thread."""
         return self.writer.save_still(
             frame,
             pipeline_settings=self.pipeline.settings_snapshot(),
@@ -219,6 +287,17 @@ class CameraRuntime:
             tag=tag,
             label=self.label,
         )
+
+    def capture_still(self, raw: bool = True, tag: str = "still") -> dict[str, Any]:
+        """Full-resolution capture, saved with full provenance.
+
+        Two steps on two threads: the owner takes the frame, this thread writes
+        it. `capture_all` uses the halves separately so both heads are asked
+        before either is written -- the old version completed each camera's
+        disk write before requesting the next, which put storage latency inside
+        the pair skew.
+        """
+        return self.save_frame(self.grab_still(raw=raw), tag)
 
     def capture_preview(self, tag: str = "view") -> dict[str, Any]:
         """Save the preview frame exactly as displayed -- post-pipeline.
@@ -245,6 +324,29 @@ class CameraRuntime:
             tag=tag,
             label=self.label,
         )
+
+    def set_controls(self, controls: dict[str, Any]) -> None:
+        """Sensor controls, applied by the owner thread.
+
+        Controls reach the SDK, so they go through the queue like everything
+        else. They apply to FUTURE requests: a control submitted while a
+        request is already in hand cannot have affected it, and the effective
+        values for any given frame come from that frame's own metadata.
+        """
+        self.owner.submit(
+            "control", lambda: self.source.set_controls(controls),
+            CONTROL_DEADLINE_S,
+        )
+
+    def control_spec(self) -> dict[str, dict[str, Any]]:
+        """Advertised control ranges, snapshotted at open.
+
+        Served from the snapshot rather than the camera: it is a property of
+        the configuration, the UI asks for it on every page load, and a
+        round-trip through the command queue for a constant would be latency
+        bought for nothing.
+        """
+        return self._control_spec
 
     def grab_full(self, timeout: float = 3.0) -> Frame | None:
         """A full-resolution mono frame, served by the capture thread.
@@ -324,6 +426,11 @@ class CameraRuntime:
             # Stage failures, which the capture-loop error count never saw:
             # the pipeline catches them and passes the frame through.
             "stage_failures": self.pipeline.failures,
+            "lifecycle": self.lifecycle,
+            # The command queue. `max_depth` and `max_age_s` are the two a
+            # bench run reads: if neither ever approached its bound, the
+            # capacity is not what is limiting anything.
+            "commands": self.owner.state(),
             "preview_shape": list(frame.shape) if frame is not None else None,
             "live": self.live_controls(),
             "info": self.source.describe().as_dict() if self.source.is_open else None,
@@ -408,7 +515,7 @@ class CameraRuntime:
         controls = state.get("controls") or {}
         if controls:
             try:
-                self.source.set_controls(controls)
+                self.set_controls(controls)
             except Exception as exc:
                 notes.append(f"{self.cam_id}: controls not restored ({exc})")
         return notes

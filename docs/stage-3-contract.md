@@ -1,5 +1,10 @@
 # Stage 3 contract — one acquisition owner and a bounded lifecycle
 
+> **Historical proposal, superseded for remaining work.** Following the user's
+> research-rig scope clarification, use [the current implementation plan](implementation-plan.md)
+> and [Stage 3 review](stage-3-review.md). The text below is retained as design
+> history, not as a requirement to implement its deferred machinery.
+
 **For supervisory review before implementation.** The amended
 `docs/implementation-plan.md` requires that "finite queue capacity and numeric
 provisional latency/freshness/shutdown thresholds" be documented and approved

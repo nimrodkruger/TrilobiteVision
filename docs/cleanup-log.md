@@ -12,6 +12,117 @@ git checkout .              # everything back to HEAD
 
 ---
 
+## 2026-09-06 (s) — stage 3: one thread owns the camera
+
+Review finding **F1**, gate **G2**. `src/trilobite/acquisition.py` is new.
+
+### What was actually wrong
+
+`capture_still` called `source.capture_full()` on whichever thread the web
+framework dispatched the request on, while the capture loop called
+`read_preview()` on its own. Two mutexes made them take turns.
+
+**Serialisation is not ownership.** A mutex does not say who releases a request
+when the holder raises, which thread may `close()` while another is inside
+`capture_request()`, or what a caller's timeout means for an SDK call that
+cannot be interrupted. The rig usually worked, and an earlier version of the
+same shape — a second thread pulling full frames at 1 Hz against a preview loop
+at 30 — took the Pi down repeatedly.
+
+### The change
+
+`CameraOwner` is a bounded queue serviced by the capture loop that already
+exists. It is not a new thread: adding one would only move the question of
+which of two loops is authoritative. Callers submit and block on a deadline;
+the capture thread is the only thread that reaches the source.
+
+| moved | from | to |
+| --- | --- | --- |
+| `capture_full` | web worker thread, under a mutex | `still` command |
+| `set_controls` | web worker thread | `control` command |
+| `control_spec` | live SDK read per page load | snapshot taken at open |
+| `open` | unchanged — the capture thread does not exist yet, so the invariant holds by construction | |
+| `close` | after a join that might have timed out | only after a join that succeeded |
+
+**Capture and save are now separate calls.** `grab_still()` runs on the owner;
+`save_frame()` runs on the caller. A write to a slow USB stick must never be
+holding an SDK request, and must never be what the next capture queues behind.
+`capture_all` uses the halves separately, so both heads are asked before either
+is written — the old loop completed each head's disk write before requesting
+the next frame, which put storage latency inside the pair skew.
+
+**A join that times out is `failed-stop`, not `stopped`.** The old code joined
+with a timeout and closed the source regardless, which is a `close()` racing a
+thread that may be inside `capture_request()` — a segfault rather than an error
+message. The camera now stays held, `lifecycle` says `failed-stop`, and status
+says why. A held device an operator can see beats a crash they cannot diagnose,
+and it is the honest report: the thread really is still running.
+
+**A submit from the owner thread runs inline** rather than queueing behind a
+loop that is currently inside the call. Not a convenience — it is the deadlock
+that would appear the first time a stage or a command submitted work.
+
+New API status codes: **429** when the queue is full or the camera is stopped
+(nothing was attempted; retrying is reasonable) and **504** when a deadline
+passes, with a message saying the capture may still have happened, because
+nothing here can interrupt an SDK call.
+
+### Scope, deliberately
+
+`docs/stage-3-contract.md` specifies seven command outcomes, control
+coalescing, per-kind fairness and generation isolation across restarts. This
+implements **five outcomes and none of the rest**. Each omitted piece guards a
+failure this rig has not exhibited, and each is another interacting state to
+get wrong — which is the same judgement the Stage 2 corrections needed applied
+in the other direction. They stay specified in the contract and unbuilt.
+
+The one bound that is currently slack is `WORK_PER_LOOP`: at capacity 8 and a
+budget of 4 it costs at most one extra frame period, so no end-to-end test can
+distinguish it from an unbounded drain. Said so in the test rather than
+pretending otherwise. It stops being slack the moment the capacity rises.
+
+### Evidence
+
+`tests/test_acquisition.py`, 17 tests. The load is deliberately concurrent and
+the recording happens INSIDE the source, below anything a test could route
+around:
+
+- **one thread, proved by id** — eight threads issuing stills and controls
+  against a running preview loop; the recorded thread set must have one member
+  and the peak concurrency inside the source must be 1. A version that merely
+  serialised would show nine threads and still pass a "captures work" test.
+- **the right thread** — the set must equal the capture thread's id, so a
+  dedicated command thread cannot satisfy it.
+- **200 captures, four threads**: every one on disk, sidecar parsing, byte
+  count matching, 200 distinct sequence numbers, no two writing one path,
+  queue empty at the end, zero errors.
+- preview keeps publishing through a 40-capture burst; a slow save does not
+  hold the camera; `capture-all` asks both heads before writing either.
+- expired queued work never executes; an abandoned command resolves once; a
+  full queue refuses; `retire` refuses work already queued rather than
+  stranding a caller on a 30-second wait; failed-stop leaves the device open.
+
+**10 mutants, all caught.** Two survived first: `retire` not refusing queued
+work, and the default `service()` budget — both were gaps in the tests, not in
+the code, and both are now covered.
+
+Suite: **457 passed, 13 skipped**, 13 browser scenarios. Ruff clean.
+
+### Bench test
+
+1. Both previews running. Take stills from two browser tabs at once for a few
+   minutes. `commands.max_depth` and `commands.max_age_s` in `/api/status` say
+   whether the queue was ever near its bound; `rejected`, `expired` and
+   `abandoned` should all be zero.
+2. Capture-all repeatedly with the output on a slow USB stick. Files land; the
+   preview does not stall.
+3. Stop the service during a capture burst. It must stop cleanly — check for
+   `failed-stop` in the log, which would mean a thread would not join.
+4. `journalctl -u trilobite | grep -i "does not own this camera"` after a
+   session. Any hit is a caller that escaped the owner and is a bug.
+
+---
+
 ## 2026-09-06 (r) — the boundary grades instead of refusing
 
 **Reported from the bench: every raw frame reads as white noise with row

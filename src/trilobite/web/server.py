@@ -39,6 +39,7 @@ from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ValidationError
 
+from ..acquisition import CommandExpired, CommandRejected
 from ..app import Application, CameraRuntime
 from ..calibration import CalibrationSettings
 from ..cameras.rawformat import RawFormatError
@@ -384,7 +385,7 @@ def create_app(application: Application) -> FastAPI:
         # camera really was at 12000 us and the box really did say 8000, and
         # the first nudge of the slider sent the sensor back to the YAML.
         return {
-            "spec": cam.source.control_spec(),
+            "spec": cam.control_spec(),
             "requested": cam.source.requested_controls(),
             "config": dict(cam.cfg.controls),
         }
@@ -513,7 +514,11 @@ def create_app(application: Application) -> FastAPI:
         """
         cam = _cam(cam_id)
         try:
-            cam.source.set_controls(body.controls)
+            cam.set_controls(body.controls)
+        except CommandRejected as exc:
+            raise HTTPException(429, str(exc)) from None
+        except CommandExpired as exc:
+            raise HTTPException(504, str(exc)) from None
         except ValueError as exc:
             raise HTTPException(422, str(exc)) from None
         except Exception as exc:
@@ -792,6 +797,14 @@ def create_app(application: Application) -> FastAPI:
         cam = _cam(cam_id)
         try:
             return cam.capture_still(raw=True, tag="raw")
+        except CommandRejected as exc:
+            # The camera is busy or stopped. 429, not 500: nothing failed, the
+            # work was never attempted, and retrying shortly is reasonable.
+            raise HTTPException(429, str(exc)) from None
+        except CommandExpired as exc:
+            # 504, and the message says the capture may still have happened.
+            # Nothing here can interrupt an SDK call.
+            raise HTTPException(504, str(exc)) from None
         except RawFormatError as exc:
             log.warning("%s: raw capture refused: %s", cam_id, exc)
             raise HTTPException(422, {
@@ -820,22 +833,42 @@ def create_app(application: Application) -> FastAPI:
     def capture_all(kind: str) -> dict[str, Any]:
         """Trigger every camera. kind is 'raw' or 'view'.
 
-        This is NOT synchronised capture. Requests go out sequentially from one
-        thread and the sensors free-run, so frames may be tens of milliseconds
-        apart. For stereo or plenoptic work needing real simultaneity, wire the
-        IMX296 XVS pins together and drive an external trigger -- software
-        cannot fix this.
+        This is NOT synchronised capture. The sensors free-run, so frames are
+        tens of milliseconds apart. For stereo or plenoptic work needing real
+        simultaneity, wire the IMX296 XVS pins together and drive an external
+        trigger -- software cannot fix this.
+
+        What software CAN fix, and this now does, is not making it worse. The
+        old version completed each head's **disk write** before requesting the
+        next frame, so storage latency landed inside the pair skew -- tens of
+        milliseconds of sensor difference plus however long a USB stick took.
+        Both heads are now asked before either is written.
         """
         if kind not in ("raw", "view"):
             raise HTTPException(404, "kind must be 'raw' or 'view'")
-        out: dict[str, Any] = {}
+        if kind == "view":
+            out: dict[str, Any] = {}
+            for cam_id, cam in application.cameras.items():
+                try:
+                    out[cam_id] = cam.capture_preview(tag="view")
+                except Exception as exc:
+                    out[cam_id] = {"error": f"{type(exc).__name__}: {exc}"}
+            return out
+
+        # Ask every head first. Each submit blocks only until that camera's
+        # owner services it, which is at most one frame period, and the two
+        # owners are independent threads.
+        frames: dict[str, Any] = {}
+        out = {}
         for cam_id, cam in application.cameras.items():
             try:
-                out[cam_id] = (
-                    cam.capture_still(raw=True, tag="raw")
-                    if kind == "raw"
-                    else cam.capture_preview(tag="view")
-                )
+                frames[cam_id] = cam.grab_still(raw=True)
+            except Exception as exc:
+                out[cam_id] = {"error": f"{type(exc).__name__}: {exc}"}
+        # Then write. Slow storage now delays the files, not the exposures.
+        for cam_id, frame in frames.items():
+            try:
+                out[cam_id] = application.camera(cam_id).save_frame(frame, "raw")
             except Exception as exc:
                 out[cam_id] = {"error": f"{type(exc).__name__}: {exc}"}
         return out
