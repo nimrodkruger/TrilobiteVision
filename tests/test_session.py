@@ -14,6 +14,7 @@ timing is a state machine tested slowly and flakily.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -70,11 +71,29 @@ def make_session(tmp_path, app, **capture):
     return CaptureSession(app.cameras, settings(**capture), root=tmp_path / "out")
 
 
-def warm(app, n=3):
-    """Let each camera produce presence maps."""
+def warm(app, n=3, timeout=5.0):
+    """Wait for each camera's own loop to publish `n` processed frames.
+
+    It used to call `cam.source.read_preview()` from the test thread while
+    `app.start()` had real capture threads running -- which is precisely the
+    two-consumer arrangement Stage 3 exists to prevent, done by the test
+    harness itself. It passed because nothing checked. Enforcing ownership in
+    the source found it.
+
+    Waiting on the bus is both correct and a better test: the presence maps
+    now come from the production path rather than from a second caller
+    reaching past it.
+    """
     for cam in app.cameras.values():
-        for _ in range(n):
-            cam.pipeline(cam.source.read_preview())
+        start = cam.preview.get()[0]
+        deadline = time.monotonic() + timeout
+        while cam.preview.get()[0] < start + n:
+            if time.monotonic() > deadline:
+                raise AssertionError(
+                    f"{cam.cam_id}: only {cam.preview.get()[0] - start} of {n} "
+                    f"frames published in {timeout}s (errors={cam.errors}, "
+                    f"last={cam.last_error})")
+            time.sleep(0.01)
 
 
 # -- the state machine ------------------------------------------------------

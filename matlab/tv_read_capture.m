@@ -43,6 +43,17 @@ function cap = tv_read_capture(path)
 %                   correction to undo.
 %     .files        the paths it read
 %
+%     .schema       sidecar schema version; 0 if the file predates the field.
+%                   A newer version than this reader knows is REFUSED.
+%     .processing   the frozen record of what the pipeline did: .ran, .revision
+%                   and per-stage outcomes. .ran == false means the pixels came
+%                   straight off the sensor and .pipeline below is the
+%                   alignment at exposure, NOT processing applied to them.
+%     .controls     .requested / .effective / .unknown sensor controls, kept
+%                   apart. A requested value is a preference; .effective is
+%                   what this frame's own metadata reported.
+%     .saved        ids and times for this particular write.
+%
 %     .trimmed_padding  columns of raw row-stride padding removed on load
 %
 %   TWO THINGS ARE RECONCILED HERE, and both are silent when wrong.
@@ -119,6 +130,37 @@ function cap = tv_read_capture(path)
     end
   end
 
+  % The sidecar schema this reader understands. A file claiming a newer one is
+  % REFUSED rather than parsed hopefully: the point of a version field is that
+  % a reader which does not know the shape says so, instead of quietly reading
+  % the fields it recognises while ignoring the ones that changed meaning.
+  SUPPORTED_SCHEMA = 1;
+  cap_schema = 0;                       % 0 = written before the field existed
+  if isfield(info, 'schema')
+    cap_schema = double(info.schema);
+    if ~isfinite(cap_schema)
+      error('tv_read_capture:schema', ...
+            ['%s: sidecar schema is not a version number. Refusing to guess ' ...
+             'at the file''s shape.'], img_path);
+    end
+    if cap_schema > SUPPORTED_SCHEMA
+      error('tv_read_capture:schema', ...
+            ['%s: sidecar schema %d, and this reader understands up to %d. ' ...
+             'Fields may have changed meaning, so it is refused rather than ' ...
+             'half-read. Update the MATLAB readers from the same commit that ' ...
+             'wrote the file.'], img_path, cap_schema, SUPPORTED_SCHEMA);
+    end
+  end
+
+  % Prefer the blocks, fall back to the flattened keys for older files. The
+  % writer emits both for now, so this is what keeps the archive readable.
+  if isfield(info, 'acquisition') && isstruct(info.acquisition)
+    acq = info.acquisition;
+    for f = fieldnames(acq)'
+      info.(f{1}) = acq.(f{1});
+    end
+  end
+
   [img, trimmed] = i_trim_stride(img, info);
 
   cap = struct();
@@ -129,6 +171,10 @@ function cap = tv_read_capture(path)
   cap.info   = info;
   cap.files  = struct('image', img_path, 'metadata', json_path);
 
+  cap.schema     = cap_schema;
+  cap.processing = i_get(info, 'processing', struct());
+  cap.saved      = i_get(info, 'saved', struct());
+  cap.controls   = i_get(info, 'controls', struct());
   cap.cam_id = i_get(info, 'cam_id', '');
   cap.tag    = i_get(info, 'tag', '');
   cap.space  = i_get(info, 'space', '');

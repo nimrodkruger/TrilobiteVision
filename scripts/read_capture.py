@@ -81,7 +81,7 @@ import argparse
 import csv
 import json
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -136,6 +136,16 @@ class Capture:
     admitted: bool = False
     # What the rig could not establish, verbatim. Empty for an admitted frame.
     reservations: tuple[str, ...] = ()
+    # Sidecar schema version. 0 means the file predates the field.
+    schema: int = 0
+    # The frozen processing record: whether the pipeline ran, under which
+    # revision, and each stage's outcome. `{}` for a file written before it.
+    processing: dict[str, Any] = field(default_factory=dict)
+    # This particular write: ids and times that may differ between two saves
+    # of one retained frame.
+    saved: dict[str, Any] = field(default_factory=dict)
+    # Requested / effective / unknown sensor controls, kept apart.
+    controls: dict[str, Any] = field(default_factory=dict)
 
     # MLA geometry converted to THIS frame's pixels, or None if unrecorded.
     pitch: float | None = None
@@ -359,6 +369,32 @@ def _isotropic_scale(ref_w: int, ref_h: int, w: int, h: int, what: str) -> float
     return sx
 
 
+# The sidecar schema this reader understands. A file claiming a newer one is
+# REFUSED rather than parsed hopefully: the whole point of a version field is
+# that a reader which does not know the shape says so instead of silently
+# reading the fields it recognises and ignoring the ones that changed meaning.
+SUPPORTED_SCHEMA = 1
+
+
+def _check_schema(path: Path, meta: dict[str, Any]) -> int:
+    schema = meta.get("schema")
+    if schema is None:
+        return 0            # written before the field existed
+    try:
+        schema = int(schema)
+    except (TypeError, ValueError):
+        raise SystemExit(
+            f"{path.name}: sidecar schema is {meta['schema']!r}, which is not a "
+            f"version number. Refusing to guess at the file's shape.") from None
+    if schema > SUPPORTED_SCHEMA:
+        raise SystemExit(
+            f"{path.name}: sidecar schema {schema}, and this reader understands "
+            f"up to {SUPPORTED_SCHEMA}. Fields may have changed meaning, so it "
+            f"is refused rather than half-read. Update the reader from the same "
+            f"commit that wrote the file.")
+    return schema
+
+
 def load(npy_path: Path) -> Capture:
     path = Path(npy_path)
     if not path.exists():
@@ -369,27 +405,40 @@ def load(npy_path: Path) -> Capture:
     if not side.exists():
         print(f"warning: no sidecar beside {path.name} — pixels only", file=sys.stderr)
 
-    image, trimmed = _trim_stride(image, meta)
-    cap = Capture(path=path, image=image, meta=meta, kind="bare")
+    cap_schema = _check_schema(path, meta)
+    # Prefer the blocks; fall back to the flattened keys for older files. The
+    # writer emits both for now, so this is the path that keeps the archive
+    # readable rather than a branch that never runs.
+    acq = meta.get("acquisition") if isinstance(meta.get("acquisition"), dict) else {}
+    merged = {**meta, **acq}
+
+    image, trimmed = _trim_stride(image, merged)
+    cap = Capture(path=path, image=image, meta=merged, kind="bare")
+    cap.schema = cap_schema
+    cap.processing = meta.get("processing") if isinstance(
+        meta.get("processing"), dict) else {}
+    cap.saved = meta.get("saved") if isinstance(meta.get("saved"), dict) else {}
+    cap.controls = acq.get("controls") if isinstance(
+        acq.get("controls"), dict) else {}
     cap.trimmed_padding = trimmed
     # Captures put driver metadata under `sensor_metadata`; poses under
     # `sensor`. One name here so the eligibility rules do not have to know
     # which kind of file they are looking at.
-    sensor = meta.get("sensor_metadata") or meta.get("sensor") or {}
+    sensor = merged.get("sensor_metadata") or merged.get("sensor") or {}
     cap.rotate_deg = int(sensor.get("rotate_deg") or 0)
     cap.flip_horizontal = bool(sensor.get("flip_horizontal"))
     cap.flip_vertical = bool(sensor.get("flip_vertical"))
     # Top level, written for every capture and every pose. A file from before
     # the boundary existed has neither key and stays 'unknown', which is
     # refused rather than assumed good (R1).
-    recorded = str(meta.get("validity") or "")
+    recorded = str(merged.get("validity") or "")
     cap.validity = recorded if recorded in ("science", "diagnostic",
                                             "unvalidated") else "unknown"
     if recorded and cap.validity == "unknown":
         print(f"warning: {path.name} records validity {recorded!r}, which this "
               f"reader does not recognise — treating it as unknown. It may come "
               f"from a newer schema.", file=sys.stderr)
-    cap.source_kind = str(meta.get("source_kind") or "unknown")
+    cap.source_kind = str(merged.get("source_kind") or "unknown")
     cap.refusal = str(sensor.get("raw_refusal") or "")
     # The evidence a `science` claim rests on. Without it the label is just a
     # string in a file anyone can edit.
@@ -551,11 +600,50 @@ def describe(cap: Capture) -> None:
         if m.get("forced"):
             print("              taken with the keyboard override")
 
+    # Processing: whether the pipeline touched these pixels at all, and what
+    # each stage did. The distinction that matters is `ran` -- a raw capture
+    # carries the stage parameters as CONTEXT (the alignment at exposure) and
+    # did not go through them.
+    pr = cap.processing
+    if pr:
+        if pr.get("ran"):
+            bits = []
+            for s in pr.get("stages") or []:
+                mark = {"ok": "", "skipped": " (skipped)",
+                        "failed": " FAILED"}.get(s.get("outcome"), "")
+                bits.append(f"{s.get('name')}{mark}")
+            print(f"processing  : ran, revision {pr.get('revision')} — "
+                  + ", ".join(bits))
+            for s in pr.get("stages") or []:
+                if s.get("outcome") == "failed":
+                    print(f"              ! {s.get('name')}: {s.get('reason')}")
+        else:
+            print(f"processing  : BYPASSED (revision {pr.get('revision')}) — "
+                  f"straight off the sensor. The stage parameters below are "
+                  f"the\n              alignment at exposure, NOT processing "
+                  f"applied to these pixels.")
     pipe = m.get("pipeline") or {}
     if pipe and cap.kind != "pose":
-        print("pipeline    : " + ", ".join(
+        print("parameters  : " + ", ".join(
             f"{k}({'on' if v.get('enabled', True) else 'off'})"
             for k, v in pipe.items() if isinstance(v, dict)))
+
+    # Requested is a preference; effective is what the frame's own metadata
+    # reports. Anything requested and not reported is listed as unknown and
+    # never filled in from the request.
+    if cap.controls:
+        eff = cap.controls.get("effective") or {}
+        req = cap.controls.get("requested") or {}
+        if eff:
+            print("controls    : effective  " + "  ".join(
+                f"{k}={v}" for k, v in eff.items()))
+        if req:
+            print("              requested  " + "  ".join(
+                f"{k}={v}" for k, v in req.items()))
+        unknown = cap.controls.get("unknown") or []
+        if unknown:
+            print(f"              UNKNOWN: {', '.join(unknown)} — requested, "
+                  f"and this frame's metadata does not say what was used")
 
 
 # --------------------------------------------------------------------------

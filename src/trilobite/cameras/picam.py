@@ -73,6 +73,10 @@ class Picamera2Source(CameraSource):
         # stream ACTUALLY is. Admission checks against this and nothing else.
         self._raw_negotiated: dict[str, Any] = {
             "format": "", "size": (0, 0), "stride": None}
+        # True only if a failed startup could not give the device back. Reported
+        # rather than assumed away: it changes the recovery advice from "fix the
+        # config" to "restart the service".
+        self._partial_open_leaked = False
 
     @staticmethod
     def _split_controls(picam: Any, controls: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
@@ -121,6 +125,54 @@ class Picamera2Source(CameraSource):
         self._info = available[self.cfg.index]
 
         picam = Picamera2(self.cfg.index)
+        try:
+            self._configure_and_start(picam)
+        except BaseException:
+            # **Every** failure between construction and a started camera, not
+            # just the raw-format refusals that used to be special-cased. The
+            # device is held from `Picamera2(index)` onwards, and a held device
+            # makes the NEXT open report no cameras at all -- which reads as
+            # absent hardware and sends the operator to the ribbon cables.
+            #
+            # BaseException on purpose: a KeyboardInterrupt during startup
+            # leaves the camera held just as thoroughly as a ValueError does.
+            self._release_partial(picam)
+            raise
+        self._picam = picam
+        self._open = True
+        log.info(
+            "%s: opened %s at %sx%s (mono=%s), preview %sx%s, raw %s -> %s",
+            self.cam_id,
+            self._info.get("Model", "unknown"),
+            self._full_res[0],
+            self._full_res[1],
+            self._mono,
+            *self.cfg.preview_resolution,
+            self._raw_choice,
+            "science" if self._raw_admissible else "DIAGNOSTIC ONLY",
+        )
+
+    def _release_partial(self, picam: Any) -> None:
+        """Give the device back after a failed startup, and say if we could not.
+
+        `close()` can itself raise. Swallowing that and reporting the camera
+        released would be the same class of untruth as the rest of this module
+        exists to prevent, so the failure is logged as an error and the state
+        says the device may still be held.
+        """
+        with contextlib.suppress(Exception):
+            picam.stop()
+        try:
+            picam.close()
+        except Exception:
+            self._partial_open_leaked = True
+            log.exception(
+                "%s: a partially opened camera could NOT be released. The "
+                "device is probably still held, so the next open may report "
+                "no cameras at all. Restart the service before looking at "
+                "cables.", self.cam_id)
+
+    def _configure_and_start(self, picam: Any) -> None:
         sensor_res = picam.sensor_resolution
         full = tuple(self.cfg.full_resolution or sensor_res)
         self._full_res = (int(full[0]), int(full[1]))
@@ -134,16 +186,10 @@ class Picamera2Source(CameraSource):
         )
 
         raw_stream: dict[str, Any] = {"size": sensor_res}
-        try:
-            chosen = self._choose_raw_format(picam)
-        except RawFormatError:
-            # A refusal here means the camera must not open at all. Release the
-            # device before the exception leaves, or the next attempt -- after
-            # the operator has fixed the config -- finds libcamera reporting no
-            # cameras and goes looking at ribbon cables.
-            with contextlib.suppress(Exception):
-                picam.close()
-            raise
+        # No local cleanup here any more: open() wraps this whole method and
+        # releases the device on any failure, which covers configure, controls
+        # and start as well as this refusal.
+        chosen = self._choose_raw_format(picam)
         if chosen:
             raw_stream["format"] = chosen
 
@@ -166,12 +212,7 @@ class Picamera2Source(CameraSource):
         #     in the config sizes `main`; raw is configured at the sensor's
         #     native size. Checking a raw buffer against the main resolution
         #     happens to work only while the two are equal.
-        try:
-            self._raw_negotiated = self._read_back_raw(picam)
-        except RawFormatError:
-            with contextlib.suppress(Exception):
-                picam.close()
-            raise
+        self._raw_negotiated = self._read_back_raw(picam)
 
         if "MONO" in str(self._raw_negotiated.get("format", "")).upper():
             # A configured mono sensor reports a MONO_* raw format. That is a
@@ -204,19 +245,6 @@ class Picamera2Source(CameraSource):
             picam.set_controls(supported)
 
         picam.start()
-        self._picam = picam
-        self._open = True
-        log.info(
-            "%s: opened %s at %sx%s (mono=%s), preview %sx%s, raw %s -> %s",
-            self.cam_id,
-            self._info.get("Model", "unknown"),
-            self._full_res[0],
-            self._full_res[1],
-            self._mono,
-            *self.cfg.preview_resolution,
-            self._raw_choice,
-            "science" if self._raw_admissible else "DIAGNOSTIC ONLY",
-        )
 
     def close(self) -> None:
         if not self._open:
@@ -231,6 +259,7 @@ class Picamera2Source(CameraSource):
             self._open = False
 
     def read_preview(self) -> Frame | None:
+        self._check_owner("read_preview")
         if not self._open:
             return None
         want_full = self.full_frame_pending
@@ -295,6 +324,7 @@ class Picamera2Source(CameraSource):
         away. Metadata is still kept: auto-exposure state should not go stale
         just because the pipeline is running slower than the sensor.
         """
+        self._check_owner("skip_preview")
         if not self._open:
             return
         if self.full_frame_pending:
@@ -309,6 +339,7 @@ class Picamera2Source(CameraSource):
                 request.release()
 
     def capture_full(self, raw: bool = True) -> Frame:
+        self._check_owner("capture_full")
         if not self._open:
             raise RuntimeError(f"{self.cam_id}: camera not open")
         stream = "raw" if raw else "main"
@@ -641,6 +672,7 @@ class Picamera2Source(CameraSource):
         )
 
     def set_controls(self, controls: dict[str, Any]) -> None:
+        self._check_owner("set_controls")
         if not self._open:
             raise RuntimeError(f"{self.cam_id}: camera not open")
 

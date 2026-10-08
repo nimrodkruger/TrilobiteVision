@@ -49,6 +49,29 @@ class CameraSource(ABC):
         self._full_ready = threading.Event()
         self._full_lock = threading.Lock()
         self._full_frame: Frame | None = None
+        self._owner: Any = None
+
+    # -- ownership ------------------------------------------------------
+    #
+    # Bound by CameraRuntime.start() once the capture thread exists. Until then
+    # it is None and every check below is a no-op, which is correct: `open()`
+    # legitimately runs before there is an owner to be.
+    #
+    # This is what makes "one thread touches the camera" an ENFORCED property
+    # rather than a convention. The Stage 3 review was right to object to the
+    # earlier claim: `assert_owner` existed, was unit-tested, and was called
+    # from nowhere in the acquisition path, so it backstopped nothing. Calling
+    # it from the source itself puts the check below anything a caller could
+    # route around, and turns the bug class that took the rig down into a
+    # traceback naming the offending thread.
+
+    def bind_owner(self, owner: Any) -> None:
+        self._owner = owner
+
+    def _check_owner(self, what: str) -> None:
+        owner = getattr(self, "_owner", None)
+        if owner is not None:
+            owner.assert_owner(f"{type(self).__name__}.{what}")
 
     # -- lifecycle ------------------------------------------------------
 

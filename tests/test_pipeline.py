@@ -90,8 +90,13 @@ def test_broken_stage_does_not_kill_the_pipeline():
     p = Pipeline.from_config([StageConfig(type="lenslet_extract", name="lf",
                                           params={"enabled": True})])
     f = make_frame()
-    # lenslet_extract raises NotImplementedError; the frame must still come out.
-    assert p(f) is f
+    # lenslet_extract accepts only `raw`, so a mono8 preview is declined and
+    # the PIXELS must still come out. The frame itself is a new object now:
+    # the pipeline attaches its execution record to whatever it returns.
+    out = p(f)
+    assert out.data is f.data
+    assert out.processing["stages"][0]["outcome"] == "skipped"
+    assert "accepts" in out.processing["stages"][0]["reason"]
 
 
 def test_synthetic_camera_roundtrip():
@@ -215,7 +220,10 @@ def test_state_round_trip(tmp_path):
     app = Application(make_cfg(), state_path=state)
     app.start()
     app.camera("left").pipeline.update_params("display", {"gain": 2.75, "gamma": 1.4})
-    app.camera("left").source.set_controls({"AnalogueGain": 4.0})
+    # Through the runtime, not the source: controls reach the SDK, so they
+    # go through the owner like everything else. Calling the source
+    # directly from here is the off-thread access the source now refuses.
+    app.camera("left").set_controls({"AnalogueGain": 4.0})
     app.stop()
     assert state.exists()
 

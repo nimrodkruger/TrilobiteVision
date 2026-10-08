@@ -230,6 +230,54 @@ def verify_device(directory: Path, size_bytes: int = 4 << 20) -> dict[str, Any]:
     return result
 
 
+# Bumped when the shape of a sidecar changes in a way a reader must notice.
+# Both readers refuse a version they do not know rather than guessing at it.
+SIDECAR_SCHEMA = 1
+
+
+def _controls_block(
+    requested: dict[str, Any] | None, meta: dict[str, Any],
+) -> dict[str, Any]:
+    """Requested and effective, kept apart, with the gap named.
+
+    `requested` is what somebody asked the sensor for. `effective` is what this
+    frame's own driver metadata reports. They are different things and the
+    difference is the whole point: under auto-exposure the request is a
+    preference and the metadata is the fact, and a control submitted while a
+    request was already in flight cannot have affected it at all.
+
+    Anything requested that the metadata does not report comes back under
+    `unknown`. **It is never backfilled from the request** -- that would be
+    presenting a preference as a measurement, which is the same move the raw
+    admission boundary refuses for pixel values.
+    """
+    requested = dict(requested or {})
+    effective_keys = ("ExposureTime", "AnalogueGain", "DigitalGain", "AeLocked",
+                      "ColourGains", "SensorTimestamp")
+    effective = {k: _jsonable(meta[k]) for k in effective_keys if k in meta}
+    unknown = sorted(k for k in requested if k not in effective)
+    return {
+        "requested": _jsonable(requested),
+        "effective": effective,
+        "unknown": unknown,
+    }
+
+
+def _pipeline_block(processing: dict[str, Any] | None) -> dict[str, Any]:
+    """Stage parameters in the flat `{name: {type, ...}}` shape readers expect.
+
+    Built from the frozen execution record, never from the live pipeline.
+    """
+    if not processing:
+        return {}
+    if processing.get("ran"):
+        return {
+            s["name"]: {"type": s["type"], **_jsonable(s.get("params") or {})}
+            for s in processing.get("stages") or []
+        }
+    return _jsonable(processing.get("params_at_capture") or {})
+
+
 def _jsonable(value: Any) -> Any:
     """libcamera metadata contains tuples, numpy scalars and enums."""
     if isinstance(value, (str, int, float, bool)) or value is None:
@@ -442,11 +490,24 @@ class SessionWriter:
     def save_still(
         self,
         frame: Frame,
-        pipeline_settings: dict[str, Any] | None = None,
         camera_info: dict[str, Any] | None = None,
         tag: str = "still",
         label: str | None = None,
+        controls: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """Write a frame and the record of where it came from.
+
+        **`pipeline_settings` is gone.** It was read from the live pipeline at
+        save time, which is the Stage 4 bug: edit a gain between capture and
+        save and the sidecar described a value that never touched the pixels,
+        while a raw capture -- which never enters the pipeline at all -- got a
+        full parameter block describing processing that did not happen. What
+        the frame was processed under now travels on the frame, frozen at
+        execution by `Pipeline.__call__`, and this method serialises it.
+
+        `controls` is the REQUESTED set, kept separate from what the frame's
+        own metadata says was effective. See `_controls_block`.
+        """
         with self._lock:
             self._counter += 1
             n = self._counter
@@ -489,30 +550,81 @@ class SessionWriter:
                 raise
             img_path, img_bytes = self._write_image(stem, frame)
 
+        # THREE BLOCKS, ONE FILE, ONE VERSION.
+        #
+        # `acquisition` is where the pixels came from, `processing` is what was
+        # done to them, `saved` is this particular write. They are separate
+        # because they have different lifetimes: the same retained frame saved
+        # twice must produce identical acquisition and processing blocks and
+        # may legitimately differ in `saved`. Three blocks rather than three
+        # files, because three files would have to be rejoined by every reader
+        # for no benefit.
+        #
+        # The identity keys stay at the top level. They are what a reader
+        # indexes on and what a directory listing is sorted by, and burying
+        # them inside a block would mean opening two levels to find out which
+        # camera a file came from.
         sidecar = {
+            "schema": SIDECAR_SCHEMA,
             "file": img_path.name,
             "cam_id": frame.cam_id,
             "camera_label": label or frame.cam_id,
             "tag": tag,
+            "t_iso": datetime.fromtimestamp(frame.t_wall).isoformat(),
+
+            "acquisition": {
+                "seq": frame.seq,
+                "t_monotonic": frame.t_mono,
+                "t_wall": frame.t_wall,
+                "space": frame.space,
+                # 'science', 'diagnostic' or 'unvalidated'. The field an
+                # offline reader must check before fitting anything:
+                # `space: raw` says the ISP was bypassed, which is a statement
+                # about the PATH, not about whether the values that came down
+                # it are sensor counts.
+                "validity": frame.validity,
+                # What produced the pixels. Recorded alongside validity because
+                # measurement eligibility is not one predicate -- corner
+                # geometry off an ISP mono frame is defensible where radiometry
+                # off the same frame is not, and a reader cannot tell those
+                # apart without this.
+                "source_kind": frame.source_kind,
+                "dtype": str(frame.data.dtype),
+                "shape": list(frame.data.shape),
+                "sensor_metadata": _jsonable(frame.meta),
+                "controls": _controls_block(controls, frame.meta),
+                "camera": _jsonable(camera_info or {}),
+            },
+
+            # Frozen at execution, or `ran: false` naming what was bypassed.
+            # Never read from the live pipeline.
+            "processing": _jsonable(frame.processing or {"ran": False}),
+
+            # The stage parameters, in the flat shape every existing reader
+            # already understands -- but now taken from the FROZEN record
+            # rather than from the live pipeline, which is the whole point of
+            # the stage. For a processed frame these are the values the pixels
+            # went through; for a raw capture they are the alignment as it
+            # stood at exposure, and `processing.ran` is false to say so. The
+            # MLA geometry is needed either way: it describes the optics, not
+            # a processing step, and `read_capture.py --grid` reads it here.
+            "pipeline": _pipeline_block(frame.processing),
+
+            # -- flattened duplicates, for readers that predate the blocks ----
+            # Kept deliberately and marked, because a sidecar schema change
+            # that breaks every existing reader and every archived analysis
+            # script is a worse outcome than six duplicated scalars. The blocks
+            # above are authoritative; these go when the readers no longer
+            # look at them.
             "seq": frame.seq,
             "t_monotonic": frame.t_mono,
             "t_wall": frame.t_wall,
-            "t_iso": datetime.fromtimestamp(frame.t_wall).isoformat(),
             "space": frame.space,
-            # 'science', 'diagnostic' or 'unvalidated'. The field an offline
-            # reader must check before fitting anything: `space: raw` says the
-            # ISP was bypassed, which is a statement about the PATH, not about
-            # whether the values that came down it are sensor counts.
             "validity": frame.validity,
-            # What produced the pixels. Recorded alongside validity because
-            # measurement eligibility is not one predicate -- corner geometry
-            # off an ISP mono frame is defensible where radiometry off the same
-            # frame is not, and a reader cannot tell those apart without this.
             "source_kind": frame.source_kind,
             "dtype": str(frame.data.dtype),
             "shape": list(frame.data.shape),
             "sensor_metadata": _jsonable(frame.meta),
-            "pipeline": _jsonable(pipeline_settings or {}),
             "camera": _jsonable(camera_info or {}),
             "bytes": img_bytes,
             # What durability this filesystem actually gave us, measured on the
@@ -523,6 +635,18 @@ class SessionWriter:
             # different things on the Pi and on a Windows desktop.
             "durability": durability_of(img_path.parent),
         }
+        # The one block that may legitimately differ between two saves of the
+        # same retained frame: which write this was, when, and to where. Built
+        # BEFORE serialisation, or it would not be in the file at all.
+        sidecar["saved"] = {
+            "save_id": n,
+            "t_iso": datetime.now().isoformat(),
+            "path": str(img_path),
+            "bytes": img_bytes,
+            "durability": sidecar["durability"],
+            "session_dir": str(self.session_dir),
+        }
+
         meta_path = img_path.with_suffix(".json")
         payload = json.dumps(sidecar, indent=2).encode("utf-8")
         write_durably(meta_path, payload)

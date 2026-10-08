@@ -12,6 +12,160 @@ git checkout .              # everything back to HEAD
 
 ---
 
+## 2026-10-08 (t) — stage 4, and the Stage 3 review's three corrections
+
+`docs/stage-3-review.md` arrived after Stage 3 shipped and reproduced **two
+races in code I had just written**, plus an overclaim. Those are fixed first,
+because a reproduced race should not wait for a stage boundary.
+
+### The Stage 3 corrections
+
+**`start()` did not check whether the old worker was alive.** After `stop()`
+returned `failed-stop`, `start()` cleared the shared stop event and launched a
+second worker against the same source — straight back into the two-consumer
+state that took the Pi down, with the failed-stop report protecting nothing.
+The review's probe:
+
+```text
+AFTER STOP failed-stop old thread alive True
+RESTART ALLOWED True both alive True lifecycle running
+```
+
+Start now refuses while a worker is alive, and start/stop are mutually
+exclusive under one lock. Overlapping lifetimes are prohibited rather than
+tracked, which is why no generation counter is needed.
+
+**`Command._resolve` claimed to be a compare-and-set and was not.** `if
+self.outcome != "queued"` followed by an assignment is a read and a write with
+a thread switch available in between, so a completing owner and a timing-out
+caller could both observe `queued` and both report success:
+
+```text
+RESOLVE RACE [('abandoned', True), ('done', True)] final done
+```
+
+The GIL makes each assignment atomic and does nothing for a read-then-write,
+which is exactly what the old comment got wrong. All three transitions —
+`_resolve`, `claim_for_execution`, `give_up` — now happen under one lock, and
+`started` distinguishes **work that never ran** (`expired`, nothing happened)
+from **work already inside `fn`** (`abandoned`, something may have). Queue
+admission and retirement share a second lock, closing the window where a put
+could land behind a drain and strand its caller for a full deadline.
+
+**`open()` cleaned up only the raw-format refusals.** The device is held from
+`Picamera2(index)` onward, so a failure in configure, controls or start left it
+held — and a held device makes the next open report no cameras at all, which
+reads as absent hardware and sends you to the ribbon cables. Startup is now one
+try/except over the whole sequence, on `BaseException` because a
+KeyboardInterrupt holds the camera just as thoroughly. If the release itself
+fails, `_partial_open_leaked` records it and the advice changes from "fix the
+config" to "restart the service" rather than being swallowed.
+
+**And the overclaim.** The review was right: `assert_owner` existed, was
+unit-tested, and was called from nowhere in the acquisition path. It
+backstopped nothing. `CameraSource.bind_owner` now wires it into the source
+itself, below anything a caller can route around, and `read_preview`,
+`skip_preview`, `capture_full` and `set_controls` all check.
+
+**It immediately found two real violations — in the test suite.**
+`test_session.warm()` called `source.read_preview()` from the test thread while
+`app.start()` had capture threads running, which is the exact two-consumer
+arrangement this stage exists to prevent, performed by the harness. It passed
+for months because nothing checked. It now waits on the bus instead, which is
+both correct and a better test: the presence maps come from the production
+path. `test_pipeline` was calling `source.set_controls` directly; it goes
+through the runtime now.
+
+### Stage 4
+
+Three items, down from six — the other three were already built by R1/R2.
+
+**1. The processing record is frozen at execution.** `save_frame` called
+`pipeline.settings_snapshot()` *at save time*, so editing a gain between
+capture and save wrote a value that never touched the pixels. `Pipeline.__call__`
+now attaches its own record to the frame it returns: the revision, the ordered
+stages, each stage's parameters **captured before it ran**, and its outcome.
+The writer serialises what the frame carries and reads nothing live.
+
+The lock is also now held across the whole pass. It used to be taken only to
+copy the stage list, while the docstring claimed each frame saw a consistent
+parameter set — which did not follow: an update landing between stage two and
+stage three gave that frame a mixture of two revisions and nothing recorded
+which. A pipeline pass is a few milliseconds and a slider waiting that long is
+imperceptible.
+
+Three outcomes per stage, because "ran" and "did nothing" were indistinguishable:
+`ok`, `skipped` (with `disabled` or a space mismatch as the reason), `failed`
+(with the exception). A presence stage that shipped switched off is the reason
+this distinction exists.
+
+**2. Three blocks and a schema version.** `acquisition` / `processing` /
+`saved`, plus `schema: 1`, in one file rather than three — three files would
+have to be rejoined by every reader for no gain. `saved` is the only block that
+may differ between two saves of one retained frame.
+
+A raw capture says `ran: false` and names what it bypassed. It still records
+the stage parameters, under `params_at_capture`, and the reason is worth stating:
+**the MLA alignment describes the optics, not a processing step.** A raw capture
+needs it so `read_capture.py --grid` can draw the grid that was aligned at the
+moment of exposure. What changed is that it is snapshotted at capture on the
+owner thread, and `ran: false` says plainly that none of it touched the pixels.
+
+Both readers refuse a schema they do not know rather than half-parsing it. The
+flattened top-level keys are still written, marked as duplicates for readers
+that predate the blocks — breaking every archived analysis script to save six
+scalars would be a poor trade.
+
+**3. Requested is not effective.** `acquisition.controls` carries `requested`,
+`effective` (from the frame's own driver metadata) and `unknown` — anything
+asked for that this frame cannot confirm. Never backfilled from the request,
+which would present a preference as a measurement: the same move the raw
+boundary refuses for pixel values.
+
+### Testing
+
+`tests/test_provenance.py`, 14 tests. The acceptance test is the one the
+original plan had **inverted** — it asked for two saves of one frame to differ.
+Retain a processed frame, edit the pipeline, save it twice: pixels, acquisition
+and processing must be byte-identical and only `saved` may differ. Plus the
+barrier test for one-revision-per-execution, bypass records, per-stage
+outcomes, the controls split, and the reader's schema refusal.
+
+**18 mutants, all caught.** Three survived the first pass and all three were my
+tests being timing-dependent rather than asserting the contract: removing the
+lock from `_resolve`, removing it from queue admission, and disabling the owner
+check. A barrier gets two threads to the door together and then the GIL's 5 ms
+switch interval makes an interleaving inside three bytecodes unlikely — so the
+race test stressed the code without pinning the invariant. Replaced with a
+counting lock that asserts the transition is taken while held, which is
+deterministic, and with a test that calls a source method from a foreign thread
+and requires the refusal.
+
+Suite: **483 passed, 1 skipped**, 13 browser scenarios. Ruff clean.
+
+### Bench test
+
+1. Capture a still, open the sidecar: `schema: 1`, three blocks,
+   `processing.ran: false`, `bypassed` naming the stages, and
+   `pipeline` still carrying the MLA alignment.
+2. Capture a preview; `processing.ran: true` with a stage list and outcomes.
+3. Change display gain, then save the same retained preview twice from the UI.
+   The two sidecars must differ **only** in `saved`.
+4. `python scripts/read_capture.py <any capture>` — the report now prints
+   whether processing ran, each stage's outcome, and requested vs effective
+   controls with anything unconfirmable listed as unknown.
+5. `--grid` on a raw capture still draws the grid. That is the regression this
+   stage most easily could have caused.
+
+### Still outstanding
+
+Rig acceptance for Stages 1–4. The Stage 0 residuals: `src/flyeye` and its
+service file are still present, and `Claude outputs/tests.yml` is still a draft
+outside `.github/workflows/`. `scripts/bench_encode.py` should be deleted — it
+measured synthetic noise and could not settle the question it was written for.
+
+---
+
 ## 2026-09-06 (s) — stage 3: one thread owns the camera
 
 Review finding **F1**, gate **G2**. `src/trilobite/acquisition.py` is new.

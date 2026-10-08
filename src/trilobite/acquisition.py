@@ -110,6 +110,25 @@ class Command:
     # it is inside its deadline -- see the note on `abandoned` above -- but it
     # will not be waited on, so the result is dropped and counted.
     forsaken: bool = False
+    # Has `fn` been entered? The difference between "nothing happened" and
+    # "something may have happened and cannot be undone", which is the only
+    # honest basis for choosing between `expired` and `abandoned`.
+    started: bool = False
+    # Guards every transition of `outcome` and `started`.
+    #
+    # **This lock is the fix for a reproduced race.** The previous version
+    # documented its check-then-set as a compare-and-set and it was nothing of
+    # the kind: `if self.outcome != "queued"` then assigning is two bytecode
+    # sequences with a thread switch available between them, so a completing
+    # owner and a timing-out caller could both observe `queued` and both report
+    # success. The Stage 3 review reproduced it by forcing the switch:
+    #
+    #     RESOLVE RACE [('abandoned', True), ('done', True)] final done
+    #
+    # Both callers were told they had won. The GIL makes each individual
+    # assignment atomic and does nothing whatever for a read followed by a
+    # write, which is the mistake the old comment encoded.
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
     def age(self) -> float:
@@ -117,17 +136,47 @@ class Command:
 
     def _resolve(self, outcome: str, result: Any = None,
                  error: BaseException | None = None) -> bool:
-        """Set the outcome once. Returns False if something got there first.
+        """Set the outcome once. Returns False if something got there first."""
+        with self.lock:
+            if self.outcome != "queued":
+                return False
+            self.outcome, self.result, self.error = outcome, result, error
+            self.done.set()
+            return True
 
-        The compare-and-set that makes a completion/timeout race resolve
-        exactly once. Without it a command can be reported twice, in two
-        different ways, to two different callers.
+    def claim_for_execution(self, now: float) -> str:
+        """Decide, atomically, whether this command may run.
+
+        Returns `"run"`, or the terminal outcome it was resolved to instead.
+        Taking the decision under the same lock as `_resolve` is what stops a
+        command being withdrawn by its caller and executed by the owner at the
+        same time.
         """
-        if self.outcome != "queued":
-            return False
-        self.outcome, self.result, self.error = outcome, result, error
-        self.done.set()
-        return True
+        with self.lock:
+            if self.outcome != "queued":
+                return self.outcome
+            if now > self.deadline:
+                self.outcome = EXPIRED
+                self.done.set()
+                return EXPIRED
+            self.started = True
+            return "run"
+
+    def give_up(self) -> str:
+        """The caller has stopped waiting. Returns the outcome recorded.
+
+        `abandoned` only when the owner has actually entered `fn`: that is the
+        case where something may have happened and cannot be taken back. Work
+        that never started is `expired`, and `service` will skip it rather than
+        running it late.
+        """
+        with self.lock:
+            self.forsaken = True
+            if self.outcome != "queued":
+                return self.outcome
+            self.outcome = ABANDONED if self.started else EXPIRED
+            self.done.set()
+            return self.outcome
 
 
 class CameraOwner:
@@ -144,6 +193,8 @@ class CameraOwner:
         self.capacity = capacity
         self._running = False
         self._owner_thread: int | None = None
+        # Serialises queue admission against retirement. See `submit`.
+        self._admit = threading.Lock()
         # Counters. Cheap, and they are how a bench run answers "did the queue
         # ever come near its bound" without guessing from latency.
         self.submitted = 0
@@ -168,15 +219,16 @@ class CameraOwner:
         A queued command whose camera is going away must be told so, not left
         to time out: the caller is holding an HTTP request open on it.
         """
-        self._running = False
-        while True:
-            try:
-                cmd = self._q.get_nowait()
-            except queue.Empty:
-                return
-            if cmd._resolve(REJECTED, error=CommandRejected(
-                    f"{self.cam_id}: camera stopped before this ran")):
-                self.rejected += 1
+        with self._admit:
+            self._running = False
+            while True:
+                try:
+                    cmd = self._q.get_nowait()
+                except queue.Empty:
+                    return
+                if cmd._resolve(REJECTED, error=CommandRejected(
+                        f"{self.cam_id}: camera stopped before this ran")):
+                    self.rejected += 1
 
     @property
     def running(self) -> bool:
@@ -230,37 +282,45 @@ class CameraOwner:
             self.submitted += 1
             return cmd
 
-        if not self._running:
-            self.rejected += 1
-            raise CommandRejected(
-                f"{self.cam_id}: camera is not running, so there is nothing to "
-                f"ask. Start it before requesting a {kind}.")
-        try:
-            self._q.put_nowait(cmd)
-        except queue.Full:
-            self.rejected += 1
-            raise CommandRejected(
-                f"{self.cam_id}: {self.capacity} commands are already queued "
-                f"for this camera and the oldest has been waiting "
-                f"{self._oldest_age():.2f} s. Refusing rather than adding to a "
-                f"backlog that is already the problem.") from None
-
-        self.submitted += 1
-        self.max_depth = max(self.max_depth, self._q.qsize())
+        # Admission and retirement share a lock. Without it `submit` can pass
+        # the `_running` check, `retire` can drain the queue, and the put can
+        # then land behind it -- a command stranded on a stopped owner that
+        # nothing will ever service or refuse.
+        with self._admit:
+            if not self._running:
+                self.rejected += 1
+                raise CommandRejected(
+                    f"{self.cam_id}: camera is not running, so there is nothing "
+                    f"to ask. Start it before requesting a {kind}.")
+            try:
+                self._q.put_nowait(cmd)
+            except queue.Full:
+                self.rejected += 1
+                raise CommandRejected(
+                    f"{self.cam_id}: {self.capacity} commands are already "
+                    f"queued for this camera and the oldest has been waiting "
+                    f"{self._oldest_age():.2f} s. Refusing rather than adding "
+                    f"to a backlog that is already the problem.") from None
+            self.submitted += 1
+            self.max_depth = max(self.max_depth, self._q.qsize())
 
         if not cmd.done.wait(timeout):
-            # The command may be executing right now and cannot be interrupted.
-            # Say so rather than claiming it failed.
-            cmd.forsaken = True
-            if cmd._resolve(ABANDONED):
+            outcome = cmd.give_up()
+            if outcome == ABANDONED:
                 self.abandoned += 1
                 raise CommandExpired(
                     f"{self.cam_id}: {kind} did not complete within "
-                    f"{timeout:.1f} s. It may still be executing -- nothing "
-                    f"here can interrupt an SDK call -- so do not assume "
-                    f"nothing happened.")
-            # It resolved between the wait expiring and the compare-and-set.
-            # That is a success, not a timeout.
+                    f"{timeout:.1f} s. It had STARTED, and nothing here can "
+                    f"interrupt an SDK call, so do not assume nothing "
+                    f"happened.")
+            if outcome == EXPIRED:
+                self.expired += 1
+                raise CommandExpired(
+                    f"{self.cam_id}: {kind} did not run within {timeout:.1f} s "
+                    f"and has been withdrawn. It had not started, so nothing "
+                    f"happened.")
+            # It resolved between the wait expiring and the lock being taken.
+            # That is a success, not a timeout, and falls through below.
 
         if cmd.outcome == FAILED:
             raise cmd.error  # type: ignore[misc]
@@ -295,11 +355,14 @@ class CameraOwner:
 
             self.max_age_s = max(self.max_age_s, cmd.age)
 
-            # Checked HERE, not at submission: a command that has been sitting
-            # in the queue past its deadline must never execute, or a still
-            # requested ten seconds ago arrives now and is saved as current.
-            if time.monotonic() > cmd.deadline:
-                if cmd._resolve(EXPIRED):
+            # Claimed HERE, not at submission, and atomically against the
+            # caller's own timeout. A command that has been sitting in the
+            # queue past its deadline must never execute -- or a still
+            # requested ten seconds ago arrives now and is saved as current --
+            # and one the caller has already withdrawn must not run either.
+            verdict = cmd.claim_for_execution(time.monotonic())
+            if verdict != "run":
+                if verdict == EXPIRED and not cmd.forsaken:
                     self.expired += 1
                 continue
 

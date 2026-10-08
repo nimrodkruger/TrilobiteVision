@@ -21,6 +21,7 @@ them is on disk with a sidecar that parses and a size that matches.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 import time
@@ -185,6 +186,61 @@ def test_a_caller_outside_the_owner_is_named_if_it_gets_through(tmp_path):
     assert "intruder" in str(boom[0])
 
 
+def test_the_source_itself_refuses_a_call_from_a_foreign_thread(tmp_path):
+    """The review's objection, closed.
+
+    `assert_owner` existed, was unit-tested, and was called from nowhere in the
+    acquisition path -- so it backstopped nothing and describing it as a
+    runtime guard was an overclaim. It is now called by the source, below
+    anything a caller could route around, and this is the test that says so:
+    a direct `capture_full` from a foreign thread must be refused.
+    """
+    cam = runtime(tmp_path)
+    cam.start()
+    try:
+        time.sleep(0.05)
+        boom: list[BaseException] = []
+
+        def intruder():
+            try:
+                cam.source.capture_full(raw=True)       # straight past the queue
+            except BaseException as exc:                # noqa: BLE001
+                boom.append(exc)
+
+        t = threading.Thread(target=intruder, name="intruder")
+        t.start()
+        t.join(5.0)
+        assert boom, "the source accepted a call from a non-owner thread"
+        assert "does not own this camera" in str(boom[0])
+        assert "capture_full" in str(boom[0])
+    finally:
+        cam.stop()
+
+
+@pytest.mark.parametrize("call", ["read_preview", "skip_preview", "set_controls"])
+def test_every_sdk_entry_point_is_guarded(tmp_path, call):
+    """Not just the one. Each of these reaches the driver on the real backend."""
+    cam = runtime(tmp_path)
+    cam.start()
+    try:
+        time.sleep(0.05)
+        boom: list[BaseException] = []
+
+        def intruder():
+            fn = getattr(cam.source, call)
+            try:
+                fn({"ExposureTime": 100}) if call == "set_controls" else fn()
+            except BaseException as exc:                # noqa: BLE001
+                boom.append(exc)
+
+        t = threading.Thread(target=intruder, name="intruder")
+        t.start()
+        t.join(5.0)
+        assert boom and "does not own this camera" in str(boom[0]), call
+    finally:
+        cam.stop()
+
+
 # -- the queue ---------------------------------------------------------------
 
 
@@ -238,7 +294,7 @@ def test_an_abandoned_command_resolves_exactly_once(tmp_path):
     cam.start()
     try:
         time.sleep(0.05)
-        with pytest.raises(CommandExpired, match="may still be executing"):
+        with pytest.raises(CommandExpired, match="had STARTED"):
             cam.owner.submit("still", lambda: cam.source.capture_full(True), 0.15)
         time.sleep(1.0)                    # let it finish under us
         st = cam.owner.state()
@@ -337,6 +393,190 @@ def test_service_runs_at_most_its_budget():
     assert again.service() == WORK_PER_LOOP
 
 
+def test_completion_and_timeout_resolve_exactly_once_under_a_forced_race():
+    """The race the Stage 3 review reproduced, as a test.
+
+    `_resolve` used to check `outcome != "queued"` and then assign -- a read
+    followed by a write, with a thread switch available in between. The review
+    forced the switch and got both callers reporting success:
+
+        RESOLVE RACE [('abandoned', True), ('done', True)] final done
+
+    My own abandoned-command test passed throughout, because it relied on
+    timing rather than on an interleaving. This one removes the timing: both
+    threads are held at a barrier until each has decided to resolve.
+    """
+    from trilobite.acquisition import Command
+
+    for _ in range(200):
+        now = time.monotonic()
+        cmd = Command(kind="still", fn=lambda: None,
+                      deadline=now + 60, submitted=now)
+        cmd.started = True                    # as if the owner had entered fn
+        gate = threading.Barrier(2)
+        wins: list[tuple[str, bool]] = []
+        lk = threading.Lock()
+
+        def completer(cmd=cmd, gate=gate, wins=wins, lk=lk):
+            gate.wait()
+            ok = cmd._resolve("done", result=1)
+            with lk:
+                wins.append(("done", ok))
+
+        def timer_out(cmd=cmd, gate=gate, wins=wins, lk=lk):
+            gate.wait()
+            out = cmd.give_up()
+            with lk:
+                wins.append((out, True))
+
+        ts = [threading.Thread(target=completer),
+              threading.Thread(target=timer_out)]
+        for x in ts:
+            x.start()
+        for x in ts:
+            x.join()
+
+        assert cmd.outcome in ("done", "abandoned"), cmd.outcome
+        # Exactly one caller may believe it set the outcome.
+        claimed = [name for name, ok in wins if ok]
+        assert len(claimed) == 1 or claimed == ["done", "done"], wins
+        if len(claimed) == 1:
+            assert claimed[0] == cmd.outcome, (claimed, cmd.outcome)
+
+
+class _SpyLock:
+    """A real lock that counts how many times it was entered.
+
+    For asserting that a transition is taken UNDER a lock, which a race test
+    cannot do. A barrier gets both threads to the door at the same moment and
+    then the GIL's 5 ms switch interval makes an interleaving inside three
+    bytecodes very unlikely -- so the race test stresses the code without
+    pinning the invariant. Removing the lock entirely survived it. This does
+    not: `entered == 0` is the mutation, deterministically.
+    """
+
+    def __init__(self) -> None:
+        self._lk = threading.Lock()
+        self.entered = 0
+
+    def __enter__(self):
+        self._lk.acquire()
+        self.entered += 1
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self._lk.release()
+
+    def acquire(self, *a, **kw):
+        return self._lk.acquire(*a, **kw)
+
+    def release(self) -> None:
+        self._lk.release()
+
+
+def test_the_outcome_transition_is_taken_under_the_lock():
+    """The invariant, not the race. See `_SpyLock`."""
+    from trilobite.acquisition import Command
+
+    now = time.monotonic()
+    cmd = Command(kind="x", fn=lambda: None, deadline=now + 60, submitted=now)
+    spy = _SpyLock()
+    cmd.lock = spy
+
+    assert cmd._resolve("done", result=1) is True
+    assert spy.entered >= 1, "_resolve decided without holding the lock"
+
+    before = spy.entered
+    assert cmd._resolve("failed") is False, "a second transition must be refused"
+    assert spy.entered > before, "the refusal was decided without the lock too"
+
+
+def test_claim_and_give_up_are_also_taken_under_the_lock():
+    """Both of the other two transitions. `claim_for_execution` races
+    `give_up` by construction -- one is the owner, the other the caller."""
+    from trilobite.acquisition import Command
+
+    now = time.monotonic()
+    for call in (lambda c: c.claim_for_execution(time.monotonic()),
+                 lambda c: c.give_up()):
+        cmd = Command(kind="x", fn=lambda: None, deadline=now + 60, submitted=now)
+        spy = _SpyLock()
+        cmd.lock = spy
+        call(cmd)
+        assert spy.entered >= 1, call
+
+
+def test_queue_admission_is_taken_under_the_retirement_lock():
+    """Same argument for the admission/retirement window. `submit` must hold
+    the lock across the `_running` check AND the put, or a command can land
+    behind a drain that has already happened and strand its caller."""
+    owner = CameraOwner("left", capacity=4)
+    owner.adopt()
+    owner._owner_thread = -1          # so submit queues rather than inlining
+    spy = _SpyLock()
+    owner._admit = spy
+
+    # Fill it so submit returns promptly via the rejection path.
+    for _ in range(4):
+        owner._q.put_nowait(_stub())
+    with pytest.raises(CommandRejected):
+        owner.submit("still", lambda: None, 0.5)
+    assert spy.entered >= 1, "admission was decided without the lock"
+
+    before = spy.entered
+    owner.retire()
+    assert spy.entered > before, "retirement drained without the lock"
+
+
+def test_work_that_never_started_expires_rather_than_being_abandoned():
+    """`abandoned` means something may have happened and cannot be undone.
+    Saying it about a command still sitting in the queue is a lie in the
+    direction that matters: it tells the operator a capture might exist."""
+    owner = CameraOwner("left")
+    owner._owner_thread = -1
+    owner._running = True
+
+    ran: list[int] = []
+    with pytest.raises(CommandExpired, match="had not started"):
+        owner.submit("still", lambda: ran.append(1), 0.05)
+    assert owner.expired == 1 and owner.abandoned == 0
+
+    owner._owner_thread = threading.get_ident()
+    owner.service()
+    assert ran == [], "a withdrawn command ran anyway"
+
+
+def test_a_command_cannot_be_stranded_between_admission_and_retirement():
+    """`submit` checked `_running`, `retire` drained, and the put could land
+    after the drain -- leaving a caller waiting on a stopped owner for its full
+    deadline. Admission and retirement now share a lock."""
+    owner = CameraOwner("left", capacity=8)
+    owner.adopt()
+    owner._owner_thread = -1
+
+    outcomes: list[str] = []
+    lk = threading.Lock()
+
+    def caller():
+        try:
+            owner.submit("still", lambda: None, 30.0)
+            with lk:
+                outcomes.append("done")
+        except CommandRejected:
+            with lk:
+                outcomes.append("rejected")
+
+    threads = [threading.Thread(target=caller, daemon=True) for _ in range(6)]
+    for t in threads:
+        t.start()
+    time.sleep(0.1)
+    owner.retire()
+    for t in threads:
+        t.join(timeout=3.0)
+    assert not any(t.is_alive() for t in threads), "a caller was stranded"
+    assert outcomes.count("rejected") == 6, outcomes
+
+
 # -- lifecycle ---------------------------------------------------------------
 
 
@@ -366,6 +606,51 @@ def test_a_thread_that_will_not_stop_is_failed_stop_and_the_device_stays_open(tm
     cam.stop(timeout=5.0)
     assert cam.lifecycle == "stopped"
     assert not cam.source.is_open
+
+
+def test_starting_over_a_live_worker_is_refused(tmp_path):
+    """The hole the Stage 3 review found, and it made failed-stop worthless.
+
+    `start()` cleared the shared stop event and launched a second worker
+    against the same source, so a camera that had just reported `failed-stop`
+    could be restarted straight into the two-consumer state the whole design
+    exists to prevent. Reproduced by the review as:
+
+        AFTER STOP failed-stop old thread alive True
+        RESTART ALLOWED True both alive True lifecycle running
+    """
+    cam = runtime(tmp_path)
+    cam.start()
+    time.sleep(0.05)
+    try:
+        with pytest.raises(RuntimeError, match="still running"):
+            cam.start()
+    finally:
+        cam.stop()
+
+
+def test_starting_after_a_failed_stop_is_refused(tmp_path):
+    """The case that matters: the camera is wedged, stop gave up, and a restart
+    would put a second thread on the same request pool."""
+    cam = runtime(tmp_path)
+    cam.start()
+    time.sleep(0.05)
+    cam.source.delay = 2.0
+    threading.Thread(target=lambda: _swallow(cam.grab_still), daemon=True).start()
+    time.sleep(0.2)
+    cam.stop(timeout=0.2)
+    assert cam.lifecycle == "failed-stop"
+
+    with pytest.raises(RuntimeError, match="failed-stop"):
+        cam.start()
+
+    cam.source.delay = 0.0
+    cam.stop(timeout=5.0)
+
+
+def _swallow(fn):
+    with contextlib.suppress(Exception):
+        fn()
 
 
 def test_a_clean_stop_closes_and_says_so(tmp_path):

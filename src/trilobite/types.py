@@ -123,12 +123,23 @@ class Frame:
     validity: str = UNVALIDATED
     # Where the pixels came from. See the SRC_* constants above.
     source_kind: str = SRC_UNKNOWN
+    # What the pipeline did to these pixels, frozen AT EXECUTION by
+    # `Pipeline.__call__`. None means nothing has been recorded -- a frame
+    # straight off the sensor before anything ran.
+    #
+    # A first-class field for the same reason `validity` is one: the writer
+    # must serialise what the frame carries rather than asking the pipeline
+    # what its settings are now. Reading them at save time is the Stage 4 bug
+    # -- edit a gain between capture and save and the sidecar described a value
+    # that never touched the pixels.
+    processing: dict[str, Any] | None = None
     meta: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def now(
         cls, data: np.ndarray, cam_id: str, seq: int, space: str = "mono8",
-        validity: str = UNVALIDATED, source_kind: str = SRC_UNKNOWN, **meta: Any
+        validity: str = UNVALIDATED, source_kind: str = SRC_UNKNOWN,
+        processing: dict[str, Any] | None = None, **meta: Any
     ) -> Frame:
         return cls(
             data=data,
@@ -139,6 +150,7 @@ class Frame:
             space=space,
             validity=validity,
             source_kind=source_kind,
+            processing=processing,
             meta=dict(meta),
         )
 

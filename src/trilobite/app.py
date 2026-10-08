@@ -133,15 +133,48 @@ class CameraRuntime:
         # matters: a camera whose thread would not join is NOT stopped, and
         # closing it anyway races a thread that may be inside capture_request.
         self.lifecycle = "stopped"
+        # start and stop are mutually exclusive. Two threads interleaving them
+        # is how a second worker gets launched against a live source.
+        self._lifecycle_lock = threading.RLock()
 
     # -- lifecycle ------------------------------------------------------
 
     def start(self) -> None:
+        """Open the device and start the one thread allowed to touch it.
+
+        **Refuses while a previous worker is still alive**, and that guard is
+        the whole protection. Without it `start()` cleared the shared stop
+        event and launched a second worker against the same source, so a camera
+        that had just reported `failed-stop` could be restarted into exactly
+        the two-consumer state that took the Pi down -- the failed-stop report
+        protecting nothing at all. The Stage 3 review reproduced it:
+
+            AFTER STOP failed-stop old thread alive True
+            RESTART ALLOWED True both alive True lifecycle running
+
+        Overlapping lifetimes are prohibited rather than tracked, which is why
+        no generation counter is needed here.
+        """
+        with self._lifecycle_lock:
+            if self._thread is not None and self._thread.is_alive():
+                raise RuntimeError(
+                    f"{self.cam_id}: a capture thread is still running "
+                    f"(lifecycle {self.lifecycle!r}). Starting a second one "
+                    f"would put two threads on one request pool, which is the "
+                    f"failure this design exists to prevent. Stop it first; if "
+                    f"stop reported failed-stop, the camera cannot be "
+                    f"recovered in-process and the service must be restarted.")
+            self._start_locked()
+
+    def _start_locked(self) -> None:
         # Opened here, before the capture thread exists, so there is still
         # exactly one thread in the process touching this camera. That is why
         # open does not need to go through the queue -- the invariant holds by
         # construction rather than by enforcement.
         self.source.open()
+        # From here on the source itself refuses calls from any other thread.
+        # Bound after open, because open is legitimately off-owner.
+        self.source.bind_owner(self.owner)
         self._control_spec = self.source.control_spec()
         # The MLA parameters are in SENSOR pixels, so the sensor frame has to be
         # declared before any of them mean anything -- here, once, from the
@@ -174,6 +207,10 @@ class CameraRuntime:
         crash they cannot diagnose, and it is also the honest report: the
         thread really is still running.
         """
+        with self._lifecycle_lock:
+            self._stop_locked(timeout)
+
+    def _stop_locked(self, timeout: float) -> None:
         self._stop.set()
         # Refuse queued work first, so a caller blocked on a still is told the
         # camera is going away instead of waiting out its deadline.
@@ -279,13 +316,22 @@ class CameraRuntime:
         ).result
 
     def save_frame(self, frame: Frame, tag: str) -> dict[str, Any]:
-        """Write a frame the owner already produced. Caller's thread."""
+        """Write a frame the owner already produced. Caller's thread.
+
+        The processing record travels on the frame. Nothing here reads the live
+        pipeline -- that was the Stage 4 bug, and it is why a raw capture used
+        to be saved with a description of a pipeline it never entered. A frame
+        that genuinely bypassed the pipeline gets a `bypass_record` saying so
+        and naming the stages it went past.
+        """
+        if frame.processing is None:
+            frame = replace(frame, processing=self.pipeline.bypass_record())
         return self.writer.save_still(
             frame,
-            pipeline_settings=self.pipeline.settings_snapshot(),
             camera_info=self.source.describe().as_dict(),
             tag=tag,
             label=self.label,
+            controls=self.source.requested_controls(),
         )
 
     def capture_still(self, raw: bool = True, tag: str = "still") -> dict[str, Any]:
@@ -317,13 +363,7 @@ class CameraRuntime:
         frame = self.latest()
         if frame is None:
             raise RuntimeError(f"{self.cam_id}: no preview frame yet")
-        return self.writer.save_still(
-            replace(frame, validity=DIAGNOSTIC),
-            pipeline_settings=self.pipeline.settings_snapshot(),
-            camera_info=self.source.describe().as_dict(),
-            tag=tag,
-            label=self.label,
-        )
+        return self.save_frame(replace(frame, validity=DIAGNOSTIC), tag)
 
     def set_controls(self, controls: dict[str, Any]) -> None:
         """Sensor controls, applied by the owner thread.

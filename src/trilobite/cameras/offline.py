@@ -170,6 +170,7 @@ class SyntheticSource(CameraSource):
         return (at - self._t0) * 0.4 + 0.3 * (abs(hash(self.cam_id)) % 7)
 
     def read_preview(self) -> Frame | None:
+        self._check_owner("read_preview")
         if not self._open:
             return None
         # Pace the synthetic source to the configured fps so timing-related
@@ -217,6 +218,7 @@ class SyntheticSource(CameraSource):
         have put simulated data into the archive under the same label as
         measurements, which is supervisory review R2 at its worst.
         """
+        self._check_owner("capture_full")
         phase = self._phase(time.monotonic())
         return Frame.now(
             self._orient(self._render(self._full, phase)),
@@ -253,6 +255,7 @@ class SyntheticSource(CameraSource):
         }
 
     def set_controls(self, controls: dict[str, Any]) -> None:
+        self._check_owner("set_controls")
         spec = self.control_spec()
         unknown = sorted(set(controls) - set(spec))
         if unknown:
@@ -408,6 +411,7 @@ class ReplaySource(CameraSource):
             return np.asarray(Image.open(path))
 
     def read_preview(self) -> Frame | None:
+        self._check_owner("read_preview")
         if not self._open:
             return None
         now = time.monotonic()

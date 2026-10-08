@@ -59,7 +59,7 @@ from typing import Any
 
 import numpy as np
 
-from ..storage.writer import verify_size, write_durably
+from ..storage.writer import SIDECAR_SCHEMA, verify_size, write_durably
 from ..types import Frame
 from .detect import CornerDetector
 from .settings import CalibrationSettings
@@ -602,6 +602,7 @@ class CaptureSession:
                 write_durably(pose_dir / f"{cid}.npy", body)
                 verify_size(pose_dir / f"{cid}.npy", len(body))
                 sidecar = {
+                    "schema": SIDECAR_SCHEMA,
                     "cam_id": cid,
                     "seq": frame.seq,
                     "t_wall": frame.t_wall,
@@ -615,6 +616,10 @@ class CaptureSession:
                     # radiometric data -- `space` is what says which it is.
                     "validity": frame.validity,
                     "source_kind": frame.source_kind,
+                    # Frozen at execution like every other file the rig writes.
+                    # A pose is the ISP main stream, so the preview pipeline did
+                    # not touch it and this says `ran: false`.
+                    "processing": frame.processing or {"ran": False},
                     "forced": forced,
                     "sensor": {k: v for k, v in frame.meta.items()
                                if k in ("ExposureTime", "AnalogueGain", "DigitalGain",
