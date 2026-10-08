@@ -32,7 +32,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Response
@@ -47,7 +47,9 @@ from ..config import StageConfig
 from ..optics.mla import UI_SUBAPERTURES
 from ..optics.orientation import Orientation
 from ..processing.registry import catalogue
+from ..recording.buffer import PrefaultFailed
 from ..sinks.jpeg import encode_jpeg
+from ..storage.writer import StorageRefused
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +87,45 @@ class StorageTarget(BaseModel):
     # case is picking a device off the list, and writing session folders into
     # the root of someone's USB stick is rude.
     append_subdir: bool = True
+
+
+class MeasureRequest(BaseModel):
+    """How much to write while measuring sustained throughput.
+
+    The defaults are the plan's: 8 GB or 30 s, whichever comes first. Both
+    matter -- the byte budget is what gets past an SLC cache, and the time
+    budget is what stops a slow device holding the UI for ten minutes.
+    """
+
+    budget_mb: int = 8192
+    budget_seconds: float = 30.0
+
+
+class RecordingKind(BaseModel):
+    kind: Literal["burst", "continuous"] = "continuous"
+
+
+class RecordingPlanRequest(BaseModel):
+    format: str = "raw16"
+    fps: float = 30.0
+    duration_s: float | None = None
+
+
+class RecordingArmRequest(RecordingPlanRequest):
+    kind: Literal["burst", "continuous"] = "continuous"
+    # Per request, never remembered. See /api/recording/save.
+    internal_ok: bool = False
+    max_drop_fraction: float | None = None
+    # Overrides for the memory-derived sizes. Present so a bench run can force
+    # a small buffer or a small queue to exercise the limits deliberately,
+    # which is step 3 of the plan's bench test.
+    frames: int | None = None
+    slots: int | None = None
+
+
+class RecordingSaveRequest(BaseModel):
+    internal_ok: bool = False
+    label: str | None = None
 
 
 def _subaperture_tile(cam: CameraRuntime, view: str) -> np.ndarray | None:
@@ -770,16 +811,164 @@ def create_app(application: Application) -> FastAPI:
 
         return diagnostics()
 
+    @api.post("/api/storage/measure")
+    def storage_measure(body: MeasureRequest) -> dict[str, Any]:
+        """Sustained write throughput, and what it allows to be recorded.
+
+        Stage 5a and 5c's pre-flight. Distinct from `/verify`, which writes
+        four megabytes and therefore measures the drive's write cache: this one
+        writes until it has moved gigabytes or spent its time budget, and
+        reports the **final quarter's** rate, which is the figure that predicts
+        a multi-minute recording.
+
+        Takes a while on purpose. The alternative is a configuration chosen
+        from a number that describes the first twenty seconds of a five-minute
+        job.
+        """
+        try:
+            return application.recording.measure(
+                budget_bytes=int(body.budget_mb) << 20,
+                budget_seconds=float(body.budget_seconds))
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from None
+        except StorageRefused as exc:
+            raise HTTPException(409, {"state": exc.state, "detail": str(exc)}) from None
+        except OSError as exc:
+            raise HTTPException(500, f"{type(exc).__name__}: {exc}") from None
+
     @api.post("/api/storage/release")
-    def storage_release() -> dict[str, Any]:
+    def storage_release(timeout: float = 10.0) -> dict[str, Any]:
         """Return output to the internal default so a device can be unplugged.
 
         There is no eject here on purpose -- unmounting someone's filesystem is
         not this application's business. The safe sequence is: release, check
         that the panel says the output is internal again, then pull the disk.
+
+        **This now drains.** It waits for writes already in flight to finish
+        and returns `released: false` if they do not, rather than reporting a
+        disk as safe to pull while a write is inside the kernel -- which is
+        what the old version did, because `save_still` held the lock only long
+        enough to allocate a counter. 409 rather than 200, so a UI cannot show
+        "released" on a refusal.
         """
-        application.writer.release()
+        out = application.writer.release(timeout=timeout)
+        if out.get("released") is False:
+            raise HTTPException(409, {
+                "detail": (f"{out.get('inflight')} write(s) are still in "
+                           f"flight. The disk has NOT been released and must "
+                           f"not be removed."),
+                "storage": application.storage_state(),
+            })
         return application.storage_state()
+
+    # -- recording ---------------------------------------------------------
+    #
+    # Two recorders behind one set of routes, because the operator is choosing
+    # between them rather than using both: `kind` selects. Stage 5b is the RAM
+    # burst, 5c the continuous recording.
+
+    def _rec(fn, *args, **kwargs) -> dict[str, Any]:
+        """Call into the recorder and map its refusals onto status codes.
+
+        Each refusal gets the code that says what the caller should do about
+        it, which is the whole value of having distinct exception types:
+
+          409  the rig is in a state that makes this wrong (an unsaved burst,
+               another recorder running, a target that cannot take the write).
+               Nothing was attempted; change something and retry.
+          422  the request itself does not describe a possible recording.
+          507  the target is full or below its reserve. Separated from 409 so a
+               UI can say "the disk is full" without parsing a message.
+        """
+        try:
+            return fn(*args, **kwargs)
+        except StorageRefused as exc:
+            code = 507 if exc.state in ("full", "internal-refused") else 409
+            raise HTTPException(code, {
+                "state": exc.state, "detail": str(exc),
+                "recording": application.recording.status(),
+            }) from None
+        except PrefaultFailed as exc:
+            raise HTTPException(507, {"state": "memory", "detail": str(exc)}) from None
+        except MemoryError as exc:
+            raise HTTPException(507, {"state": "memory", "detail": str(exc)}) from None
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from None
+        except OSError as exc:
+            raise HTTPException(500, f"{type(exc).__name__}: {exc}") from None
+
+    @api.get("/api/recording")
+    def recording_status() -> dict[str, Any]:
+        return application.recording.status()
+
+    @api.get("/api/recording/options")
+    def recording_options() -> dict[str, Any]:
+        """Every configuration this rig can offer, with its consequences.
+
+        Each row carries its predicted drop fraction and the validity it
+        caps the data at. Where no measurement is on file the prediction is
+        **null, not zero** -- claiming no drops because nothing was measured is
+        the one answer this must never give.
+        """
+        return application.recording.options()
+
+    @api.post("/api/recording/feasibility")
+    def recording_feasibility(body: RecordingPlanRequest) -> dict[str, Any]:
+        """What would happen if this plan were started now. Changes nothing."""
+        return _rec(application.recording.feasibility,
+                    body.format, body.fps, body.duration_s)
+
+    @api.post("/api/recording/arm")
+    def recording_arm(body: RecordingArmRequest) -> dict[str, Any]:
+        """Commit the memory and verify the target. Nothing is captured yet.
+
+        Arming is where every refusal belongs: the memory is prefaulted here
+        so a shortfall is a message rather than an OOM kill at frame 400, and
+        the target is admitted here so a recording that cannot be written is
+        refused before the operator has spent an afternoon taking it.
+        """
+        if body.kind == "burst":
+            return _rec(application.recording.arm_burst, body.format, body.fps,
+                        body.duration_s, body.frames)
+        return _rec(application.recording.arm_continuous, body.format,
+                    body.fps, body.duration_s, body.internal_ok,
+                    body.max_drop_fraction, body.slots)
+
+    @api.post("/api/recording/start")
+    def recording_start(body: RecordingKind) -> dict[str, Any]:
+        if body.kind == "burst":
+            return _rec(application.recording.start_burst)
+        return _rec(application.recording.start_continuous)
+
+    @api.post("/api/recording/stop")
+    def recording_stop(body: RecordingKind) -> dict[str, Any]:
+        if body.kind == "burst":
+            return _rec(application.recording.stop_burst)
+        return _rec(application.recording.stop_continuous)
+
+    @api.post("/api/recording/save")
+    def recording_save(body: RecordingSaveRequest) -> dict[str, Any]:
+        """Flush a RAM burst to the verified target.
+
+        `internal_ok` is per call and is never remembered. The UI presents it
+        unticked every time, because the point of the override is that saving
+        multiple gigabytes onto the disk the operating system runs from is a
+        deliberate act.
+        """
+        return _rec(application.recording.save_burst, body.internal_ok,
+                    body.label)
+
+    @api.post("/api/recording/discard")
+    def recording_discard() -> dict[str, Any]:
+        """Throw away an unsaved burst. The only way to lose one on purpose."""
+        return _rec(application.recording.discard_burst)
+
+    @api.post("/api/recording/release")
+    def recording_release() -> dict[str, Any]:
+        """Give the memory back. Refuses over an unsaved burst."""
+        return _rec(application.recording.release_burst)
 
     # -- capture ----------------------------------------------------------
 

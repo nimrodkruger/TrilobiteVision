@@ -1306,6 +1306,393 @@ function renderSystem(s) {
   ]);
 }
 
+/* ---------------------------------------------------------------------------
+   VIDEO: recording, and the arithmetic that decides what may be recorded.
+
+   Three things are on screen and the order is the argument:
+
+     1. MEASURE, because every number below it is meaningless without one.
+        Until the target has been measured, every predicted drop fraction
+        reads "unknown" rather than zero -- claiming no losses because
+        nothing was measured is the one answer this page must never give.
+
+     2. The CONFIGURATION, with its consequences attached: the rate it needs,
+        the rate the disk holds, the fraction of frames that will be lost, and
+        the validity the data is capped at. A lossy format is not hidden; it is
+        offered with "diagnostic, never science" next to it.
+
+     3. The RUNNING FIGURES, per head: kept, dropped, drop percentage and the
+        throughput reaching the disk. Live, because a recording that is losing
+        frames is something the operator should be able to see losing them
+        rather than read about afterwards.
+--------------------------------------------------------------------------- */
+
+let REC_SEL = { kind: "continuous", format: "raw16", fps: null, duration: 60 };
+let REC_TIMER = null;
+let REC_NOTE = { text: "", cls: "" };
+
+function setRecNote(text, cls = "") {
+  REC_NOTE = { text, cls };
+  const el = $("#rec-note");
+  if (el) { el.textContent = text; el.className = "note " + cls; }
+}
+
+async function buildVideo() {
+  const gen = ++BUILD;
+  const root = $("#cams");
+  root.innerHTML = "";
+  root.className = "single";
+
+  const card = document.createElement("section");
+  card.className = "cam";
+  card.innerHTML = `
+    <div class="viewport"><h2><span class="ttl">Recording</span>
+      <span class="sub">raw sensor counts, both heads, free-running</span>
+      <span class="stat" id="rec-state">&mdash;</span></h2></div>
+    <div class="controls" id="rec-body">
+      <div class="panel"><div class="hdr"><span class="chev">▾</span>
+        <strong>Target</strong><span class="type">measured, not assumed</span></div>
+        <div class="body" id="rec-preflight"><div class="empty">…</div></div></div>
+      <div class="panel"><div class="hdr"><span class="chev">▾</span>
+        <strong>Configuration</strong><span class="type">fixed before Start</span></div>
+        <div class="body" id="rec-plans"><div class="empty">…</div></div></div>
+      <div class="panel"><div class="hdr"><span class="chev">▾</span>
+        <strong>Recording</strong><span class="type">live figures</span></div>
+        <div class="body" id="rec-live"><div class="empty">…</div></div></div>
+      <div class="panel"><div class="hdr"><span class="chev">▾</span>
+        <strong>How degradation works here</strong>
+        <span class="type">read once</span></div>
+        <div class="body"><div class="notes tall">${REC_EXPLAINER}</div></div></div>
+    </div>`;
+  root.appendChild(card);
+  for (const p of card.querySelectorAll(".panel")) {
+    p.querySelector(".hdr").onclick = () => {
+      p.classList.toggle("collapsed");
+      p.querySelector(".chev").textContent =
+        p.classList.contains("collapsed") ? "▸" : "▾";
+    };
+  }
+  if (gen !== BUILD) return;
+  await refreshRecording();
+  if (REC_TIMER) clearInterval(REC_TIMER);
+  REC_TIMER = setInterval(() => {
+    if (MODE === "video") refreshRecordingLive();
+    else { clearInterval(REC_TIMER); REC_TIMER = null; }
+  }, 1000);
+}
+
+const REC_EXPLAINER = [
+  "Five things can close a gap between what the sensors produce and what the",
+  "disk can absorb. They are not interchangeable, and what matters is which",
+  "are chosen here and which may act while the recording runs:",
+  "",
+  "  lower the frame rate      exact, UNIFORMLY sampled     chosen here",
+  "  packed 10-bit             exact                        chosen here",
+  "  8-bit                     LOSSY -> diagnostic          chosen here",
+  "  drop whole frames         exact per frame, gaps        WHILE RUNNING",
+  "  lossless compression      exact, far too slow live     after capture",
+  "",
+  "The configuration is fixed before Start and the only thing that changes",
+  "during a recording is whether a frame is kept. Nothing alters bit depth,",
+  "geometry or rate mid-stream: a file whose frames differ in shape breaks",
+  "every reader, and a recording that silently changed its own fidelity half",
+  "way through is worse than one that lost frames, because the loss is at",
+  "least countable.",
+  "",
+  "Lowering the rate beats dropping when the shortfall is known in advance.",
+  "Dropping throws away exposures already taken and leaves irregular",
+  "sampling; asking the sensor for a lower rate gives uniform sampling and a",
+  "longer exposure. Dropping is the safety valve for a stall.",
+  "",
+  "The heads drop independently. Nothing triggers these two sensors together",
+  "and no synchronisation is claimed: a recording is two independently",
+  "sampled sequences sharing a recorded clock, reconciled afterwards from the",
+  "per-frame SensorTimestamp in each head's index.",
+].join("\n");
+
+async function refreshRecording() {
+  let opts;
+  try { opts = await jget("/api/recording/options"); }
+  catch (e) { setRecNote(e.message, "err"); return; }
+  if (!opts.available) {
+    $("#rec-preflight").innerHTML = `<div class="empty"></div>`;
+    $("#rec-preflight").querySelector(".empty").textContent = opts.reason || "no cameras";
+    return;
+  }
+  REC_OPTS = opts;
+  if (REC_SEL.fps === null) REC_SEL.fps = opts.sensor.fps;
+  renderPreflight(opts);
+  renderPlans(opts);
+  await refreshRecordingLive();
+}
+
+let REC_OPTS = null;
+
+function renderPreflight(opts) {
+  const host = $("#rec-preflight");
+  const pf = opts.preflight || {};
+  const st = pf.storage || {};
+  const el = document.createElement("div");
+  el.className = "dev active";
+  const measured = opts.preflight_current;
+  el.innerHTML = `
+    <div class="top"><span class="name">Target</span>
+      <span class="tag ${opts.storage.removable ? "rm" : ""}">${
+        opts.storage.removable ? "external" : "internal"}</span>
+      <span class="tag ${opts.storage.state === "ok" ? "" : "rm"}">${
+        opts.storage.state_human || opts.storage.state}</span>
+      ${measured ? "" : `<span class="tag rm">NOT MEASURED</span>`}</div>
+    <div class="path"></div>
+    <div class="foot">
+      <span class="cap" id="rec-rate"></span>
+      <button class="ghost" id="rec-measure"
+        title="Writes gigabytes and reports the LAST QUARTER's rate. A four-megabyte probe measures the drive's write cache, which is not the rate a five-minute recording gets.">Measure</button>
+    </div>
+    <div class="note" id="rec-note"></div>
+    <div class="notes tall" id="rec-findings"></div>`;
+  el.querySelector(".path").textContent =
+    `${opts.storage.root}   (${opts.storage.usable_gb} GB usable above the reserve)`;
+  el.querySelector("#rec-rate").textContent = measured
+    ? `sustained ${st.sustained_mb_s} MB/s (mean ${st.mean_mb_s})`
+      + (st.filesystem ? `, ${st.filesystem}` : "")
+    : "sustained rate unknown";
+  el.querySelector("#rec-findings").textContent =
+    (pf.notes || []).join("\n\n") || (pf.stale_reason || "Run Measure.");
+  host.innerHTML = "";
+  host.appendChild(el);
+  setRecNote(REC_NOTE.text, REC_NOTE.cls);
+
+  el.querySelector("#rec-measure").onclick = async ev => {
+    const btn = ev.currentTarget;
+    btn.disabled = true; btn.textContent = "Measuring…";
+    setRecNote("writing up to 8 GB, or 30 s, whichever comes first…", "");
+    try {
+      const r = await jsend("/api/storage/measure",
+                            { budget_mb: 8192, budget_seconds: 30 });
+      setRecNote(r.storage.message, r.storage.ok ? "ok" : "err");
+      log(`measured: ${r.storage.message}`, r.storage.ok ? "ok" : "err");
+      await refreshRecording();
+    } catch (e) {
+      setRecNote(e.message, "err");
+    } finally {
+      btn.disabled = false; btn.textContent = "Measure";
+    }
+  };
+}
+
+function renderPlans(opts) {
+  const host = $("#rec-plans");
+  host.innerHTML = "";
+
+  const kinds = document.createElement("div");
+  kinds.className = "dev";
+  kinds.innerHTML = `<div class="top"><span class="name">Mode</span></div>
+    <div class="foot">
+      <button class="ghost" data-kind="continuous"
+        title="Bounded by the disk. Minutes. Drops frames when the disk cannot keep up, and counts them.">Continuous</button>
+      <button class="ghost" data-kind="burst"
+        title="Bounded by RAM. Seconds, at full rate, with no drops — then written afterwards. The frames exist only in memory until saved.">RAM burst</button>
+    </div>`;
+  for (const b of kinds.querySelectorAll("button")) {
+    b.classList.toggle("on", b.dataset.kind === REC_SEL.kind);
+    b.onclick = () => { REC_SEL.kind = b.dataset.kind; renderPlans(opts); };
+  }
+  host.appendChild(kinds);
+
+  const table = document.createElement("div");
+  table.className = "notes tall";
+  const rows = [
+    "  format            rate    needs   max fps   predicted loss   validity",
+  ];
+  for (const p of opts.plans) {
+    const sel = p.format === REC_SEL.format && Math.abs(p.fps - REC_SEL.fps) < 0.01;
+    rows.push(
+      `${sel ? ">" : " "} ${p.format.padEnd(16)}`
+      + `${String(p.fps).padStart(5)}  `
+      + `${String(p.mb_s).padStart(6)}  `
+      + `${(p.max_fps == null ? "    ?" : p.max_fps.toFixed(1)).padStart(8)}  `
+      + `${(p.predicted_drop_percent == null
+            ? "unknown" : p.predicted_drop_percent + "%").padStart(14)}   `
+      + `${p.validity_ceiling}${p.exact ? "" : "  LOSSY"}`);
+  }
+  table.textContent = rows.join("\n");
+  host.appendChild(table);
+
+  const pick = document.createElement("div");
+  pick.className = "dev";
+  pick.innerHTML = `<div class="top"><span class="name">Selected</span></div>
+    <div class="foot" id="rec-pick"></div>`;
+  host.appendChild(pick);
+  const picks = pick.querySelector("#rec-pick");
+  for (const p of opts.plans) {
+    const b = document.createElement("button");
+    b.className = "ghost";
+    b.textContent = `${p.format} @ ${p.fps} fps`;
+    b.title = p.format_note;
+    b.classList.toggle(
+      "on", p.format === REC_SEL.format && Math.abs(p.fps - REC_SEL.fps) < 0.01);
+    b.onclick = () => {
+      REC_SEL.format = p.format; REC_SEL.fps = p.fps; renderPlans(opts);
+    };
+    picks.appendChild(b);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "dev";
+  const dur = REC_SEL.kind === "continuous"
+    ? `<label>seconds <input id="rec-duration" type="number" min="1" max="3600"
+         value="${REC_SEL.duration}" style="width:5em"></label>` : "";
+  actions.innerHTML = `<div class="top"><span class="name">Arm</span>
+      <span class="tag">${REC_SEL.kind}</span></div>
+    <div class="foot">${dur}
+      <label title="Saving gigabytes to the disk the operating system runs from. Unticked every time, deliberately: the reserve still applies, but this is a decision, not a preference.">
+        <input type="checkbox" id="rec-internal"> allow internal storage</label>
+      <button class="ghost" id="rec-arm">Arm</button>
+      <button class="ghost" id="rec-start">Start</button>
+      <button class="ghost" id="rec-stop">Stop</button>
+    </div>
+    <div class="note" id="rec-arm-note"></div>`;
+  host.appendChild(actions);
+
+  const note = (t, c = "") => {
+    const el = $("#rec-arm-note");
+    if (el) { el.textContent = t; el.className = "note " + c; }
+  };
+  const body = () => ({
+    kind: REC_SEL.kind, format: REC_SEL.format, fps: REC_SEL.fps,
+    duration_s: REC_SEL.kind === "continuous"
+      ? Number($("#rec-duration").value) || null : null,
+    internal_ok: !!($("#rec-internal") || {}).checked,
+  });
+  actions.querySelector("#rec-arm").onclick = async () => {
+    try {
+      const r = await jsend("/api/recording/arm", body());
+      note(`armed: ${r.slots_per_head || r.frames_per_head} frames per head`
+           + (r.duration_s ? `, ${r.duration_s} s` : "")
+           + `, generation ${r.storage_generation || "-"}`, "ok");
+      await refreshRecordingLive();
+    } catch (e) { note(e.message, "err"); }
+  };
+  actions.querySelector("#rec-start").onclick = async () => {
+    try {
+      await jsend("/api/recording/start", { kind: REC_SEL.kind });
+      note("recording", "ok");
+    } catch (e) { note(e.message, "err"); }
+  };
+  actions.querySelector("#rec-stop").onclick = async () => {
+    try {
+      const r = await jsend("/api/recording/stop", { kind: REC_SEL.kind });
+      note(r.stop_reason ? `stopped: ${r.stop_reason}` : "stopped", "ok");
+      await refreshRecordingLive();
+    } catch (e) { note(e.message, "err"); }
+  };
+}
+
+async function refreshRecordingLive() {
+  let s;
+  try { s = await jget("/api/recording", 4000); } catch { return; }
+  const host = $("#rec-live");
+  if (!host) return;
+  const active = s.active === "burst" ? s.burst : s.continuous;
+  const badge = $("#rec-state");
+  if (badge) badge.textContent = `${s.active || "idle"} / ${active.state}`;
+
+  const lines = [];
+  if (s.burst.unsaved) {
+    lines.push("!! " + s.burst.headline, "");
+  }
+  if (s.active === "burst") {
+    lines.push(
+      `state      ${s.burst.state}`,
+      `armed for  ${s.burst.armed_duration_s} s`
+        + ` (${s.burst.capacity_frames} frames per head)`,
+      `held       ${JSON.stringify(s.burst.frames)}`
+        + `  ${(s.burst.bytes_in_ram / 1e9).toFixed(2)} GB in RAM`,
+      s.burst.elapsed_s != null ? `elapsed    ${s.burst.elapsed_s} s` : "",
+      s.burst.stop_reason ? `stopped    ${s.burst.stop_reason}` : "",
+      s.burst.planned_write_bytes
+        ? `will write ${(s.burst.planned_write_bytes / 1e9).toFixed(2)} GB` : "",
+      s.burst.last_error ? `!!         ${s.burst.last_error}` : "");
+  } else {
+    const c = s.continuous;
+    lines.push(
+      `state      ${c.state}`,
+      c.elapsed_s != null ? `elapsed    ${c.elapsed_s} s` : "",
+      c.write_mb_s != null ? `to disk    ${c.write_mb_s} MB/s` : "",
+      `ceiling    ${(c.drop_ceiling * 100).toFixed(0)}% of frames`,
+      "");
+    for (const h of Object.values(c.heads || {})) {
+      lines.push(
+        `${h.cam_id}`,
+        `  kept     ${h.stored}  of ${h.exposed} exposed`,
+        `  dropped  ${h.dropped}   ${h.drop_percent}% overall, `
+          + `${h.recent_drop_percent}% recently`,
+        `  queue    ${h.queue_depth} of ${h.queue_slots} slots`,
+        h.write_mb_s != null ? `  disk     ${h.write_mb_s} MB/s` : "",
+        h.preview_suppressed
+          ? "  preview  PAUSED -- frames are being lost, and a preview frame"
+            + " is never worth a recorded one" : "",
+        h.write_error ? `  !!       ${h.write_error}` : "");
+    }
+    if (c.every_frame_accounted != null) {
+      lines.push("", c.every_frame_accounted
+        ? "every exposed frame is in the output or in a named gap"
+        : "!! SOME FRAMES ARE UNACCOUNTED FOR -- see the journal");
+    }
+    if (c.last_result_directory) lines.push("", `last  ${c.last_result_directory}`);
+  }
+
+  host.innerHTML = "";
+  const pre = document.createElement("div");
+  pre.className = "notes tall";
+  pre.textContent = lines.filter(l => l !== "").join("\n");
+  host.appendChild(pre);
+
+  if (s.burst.unsaved || s.active === "burst") {
+    const act = document.createElement("div");
+    act.className = "dev";
+    act.innerHTML = `<div class="top"><span class="name">RAM burst</span>
+        ${s.burst.unsaved ? `<span class="tag rm">NOT SAVED</span>` : ""}</div>
+      <div class="foot">
+        <label title="Per save, never remembered."><input type="checkbox"
+          id="rec-save-internal"> allow internal storage</label>
+        <button class="ghost" id="rec-save">Save</button>
+        <button class="ghost" id="rec-discard"
+          title="Throws the frames away. They exist nowhere else.">Discard</button>
+        <button class="ghost" id="rec-free">Free memory</button>
+      </div>
+      <div class="note" id="rec-save-note"></div>`;
+    host.appendChild(act);
+    const n = (t, c = "") => {
+      const el = $("#rec-save-note");
+      if (el) { el.textContent = t; el.className = "note " + c; }
+    };
+    act.querySelector("#rec-save").onclick = async ev => {
+      const btn = ev.currentTarget;
+      btn.disabled = true; btn.textContent = "Writing…";
+      try {
+        const r = await jsend("/api/recording/save", {
+          internal_ok: !!$("#rec-save-internal").checked });
+        n(`saved ${r.gb} GB in ${r.flush_seconds} s `
+          + `(${r.flush_mb_s} MB/s) to ${r.directory}`, "ok");
+      } catch (e) { n(e.message, "err"); }
+      finally { btn.disabled = false; btn.textContent = "Save"; }
+    };
+    act.querySelector("#rec-discard").onclick = async () => {
+      if (!confirm("Discard the burst? The frames are in RAM only and exist "
+                   + "nowhere else.")) return;
+      try { await jsend("/api/recording/discard"); n("discarded", "ok"); }
+      catch (e) { n(e.message, "err"); }
+      await refreshRecordingLive();
+    };
+    act.querySelector("#rec-free").onclick = async () => {
+      try { await jsend("/api/recording/release"); n("memory released", "ok"); }
+      catch (e) { n(e.message, "err"); }
+      await refreshRecordingLive();
+    };
+  }
+}
+
 /* A tab that exists so the shape of the application is visible before the
    feature is. Saying "not built yet" in the place the feature will live is
    more use than leaving a gap and remembering where it was going. */
@@ -1845,16 +2232,8 @@ const TABS = [
   { id: "system", label: "System", build: buildSystem },
   { id: "imaging", label: "Imaging", build: buildImaging },
   {
-    id: "video", label: "Video", build: () => buildPlaceholder(
-      "Video capture", "not implemented",
-      ["Both sensors, continuous, to disk. Nothing here yet.",
-       "",
-       "The hard part is not the encoding, it is that a continuous write has",
-       "to survive the storage device going away mid-recording, which the",
-       "still path already handles and this will have to as well.",
-       "",
-       "Until then: quick-record on the Imaging tab writes a raw set from both",
-       "cameras per space bar press."]),
+    id: "video", label: "Video", build: buildVideo,
+    note: "continuous recording to disk, and the bounded RAM burst",
   },
   {
     id: "cal", label: "Calibration", build: buildCalibration,

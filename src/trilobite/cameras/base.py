@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import threading
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -31,6 +32,33 @@ from ..config import CameraConfig
 from ..types import CameraInfo, Frame
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RawRead:
+    """One exposure, as the recording path needs it.
+
+    `oriented` is the field worth reading twice. A still capture is rotated and
+    flipped on the way out, so what lands on disk matches what the operator saw
+    and the MLA geometry is expressed in one frame. A quarter turn is a
+    transpose and a copy of the whole array, and at two heads x 3 MB x 30 fps
+    that is 190 MB/s of memory traffic on the capture thread, for an operation
+    the reader can do at its leisure.
+
+    So a recording stores the pixels in **sensor orientation** and records the
+    rotation and flips in the manifest for the reader to apply. That is also
+    the more faithful thing to store: the recording is raw sensor data, and the
+    orientation is a statement about how the camera is mounted rather than
+    about the data.
+
+    `oriented=True` means the backend could not avoid orienting (the offline
+    sources, which go through `capture_full`), and the readers must then not
+    apply it again.
+    """
+
+    frame: Frame
+    preview: Frame | None = None
+    oriented: bool = False
 
 
 class CameraSource(ABC):
@@ -109,6 +137,79 @@ class CameraSource(ABC):
         reconstruction need. raw=False gives the ISP output, which is only
         useful for looking at.
         """
+
+    # -- recording ------------------------------------------------------
+
+    # Does this backend's `read_raw` hand back ORIENTED pixels?
+    #
+    # The default implementation goes through `capture_full`, which rotates and
+    # flips, so the default is True. A backend that has a cheap unoriented path
+    # -- picamera2 -- overrides it to False and the recording then stores
+    # sensor-frame pixels with the transform recorded for the reader.
+    #
+    # Declared rather than discovered, because the whole recording plan depends
+    # on it: the plan's width and height must be the frame the backend will
+    # actually deliver, and a plan built for the sensor frame against a backend
+    # that delivers a turned one produces a shape mismatch on every single
+    # frame. Finding that out by calling `read_raw` once would mean taking a
+    # frame to decide how to record, from a thread that may not own the camera.
+    records_oriented: bool = True
+
+    def read_raw(self, with_preview: bool = False) -> RawRead | None:
+        """One request, yielding the raw plane and optionally the preview.
+
+        The recording path, and separate from `capture_full` for three reasons
+        that all matter at 30 fps:
+
+          * it takes the raw plane and the lores plane out of the **same**
+            request, so running a preview while recording costs no extra camera
+            access and the preview is the same exposure as the recorded frame;
+          * it does not orient the pixels. See `RawRead.oriented`;
+          * it returns the pixels as a view into the request, valid only until
+            the request is released -- which has already happened by the time
+            this returns, so the caller must have copied them. The recorder's
+            slot copy is that copy.
+
+        Default implementation for sources that have no distinct raw path:
+        `capture_full(raw=True)` and **no preview, ever**, whatever
+        `with_preview` asks for.
+
+        The temptation is to satisfy `with_preview` here with a second
+        `read_preview()` call -- harmless-looking, since a file or a generator
+        cannot be starved the way a four-deep request pool can. It is not
+        harmless. Every read advances the sequence counter, so a preview taken
+        that way consumes an exposure number that no frame occupies, and a
+        **gap in the sequence numbers is precisely how a dropped frame is
+        recorded**. The recording's loss figures would then count every preview
+        as a lost frame. A backend that wants a preview while recording has to
+        produce both planes from one exposure and one sequence number, as
+        picamera2 does from one request and `SyntheticSource` does from one
+        render. Until it does, the preview freezes -- which is visible, and a
+        frozen preview is a far smaller problem than fabricated drops.
+        """
+        self._check_owner("read_raw")
+        frame = self.capture_full(raw=True)
+        return RawRead(frame=frame, preview=None, oriented=True)
+
+    def raw_capabilities(self) -> dict[str, Any]:
+        """Which raw formats this camera can actually deliver, measured.
+
+        The pre-flight's question, and it has to be asked of the device rather
+        than assumed: whether a packed 10-bit mode exists decides whether that
+        rung of the degradation ladder is offered at all, and packing in
+        software would cost a full-rate pass per frame to save bandwidth this
+        rig may not need to save.
+
+        Returns at least `{"formats": [...], "negotiated": ..., "packed": bool}`.
+        """
+        info = self.describe()
+        return {
+            "formats": [],
+            "negotiated": getattr(info, "raw_format", None),
+            "packed_available": False,
+            "measured": False,
+            "note": "this backend does not enumerate sensor formats",
+        }
 
     # -- full frames, served by the capture thread -----------------------
     #

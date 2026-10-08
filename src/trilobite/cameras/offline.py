@@ -31,7 +31,7 @@ from ..types import (
     CameraInfo,
     Frame,
 )
-from .base import CameraSource
+from .base import CameraSource, RawRead
 
 log = logging.getLogger(__name__)
 
@@ -207,6 +207,66 @@ class SyntheticSource(CameraSource):
             **self.orientation,
             **self._controls,
         )
+
+    # This backend has a real raw path (see `read_raw`) which, like picamera2's,
+    # hands over pixels in the SENSOR frame and leaves the turn to the reader.
+    records_oriented = False
+
+    def read_raw(self, with_preview: bool = False) -> RawRead:
+        """A rendered frame in the sensor frame, deliberately **not** oriented.
+
+        The base-class fallback would go through `capture_full`, which orients,
+        and a synthetic head would then be the one backend in the rig recording
+        under a different convention from the sensor. Everything downstream
+        copes with that -- the journal carries the flag and the readers honour
+        it -- but the dashboard, the browser scenarios and most of the tests run
+        against this backend, so the convention they exercise should be the one
+        the rig uses rather than its exception.
+
+        Both planes come from **one render at one phase under one sequence
+        number**, which is the same contract picamera2 gets from one request.
+        That is not tidiness: the sequence number is the exposure's identity in
+        the recording index, and a gap between consecutive numbers is how a
+        dropped frame is recorded. Producing the preview from a second
+        `read_preview()` would consume a number no stored frame occupies, and
+        every preview taken during a recording would read back as a lost
+        frame. See `base.CameraSource.read_raw`.
+
+        It is also paced like `read_preview`, so a recording from this backend
+        runs at the configured fps rather than as fast as the CPU can render.
+        """
+        self._check_owner("read_raw")
+        if not self._open:
+            raise RuntimeError(f"{self.cam_id}: synthetic source is closed")
+        now = time.monotonic()
+        wait = self._period - (now - self._last)
+        if wait > 0:
+            time.sleep(wait)
+        self._last = time.monotonic()
+        self._run_ae()
+        phase = self._phase(self._last)
+        seq = self._next_seq()
+
+        frame = Frame.now(
+            self._render(self._full, phase),
+            self.cam_id,
+            seq,
+            space="raw",
+            source_kind=SRC_SYNTHETIC,
+            Synthetic=True,
+            **self.orientation,
+            **self._controls,
+        )
+        preview = None
+        if with_preview:
+            image = self._render(self._prev, phase)
+            self._last_mean = float(image.mean())
+            preview = Frame.now(
+                self._orient(image), self.cam_id, seq, space="mono8",
+                source_kind=SRC_SYNTHETIC, Synthetic=True,
+                **self.orientation, **self._controls,
+            )
+        return RawRead(frame=frame, preview=preview, oriented=False)
 
     def capture_full(self, raw: bool = True) -> Frame:
         """A rendered frame. Never `science`, whatever `raw` says.

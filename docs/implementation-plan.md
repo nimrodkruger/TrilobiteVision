@@ -139,12 +139,13 @@ refactor.
 | — | R1–R6 prerequisite closure | G1, G5 | 1 day | Implemented 6 Sep; rig acceptance pending |
 | 3 | **Single owner, bounded commands and minimum lifecycle** | F1, G2 | Re-estimate | Implemented 6 Sep in reduced scope; rig acceptance pending |
 | 4 | Immutable execution provenance and reader schema | F4, G4 | Re-estimate | Retained-frame invariance, revision changes and reader round trips |
-| 5B | **Bounded burst recorder** | new | 2 days | record to the buffer limit; pull the disk before flushing |
-| 5 | Storage identity and drainable release | F2, G3a | 2 days | pull the USB disk in four ways |
+| 5a | Storage identity, reserve and sustained-rate record | F2, G3a | **IMPLEMENTED 8 Oct** | pull the USB disk in four ways |
+| 5b | **Bounded burst recorder** | new | **IMPLEMENTED 8 Oct** | record to the buffer limit; pull the disk before flushing |
+| 5c | **Continuous recorder with declared degradation** | G9 | **IMPLEMENTED 8 Oct** | a five-minute pair recording onto the USB 3 SSD |
 | 6 | Transactional capture sets | F3, G3b | 3 days | cut power mid-capture |
 | 7 | Lifecycle states and durable state file | F6 | 2 days | 100 stop/start cycles; kill during save |
 | 8 | Server admission, trust boundary, deployment manifest | §4, G6–G8 | 3 days | three browsers, slow disk, restart |
-| 9 | Continuous recorder | G9 | gated | requirements must be frozen first |
+| 9 | Unattended long-session operation | — | gated | superseded in part by 5c; see that section |
 
 Sizes are engineering days for one person, excluding bench time.
 
@@ -558,11 +559,35 @@ field/release claims and Stage 9 remains separately gated.
 
 ---
 
-## Stage 5B — bounded burst recorder *(new, 7 September)*
+## Stage 5 — recording *(5a storage, 5b burst, 5c continuous)*
 
-Inserted **before** the existing Stage 5 rather than renumbering: the
-supervisory review, the cleanup log and the Stage 3 contract all cite stage
-numbers, and churning six of them buys nothing.
+**Restructured 8 October**, after the requirement was stated plainly: Stage 5
+must deliver **continuous recording to disk**, degrading by dropping frames or
+other declared lossy means when the write path cannot keep up. The continuous
+recorder was Stage 9; it is now Stage 5c, and Stage 9 keeps only what is
+genuinely later.
+
+Build order is **5a → 5b → 5c**, and the sections appear below in the order they
+were written rather than that order, because the supervisory review, the cleanup
+log and the Stage 3 contract all cite stage numbers and churning them buys
+nothing. Read 5a (p. "storage identity") first.
+
+Requirements as they now stand:
+
+| | |
+|---|---|
+| pixels | raw sensor counts |
+| heads | both, free-running, **no synchronisation claimed** |
+| shape | burst (RAM) **and** continuous (disk) |
+| duration | continuous: **a few minutes** — 1–5 min, so 11–57 GB at full rate |
+| target | **USB 3 SSD** |
+| under-rate behaviour | **explicit loss is permitted** — frame dropping, or another declared lossy configuration. Silence is not. |
+
+That last row also closes open question 2 in the decisions table.
+
+---
+
+## Stage 5b — bounded burst recorder *(new, 7 September)* — **IMPLEMENTED 8 Oct**
 
 Requirements settled 7 September: **raw sensor counts, both heads, no
 synchronisation claim, burst first and continuous later.**
@@ -678,9 +703,10 @@ contradiction in terms — it would be `diagnostic` by construction.
 
 But "AVI" is a container, not a codec, and one option inside it is real:
 
-Measured on an **x86 desktop** with `scripts/bench_encode.py`, 60 frames,
-1456 × 1088 uint16. **Not a Pi — expect roughly 4–6× slower on a Cortex-A76**,
-and run the script there before deciding:
+Measured on an **x86 desktop** on *synthetic* noise, 60 frames, 1456 × 1088
+uint16. **Not a Pi — expect roughly 4–6× slower on a Cortex-A76 — and not this
+sensor**, which is why the figures below are indicative only and the real
+measurement moved into Stage 5c's pre-flight:
 
 | format | MiB/s | ratio (σ=12) | ratio (σ=40) | fidelity |
 |---|---:|---:|---:|---|
@@ -717,7 +743,11 @@ Read off it:
    it writes anything, while the data is still in RAM.
 5. Record 10 s, read the pair back, plot the inter-head `SensorTimestamp`
    difference. That number is the honest statement of this rig's stereo timing.
-6. `python scripts/bench_encode.py --frames 300` on the Pi, to settle FFV1.
+6. Encode one burst to FFV1 and to the 8-bit proxy, post-capture, and time
+   both. **Superseded 8 October:** this was `python scripts/bench_encode.py`,
+   which measured synthetic noise and therefore measured an assumption about
+   the sensor. The timing now happens on real frames inside Stage 5c's
+   pre-flight; `scripts/bench_encode.py` is to be deleted.
 
 ### Acceptance
 
@@ -727,7 +757,7 @@ No flush reaches internal storage without a deliberate, per-save override.
 
 ---
 
-## Stage 5 — storage identity and drainable release *(F2, gate G3a)*
+## Stage 5a — storage identity and drainable release *(F2, gate G3a)* — **IMPLEMENTED 8 Oct**
 
 **Re-scoped 7 September.** Split, because only half of it gates recording:
 
@@ -771,6 +801,21 @@ the first byte rather than discovered during.
 - **`EmptyWriteError` quarantines the device.** Recovery can currently return
   false and later captures keep targeting the same disk.
 - A reserved internal-space floor, so fallback cannot fill the SD card.
+- **Sustained write rate, not a burst probe — added 8 October for 5c.**
+  `verify_device()` currently times a single 4 MiB write. That number is the
+  SLC cache, not the drive. Consumer SSDs hold a fast write cache of a few GB
+  and then fall to their native rate; a DRAM-less QLC drive can drop from
+  450 MB/s to under 100 MB/s. A five-minute pair recording is 11–57 GB, which
+  leaves that cache well behind. So device verification gains a sustained
+  measurement — write until 8 GB or 30 s, whichever comes first, and report
+  **the throughput of the final quarter**, which is the only figure that
+  predicts a multi-minute recording. The mean is reported too, and the gap
+  between them is itself the diagnostic.
+- **Filesystem is recorded, and named to the operator.** exFAT is what lets the
+  SSD mount on the Windows desktop directly; it is also slower on Linux and
+  unjournalled. ext4 is faster and safer and needs a reader on the desktop
+  side. This is a real trade and it is the operator's, so the pre-flight
+  measures whatever is actually there and states which it found.
 
 ### Bench test
 
@@ -787,6 +832,275 @@ Four physical tests, all on the rig with an expendable USB stick:
 ### Acceptance
 
 G3a. No success message may name a target that was not verified.
+
+---
+
+## Stage 5c — continuous recorder with declared degradation *(was Stage 9)* — **IMPLEMENTED 8 Oct**
+
+**Added 8 October.** This is the "proper video recording" requirement. It was
+Stage 9, gated behind everything; it moves here because it is the capability
+being asked for, and because the one answer that unblocks it has now been
+given: **under-rate loss is permitted provided it is declared.**
+
+That single permission is what makes continuous recording tractable. The
+previous draft defaulted to *stopping with an explicit incomplete result*,
+because without permission to lose frames an under-rate disk has no legal
+response. With permission, the disk no longer has to be fast enough — it has
+to be **honest about what it kept**.
+
+### The arithmetic, and where a USB 3 SSD sits in it
+
+Two 1456 × 1088 heads, 1.51 MiB per frame per head at uint16:
+
+| stored samples | 30 fps pair | one minute | five minutes |
+|---|---:|---:|---:|
+| 8-bit (R8) | 95 MB/s | 5.7 GB | 28 GB |
+| 10-bit packed (R10P, if offered) | 119 MB/s | 7.1 GB | 36 GB |
+| 10-bit as uint16 | 190 MB/s | 11.4 GB | 57 GB |
+
+The Pi 5 exposes **one 5 Gbps USB 3 controller shared between both USB 3
+ports** — about 400 MB/s achievable in practice, and only if the enclosure's
+bridge supports **UASP**; a bridge that falls back to BOT can halve it. So
+190 MB/s is inside the bus budget with roughly 2× headroom, and whether it is
+inside the *drive's* budget for five continuous minutes is the question 5a's
+sustained measurement answers.
+
+This is why the design assumes degradation rather than hoping to avoid it: the
+most likely failure is not a missing disk but a drive that holds 450 MB/s for
+twenty seconds and then settles to 90.
+
+### The degradation ladder, and the line through the middle of it
+
+Five mechanisms can close a bandwidth gap. They are not interchangeable, and
+the important distinction is **which are chosen before Start and which may act
+during the recording**:
+
+| | mechanism | effect on the data | cost | when |
+|---|---|---|---|---|
+| 1 | **lower the requested frame rate** | exact, **uniformly** sampled, longer exposure → less noise | fewer frames per second, by choice | **configuration** |
+| 2 | **packed 10-bit raw from the sensor** | exact | needs the format to exist; readers must unpack | **configuration** |
+| 3 | **8-bit raw (R8) from the sensor** | **lossy** → `validity: diagnostic` by the Stage 2 rules | loses 2 bits of every pixel | **configuration**, deliberate |
+| 4 | **drop whole frames at the queue** | each retained frame exact; the sequence becomes **non-uniformly** sampled | temporal gaps | **runtime**, the only one |
+| 5 | FFV1 lossless compression | exact | ~10 MB/s per Pi core — three orders off | **post-capture only** |
+
+**The rule that follows:** the configuration is fixed before Start from measured
+numbers, and **the only thing that may change during a recording is whether a
+frame is kept.** Nothing alters bit depth, geometry or rate mid-stream. A file
+whose frames are not all the same shape and depth breaks every reader
+downstream, and a recording that silently changed its own fidelity halfway is
+worse than one that lost frames, because the loss is at least countable.
+
+Two notes on the ladder itself:
+
+- **Rate reduction beats dropping when the deficit is known in advance.**
+  Dropping discards exposures that were already taken and leaves irregular
+  sampling; asking the sensor for 15 fps instead gives uniform sampling and a
+  longer integration time. Dropping is the safety valve for a *stall*, not the
+  plan for a *deficit*.
+- **8-bit and packed formats are requested from the sensor, not computed.**
+  Truncating uint16 to uint8 in Python costs a full-rate memory pass on cores
+  that do not have it to spare; `R8` costs nothing because the ISP already
+  produces it. Same for packed 10-bit — if libcamera offers it for this
+  sensor, it is free, and if it does not, it is not worth doing in software.
+  Whether it is offered is a measurement, item 4 of the pre-flight.
+
+### Required design
+
+**1. A pre-flight that measures this rig, inside the interface.**
+
+Not a script, and not synthetic noise — a synthetic benchmark measures an
+assumption about the sensor. The Recording tab gets a **Measure** action which
+uses the real camera and the real target:
+
+1. Capture a short real burst into the 5b RAM buffer.
+2. Write it through the actual chunked writer to the selected target, at the
+   volume 5a specifies (8 GB or 30 s), and report **last-quarter** throughput.
+3. Enumerate the raw formats libcamera actually offers for the IMX296 here, and
+   whether any packed 10-bit mode exists.
+4. Derive, for each configuration on the ladder, **the maximum sustainable
+   frame rate** and the predicted drop fraction at the requested rate.
+5. Persist the result **against the storage generation counter** from 5a, so
+   changing the disk invalidates it rather than carrying a stale number.
+
+The recorder then offers **only configurations the pre-flight proved**, each
+labelled with its predicted loss and its resulting `validity`. This replaces
+`scripts/bench_encode.py`, which measured my guess at the sensor rather than
+the sensor.
+
+It also settles, as a by-product, the outstanding `raw_alignment` lsb/msb
+question from Stage 2, since step 3 reads the negotiated format and step 1
+produces a real `raw_observed_max`.
+
+**2. Shape: owner → per-head bounded queue → chunk writer → journal.**
+
+- The acquisition owner (Stage 3) stays the single camera consumer. Recording
+  is a state of the owner loop, as in 5b, not a command.
+- **One bounded queue per head.** Sized so the total is ≤ 25 % of
+  `MemAvailable`, reported in frames and seconds before Start. A few hundred
+  MiB is 2–3 s of pair stream — enough to ride out a stall, and no finite
+  queue survives a sustained deficit, which is precisely why item 3 exists.
+- A dedicated writer thread per head, writing in **4–8 MiB blocks** (a few
+  frames), `fsync` at chunk boundaries only. Per-frame `fsync` at 60 writes/s
+  destroys sustained throughput and buys nothing a completion journal does not.
+
+**3. Drop policy: drop the newest, count it, and never hide it.**
+
+- **Drop-newest, not a wrapped ring.** Overwriting the oldest frame makes the
+  retained sequence depend on future events and discards data already entered
+  in the index. Drop-newest keeps the retained set a prefix-consistent
+  subsample: if the queue is full when a frame arrives, that frame is counted
+  as dropped and its buffer released immediately.
+- **Heads drop independently.** Coupling the drops — discarding head R's frame
+  because head L's was dropped — throws away good data to impose a pairing the
+  rig does not guarantee. The heads are free-running and no synchronisation is
+  claimed, so the recording is **two independently sampled sequences sharing a
+  recorded clock domain**, reconciled offline by `SensorTimestamp`. This is the
+  same position as 5b, applied to a longer window.
+- **Loss is surfaced live**, per head: retained, dropped, instantaneous and
+  cumulative drop fraction, and current write throughput. Not a post-hoc
+  footnote.
+- The manifest records **every gap as an explicit interval** — first and last
+  missing sequence number with their bracketing timestamps — so "94 % of head
+  L, 97 % of head R, longest gap 340 ms" is on the record and reconstructible.
+- A **drop-fraction ceiling** is set before Start. Exceeding it stops the
+  recording with an explicit incomplete result, because past some point the
+  honest answer is that this disk cannot do this job. Default 10 %, operator
+  editable, recorded in the manifest.
+
+**4. File layout: chunked arrays, authoritative index.**
+
+Per-frame files at 60 files/s for five minutes is 18 000 files, which is slow
+on ext4 and worse on exFAT. Instead, **one `.npy` per head per chunk**, each a
+3-D `(N, H, W)` array of fixed N — numpy memory-maps it directly and the
+existing `tv_read_npy` reads it in MATLAB, so no new format arrives in the
+readers. Chunk size 128 frames per head (~194 MiB); the final short chunk is
+written with its true N.
+
+Alongside it, a **per-chunk index sidecar**, which is authoritative: for every
+retained frame, its sequence number, `SensorTimestamp`, per-frame validity and
+offset within the chunk. Sequence numbers are **as exposed, not as stored**, so
+a gap in the index *is* the record of a drop.
+
+**5. Per-frame admission still runs.** A recording where frame 9 000 stopped
+being admissible is a finding. Per-frame validity in the index; the manifest's
+top level says whether every retained frame was science, and names the first
+frame that was not.
+
+**6. Preview is subordinate to the recording.** The 12 Hz browser cap competes
+for the same cores as the JPEG encode and the write path. While recording,
+preview drops to ~2 Hz, published from the queue rather than by a separate
+read, and is suspended entirely if the drop fraction rises above half the
+ceiling. **A preview frame is never worth a recorded frame.**
+
+**7. The playable file is a post-capture proxy, as in 5b.** 8-bit H.264 or
+MJPEG, written after the recording closes, named `diagnostic_…`, tagged
+`validity: diagnostic`, **alongside** the exact data and never instead of it.
+Scrubbing through a recording to decide whether it is worth keeping is a real
+need and this is the right way to meet it; H.264 is 8-bit and lossy, so it can
+never be the science artefact.
+
+**8. Space is checked against the plan, not the moment.** Before Start, the
+requested duration × the configured rate is compared against free space with
+5a's reserve intact, and the **maximum recordable duration on this target is
+displayed**. A recording that will hit the reserve in 90 s says so before it
+starts rather than failing at 90 s.
+
+### Bench test
+
+On the rig, with the USB 3 SSD and an expendable filesystem:
+
+1. Run Measure. Record last-quarter vs mean throughput. **If they differ by
+   more than ~1.5×, the drive has an SLC cache and the sustained figure is the
+   only one that counts.** Note the filesystem and whether UASP is active
+   (`lsusb -t` shows the `uas` driver; a `usb-storage` binding is BOT).
+2. Five-minute pair recording at the highest configuration Measure endorsed.
+   Check: frames retained vs exposed, drop intervals present in the index,
+   chunk count and sizes as predicted, throughput log flat rather than
+   decaying.
+3. Repeat at 30 fps uint16 whether or not Measure endorsed it — the point is to
+   **see the degradation work**. Drops must appear, be counted, be visible live,
+   and be reconstructible from the index afterwards.
+4. Pull the SSD mid-recording. Must stop with an explicit incomplete result
+   naming the chunk that failed, and must not divert to the SD card.
+5. Fill the SSD to within the reserve mid-recording. Must stop with "reserve
+   reached", not a write error.
+6. Read a recording back on the desktop: reconstruct both sequences, plot the
+   inter-head `SensorTimestamp` difference and the retained-frame intervals.
+   Those two plots are the honest statement of this rig's temporal behaviour.
+7. Encode the proxy post-capture and time it. That number decides whether the
+   proxy is automatic or on request.
+
+### As implemented — 8 October
+
+Code: `src/trilobite/recording/` (`buffer`, `burst`, `chunks`, `continuous`,
+`ladder`, `manager`, `preflight`), `src/trilobite/storage/identity.py`, the
+`/api/recording/*` endpoints and the dashboard's Video tab.
+
+Four corrections made while finishing the stage, each of which the design above
+asked for and the first implementation did not deliver:
+
+1. **`offer` has three outcomes, not two.** It returned `False` both for a
+   frame that was dropped and for one that arrived after the recorder had
+   stopped. The capture loop counts the first as a loss, and the recorder never
+   counted the second as exposed, so every recording ended with one phantom
+   drop — and the agreement between those two independent counts is the only
+   thing that would detect a frame genuinely lost between the capture thread
+   and the ring. A detector that always fires by one is not a detector. `None`
+   is now that third outcome, in both recorders.
+
+2. **Start waits for the heads.** `start()` set a flag and returned. Each
+   capture loop decides once per frame whether to record or to release the
+   frame to the preview cap, so a loop that evaluated that check just before
+   the flag flipped released one more frame undecoded — never offered, never
+   counted, simply absent, which is the one kind of loss this stage exists to
+   make impossible. Start now blocks until every head with a live capture loop
+   has been seen in the recording branch, and a head that does not arrive is a
+   failed start rather than a half recording that looks complete.
+
+3. **The synthetic backend records unoriented pixels**, like picamera2, instead
+   of going through `capture_full` and turning them. It was the one backend in
+   the rig recording under the opposite convention, and it is the backend the
+   dashboard, the browser scenarios and most of the tests run against.
+
+   The first attempt at giving it a preview while recording took a second
+   `read_preview()`, which advanced the sequence counter — and a gap in the
+   sequence numbers is exactly how a dropped frame is recorded, so every
+   preview taken during a recording read back as a lost frame. Both planes now
+   come from one render at one phase under one sequence number, which is the
+   contract picamera2 gets from one request.
+
+4. **The preview stands down past half the drop ceiling**, which item 6 above
+   specifies and the first implementation left out: the 2 Hz cap was there, the
+   suspension was not.
+
+Verification: 573 unit tests, 19 browser scenarios, ruff clean. **14 of 14
+mutations caught** (`tools/mutate_stage5.py`) — three survived the first run,
+all three on behaviour added in corrections 1 and 2 with no test asserting it.
+
+Readers: `scripts/read_capture.py` opens a recording directory and recomputes
+the accounting from the chunks and indexes alone; `matlab/tv_read_recording.m`
+and `matlab/tv_recording_frame.m` do the same in MATLAB, seeking to one frame
+rather than loading a chunk. The MATLAB files are **not executed by any test**
+— no MATLAB or Octave on the build machine — so what is checked is the layout
+they depend on: `test_the_matlab_frame_arithmetic_lands_on_the_right_bytes`
+re-implements their header parse, seek and column-major reshape in Python and
+compares every row against `np.load`.
+
+Deferred, deliberately: **the 8-bit playable proxy** (item 7). It is the one
+piece of the written design not built, because the requirement settled on
+8 October was continuous recording with declared degradation, and a scrubable
+file was explicitly not chosen. Nothing in the implementation precludes it —
+it is a post-capture pass over finished chunks — and the reason to want it
+stands: deciding whether a five-minute recording is worth keeping should not
+require a numpy session.
+
+### Acceptance
+
+Every exposed frame is either in the output or counted in the manifest as a
+dropped frame inside a named interval — **no frame is unaccounted for**. No
+recording changes its pixel format, geometry or requested rate mid-stream. No
+recording reaches a target that was not verified under the current storage
+generation. The live loss figures match the manifest.
 
 ---
 
@@ -899,40 +1213,39 @@ eight-hour still workload, 100 lifecycle cycles, restart and rollback.
 
 ---
 
-## Stage 9 — continuous recorder *(G9)* — gated on Stage 5a
+## Stage 9 — unattended long-session operation
 
-**Requirements frozen 7 September** (raw, both heads, unsynchronised), so this
-is no longer gated on the operator. It is gated on **Stage 5a**: at 190 MB/s a
-target that turns out to be the SD card is not a slow session, it is a dead
-card and a lost afternoon.
+**Superseded in substance on 8 October.** The continuous recorder that was this
+stage is now **Stage 5c**, because continuous recording to disk is the stated
+Stage 5 requirement rather than a later ambition. The arithmetic, the
+owner → queue → chunk-writer → journal shape and the SD-card prohibition all
+moved there, together with the correction that matters: this section defaulted
+to *stopping with an explicit incomplete result* when the path could not keep
+up, which was the only legal answer while every exposed frame had to be
+retained. **Explicit loss is now permitted**, so dropping counted frames is the
+first response and stopping is reserved for breaching the drop ceiling.
 
-Stage 6 is **not** a prerequisite, contrary to the note at the end of this
-section as originally written. Stage 6 is about capture *sets* -- a stereo pair
-of stills sharing an id, with per-member manifests. A recording is a different
-transaction shape: one chunked stream with a completion journal, which Stage 5B
-builds. The dependency is on storage identity, not on set atomicity.
+Stage 6 was never a prerequisite, contrary to the note originally at the end of
+this section. Stage 6 is about capture *sets* — a stereo pair of stills sharing
+an id, with per-member manifests. A recording is a different transaction shape:
+one chunked stream with a completion journal. The dependency is on storage
+identity, not on set atomicity.
 
-The arithmetic for
-two 1456 × 1088 heads at 30 fps:
+What genuinely remains later, and is still ungated by any requirement:
 
-| stored samples | rate | one minute | ten minutes |
-|---|---:|---:|---:|
-| 8-bit | 95 MB/s | 5.7 GB | 57 GB |
-| 10-bit as uint16 | 190 MB/s | 11.4 GB | 114 GB |
+- **Sessions measured in hours** rather than minutes, where total volume rather
+  than instantaneous rate is the binding constraint, and the drive has to be
+  managed rather than merely verified — rotation, per-session quotas, and a
+  policy for what happens when a day's work exceeds the disk.
+- **Unattended operation**: scheduled or triggered recording with no operator
+  present to read a drop counter, which needs the Stage 7 durable state file
+  and a notification path rather than a UI panel.
+- **Thermal and duty-cycle behaviour** over such sessions. Two capture loops,
+  two writer threads and a saturated USB 3 controller on a passively cooled Pi
+  5 is an open question, and one that only a long run answers.
 
-A 512 MiB queue absorbs about **2.8 seconds** of the uint16 pair stream. No
-finite queue makes an unavailable disk survivable.
-
-Shape: acquisition owner → validated frame packet → bounded queue with an
-explicit drop counter → dedicated chunk writer → completion journal. Preview
-takes an independently throttled branch. Default to **stopping with an explicit
-incomplete result** when the data path cannot keep up, and never silently
-divert a 190 MB/s recording to the SD card.
-
-This is why Stage 3 came first and Stage 5a comes before this one: the recorder
-needs a single owner and a verified target. The transaction it needs is the
-chunked-stream one from Stage 5B, not Stage 6's capture-set atomicity -- an
-earlier draft of this plan conflated the two.
+None of this blocks 5c, and none of it should be designed before 5c's bench
+numbers exist.
 
 ---
 
@@ -941,7 +1254,7 @@ earlier draft of this plan conflated the two.
 | # | Question | Blocks |
 |---|---|---|
 | 1 | ~~Is 0.1 a still/burst instrument, or must it record continuous raw data?~~ **Answered 7 Sep: both, burst first. Raw sensor counts, both heads, no synchronisation claim.** | closed |
-| 2 | Must every exposed frame be retained, or are explicit losses acceptable? What should happen when the disk fills or vanishes? | Stage 5 fallback policy; Stage 9 |
+| 2 | ~~Must every exposed frame be retained, or are explicit losses acceptable?~~ **Answered 8 Oct: explicit losses are acceptable, provided they are declared and counted. Frame dropping, or another declared lossy configuration, is permitted; silent degradation is not.** Disk full or vanished still stops the recording with a named reason. | closed — defines Stage 5c |
 | 3 | How many simultaneous viewers/operators, and is the rig on an isolated network? | Stage 8 — both the concurrency cap and whether authentication is needed |
 | 4 | Acceptable command latency, preview age, stop/recovery time? | Stages 1/3 require documented provisional thresholds; Stage 8 final operating envelope |
 | 5 | Supported OS / picamera2 / libcamera / filesystem baseline, and who owns rollback? | Stage 8 manifest |
@@ -949,7 +1262,13 @@ earlier draft of this plan conflated the two.
 
 Stages 3/4 are subject to the entry and evidence gates above. Provisional
 engineering thresholds allow development while research requirements mature,
-but must be explicit before acceptance testing. Question 2 also informs Stage 5.
+but must be explicit before acceptance testing.
+
+Question 5's filesystem half is now partly load-bearing for Stage 5c rather
+than only for the Stage 8 manifest: exFAT buys direct mounting on the Windows
+desktop and costs throughput and journalling, ext4 the reverse. Stage 5a's
+pre-flight measures whichever is present, so the decision can be made on
+measured numbers rather than in advance — but it does have to be made.
 
 ---
 

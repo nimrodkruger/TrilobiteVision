@@ -41,7 +41,7 @@ from ..types import (
     CameraInfo,
     Frame,
 )
-from .base import CameraSource
+from .base import CameraSource, RawRead
 from .rawformat import RawFormatError, admit, best_format, classify, describe_refusal
 
 log = logging.getLogger(__name__)
@@ -404,6 +404,152 @@ class Picamera2Source(CameraSource):
             self._next_seq(), space=space, validity=validity,
             source_kind=source_kind, **meta
         )
+
+    # The recording path takes the raw plane out of the request and does NOT
+    # turn it. See base.CameraSource.records_oriented and base.RawRead.
+    records_oriented = False
+
+    def read_raw(self, with_preview: bool = False) -> RawRead | None:
+        """One request -> the raw plane, unoriented, plus the preview if asked.
+
+        The recording path. Three differences from `capture_full`, each of
+        which exists because this runs at sensor rate rather than once:
+
+          * **the raw and lores planes come out of the same request**, so a
+            preview during a recording costs no extra camera access and is the
+            same exposure as the frame being recorded;
+          * **the pixels are not oriented.** See base.RawRead: a quarter turn
+            is a transpose and a full copy, which at 190 MB/s is not affordable
+            on the capture thread, and the reader can apply it later from the
+            manifest;
+          * **admission still runs, per frame.** A recording where frame 9,000
+            stopped being admissible is a finding, so the check is not hoisted
+            out of the loop. It costs one pass over the array for the value
+            check, which is a fraction of a millisecond on 1.5 M pixels.
+
+        The returned pixels are a view into the request's buffer and the
+        request has been released by the time this returns, so **the caller
+        must copy before the next call.** The recorder's slot copy is that
+        copy, and it is the one copy the design cannot avoid.
+        """
+        self._check_owner("read_raw")
+        if not self._open:
+            return None
+        with self._lock:
+            request = self._picam.capture_request()
+            try:
+                try:
+                    data = request.make_array("raw")
+                except Exception as exc:
+                    fmt = self._raw_format_name()
+                    raise RuntimeError(
+                        f"{self.cam_id}: cannot decode the raw stream "
+                        f"(format {fmt!r}) for recording. Set 'raw_format' in "
+                        f"the camera config to an uncompressed format."
+                    ) from exc
+                yuv = request.make_array("lores") if with_preview else None
+                meta = dict(request.get_metadata())
+            finally:
+                request.release()
+
+        seq = self._next_seq()
+        pixels, evidence, validity = self._admit_raw(data)
+        meta.update(evidence)
+        meta["stream"] = "raw"
+        meta["mono_sensor"] = self._mono
+        meta["raw_format"] = self._raw_format_name()
+        meta["raw_format_choice"] = self._raw_choice
+        # Stated explicitly rather than left to be inferred from the camera
+        # config: a reader holding one chunk file has no access to the config,
+        # and applying the rotation twice is a silent error.
+        meta["raw_oriented"] = False
+        meta.update(self.orientation)
+        native = self._raw_negotiated.get("size") or self._full_res
+        meta["image_width"] = int(native[0])
+        meta["image_height"] = int(native[1])
+
+        frame = Frame.now(pixels, self.cam_id, seq, space="raw",
+                          validity=validity, source_kind=SRC_RAW, **meta)
+
+        preview = None
+        if yuv is not None:
+            h = int(self.cfg.preview_resolution[1])
+            luma = np.ascontiguousarray(
+                yuv[:h, : self.cfg.preview_resolution[0]])
+            self._last_meta = meta
+            preview = Frame.now(self._orient(luma), self.cam_id, seq,
+                                space="mono8", source_kind=SRC_ISP_PREVIEW,
+                                **self.orientation)
+        return RawRead(frame=frame, preview=preview, oriented=False)
+
+    def raw_capabilities(self) -> dict[str, Any]:
+        """Every raw format this sensor advertises, and what it means for 5c.
+
+        Measured off `sensor_modes` plus the format actually negotiated, and
+        then put through the same `rawformat` allowlist that admission uses --
+        so a format that appears here as available is one admission would also
+        accept, rather than merely one the driver named.
+        """
+        advertised: list[str] = []
+        modes: list[dict[str, Any]] = []
+        try:
+            for mode in (getattr(self._picam, "sensor_modes", None) or []):
+                row = {
+                    "format": str(mode.get("format") or ""),
+                    "unpacked": str(mode.get("unpacked") or ""),
+                    "size": list(mode.get("size") or ()),
+                    "bit_depth": mode.get("bit_depth"),
+                    "fps": mode.get("fps"),
+                }
+                modes.append(row)
+                for key in ("format", "unpacked"):
+                    name = row[key]
+                    if name and name not in advertised:
+                        advertised.append(name)
+        except Exception as exc:                          # pragma: no cover
+            log.debug("%s: cannot read sensor_modes: %s", self.cam_id, exc)
+
+        classified = {}
+        for name in advertised:
+            fmt = classify(name)
+            classified[name] = {
+                "known": fmt is not None,
+                "admissible": bool(fmt and fmt.admissible),
+                "packed": bool(fmt and fmt.packed),
+                "compressed": bool(fmt and fmt.compressed),
+                "bits": getattr(fmt, "bits", None),
+            }
+
+        negotiated = self._raw_format_name()
+        # A packed format is only useful if BOTH the sensor advertises it and
+        # picamera2 will hand it back as an array this code can store. The
+        # second half is not knowable without trying, so this reports the
+        # first half and says so.
+        packed = sorted(n for n, c in classified.items() if c["packed"])
+        return {
+            "measured": True,
+            "negotiated": negotiated,
+            "requested": self._requested_raw,
+            "choice": self._raw_choice,
+            "formats": advertised,
+            "classified": classified,
+            "sensor_modes": modes,
+            "packed_advertised": packed,
+            # Deliberately conservative. Packed storage needs an unpack step in
+            # both readers; until that exists the ladder does not offer it, and
+            # claiming availability for a rung that is not wired up would put
+            # an unusable option in front of the operator.
+            "packed_available": False,
+            "packed_note": (
+                f"packed formats advertised: {', '.join(packed) or 'none'}. "
+                f"Not offered as a recording format yet: storing packed needs "
+                f"an unpack step in read_capture.py and the MATLAB readers, "
+                f"and this rig has not shown it needs the bandwidth."),
+            "eight_bit_available": any(
+                c["admissible"] and c["bits"] == 8 for c in classified.values()),
+            "negotiated_admissible": bool(
+                (f := classify(negotiated)) and f.admissible),
+        }
 
     def _choose_raw_format(self, picam: Any) -> str | None:
         """Pick a raw format that is established sensor counts, or refuse to open.

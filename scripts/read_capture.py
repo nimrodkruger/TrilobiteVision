@@ -33,6 +33,15 @@ USAGE
     python scripts/read_capture.py calibration_20260901_143000/ --detect \\
         --csv corners.csv
 
+    # a RECORDING: what is in it, how much was lost, and where
+    python scripts/read_capture.py rec_20261008_143000_raw16_30fps/
+
+    # step through it, every tenth kept frame
+    python scripts/read_capture.py rec_.../ --show --every 10
+
+    # lift one frame out as an ordinary still, so every tool above works on it
+    python scripts/read_capture.py rec_.../ --seq 9014 --export frames/
+
 WHAT THE SIDECARS CARRY
 
 Every capture sidecar carries `validity` and `source_kind`, and this reader
@@ -65,6 +74,31 @@ established. `--allow-diagnostic` overrides even that.
 None of this is the same question as `space`: `space: raw` says the ISP was
 bypassed, which is a claim about the path the pixels took, not about what the
 values mean. A compressed PiSP buffer is `space: raw`.
+
+RECORDINGS
+
+A recording is a DIRECTORY with a `recording.json` journal, per-head
+subdirectories of chunked `.npy` files, and an index beside each chunk. Two
+things about them differ from stills and both will give wrong answers quietly
+if ignored:
+
+    The pixels are stored UNORIENTED. A still is rotated and flipped on the
+    way out; a recording cannot afford a transpose of every frame at
+    190 MB/s, so the transform is in the journal and this reader applies it.
+    The journal says `pixels_oriented: false` explicitly, so an absent key is
+    never read as "no rotation needed".
+
+    The index is AUTHORITATIVE, not the array. The array holds the frames
+    that were kept; the index holds the sequence number each one was exposed
+    at. They differ exactly where a frame was dropped, so row 3 is not
+    necessarily the frame after row 2 -- reading the array alone gives a
+    sequence that looks continuous and is not.
+
+Losses are expected and declared, not a fault: the rig is permitted to drop
+frames when the disk cannot keep up, provided it counts them. This reader
+RECOMPUTES the accounting from the files rather than printing what the journal
+claims, so the two can be compared -- which is the acceptance criterion for
+the recorder.
 
 A capture sidecar (`raw_*`/`view_*`) has `pipeline`, so the MLA parameters are
 under `pipeline.mla` **in preview pixels** with `reference_width` alongside;
@@ -761,6 +795,438 @@ def board_from_session(path: Path) -> tuple[int, int] | None:
     return None
 
 
+# ===========================================================================
+# RECORDINGS (Stage 5)
+#
+# A recording is a directory, not a file, and it is read differently from a
+# still for two reasons that both matter more than the convenience of one code
+# path:
+#
+#   * the pixels are stored in SENSOR ORIENTATION. A still is rotated and
+#     flipped on the way out so that what lands on disk matches what the
+#     operator saw; a recording cannot afford a transpose and a full copy of
+#     every frame on the capture thread, so the transform travels in the
+#     journal and is applied HERE. Applying it twice, or not at all, is a
+#     silent error, which is why the journal states `pixels_oriented: false`
+#     explicitly rather than leaving an absent key to be interpreted.
+#
+#   * the array holds the frames that were KEPT and the index holds what was
+#     EXPOSED. Row 3 is not necessarily the frame after row 2. Reading the
+#     array without the index gives a sequence that looks continuous and is
+#     not, which is the one way to misread a recording that produces plausible
+#     numbers.
+# ===========================================================================
+
+SUPPORTED_RECORDING_SCHEMA = 1
+
+
+@dataclass
+class Recording:
+    """One recording directory: its journal, its heads, its losses."""
+
+    path: Path
+    journal: dict[str, Any] = field(default_factory=dict)
+    heads: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+
+    @property
+    def kind(self) -> str:
+        return str(self.journal.get("kind") or "unknown")
+
+    @property
+    def plan(self) -> dict[str, Any]:
+        return self.journal.get("plan") or {}
+
+    @property
+    def complete(self) -> bool:
+        """A burst journal has no `complete` key; its presence IS completion."""
+        return bool(self.journal.get("complete", self.kind == "burst"))
+
+    @property
+    def validity_ceiling(self) -> str:
+        return str(self.plan.get("validity_ceiling") or "unknown")
+
+    @property
+    def pixels_oriented(self) -> bool:
+        """Were the stored pixels already turned when they were written?
+
+        The journal states this explicitly, including when it is False, so an
+        absent key is never read as "nothing to do". A recording from the
+        picamera2 path stores sensor-frame pixels and this is False; one from
+        an offline backend went through `capture_full`, which orients, and this
+        is True. Applying the transform twice is a silent error, which is why
+        the flag exists rather than being inferred from the rotation being
+        non-zero.
+        """
+        return bool(self.plan.get("pixels_oriented", False))
+
+    def orientation(self, cam_id: str) -> dict[str, Any]:
+        """The transform this reader must APPLY. Empty when already applied."""
+        if self.pixels_oriented:
+            return {}
+        return (self.plan.get("orientation") or {}).get(cam_id, {})
+
+    def orientation_recorded(self, cam_id: str) -> dict[str, Any]:
+        """What the camera's orientation was, applied or not. For reporting."""
+        return (self.plan.get("orientation") or {}).get(cam_id, {})
+
+    def head_summary(self, cam_id: str) -> dict[str, Any]:
+        return (self.journal.get("heads") or {}).get(cam_id, {})
+
+    # -- the frames ------------------------------------------------------
+
+    def frames(self, cam_id: str):
+        """Yield `(record, pixels)` in stored order, oriented for viewing.
+
+        Memory-mapped, so a 57 GB recording can be stepped through on a laptop:
+        `np.load(..., mmap_mode="r")` reads the header and nothing else, and
+        each frame is faulted in as it is touched.
+
+        `record` is the index entry, which carries the sequence number **as
+        exposed**. Callers that care about timing must use `record["seq"]` and
+        `record["sensor_timestamp"]`, never the position in this generator.
+        """
+        for chunk in self.heads.get(cam_id, []):
+            arr = np.load(chunk["npy"], mmap_mode="r")
+            records = chunk["index"].get("frames") or []
+            if len(records) != arr.shape[0]:
+                print(f"warning: {Path(chunk['npy']).name} holds "
+                      f"{arr.shape[0]} frames and its index names "
+                      f"{len(records)}. The index is authoritative; the extra "
+                      f"rows are an interrupted write.", file=sys.stderr)
+            for i, record in enumerate(records[: arr.shape[0]]):
+                yield record, _apply_orientation(
+                    np.asarray(arr[i]), self.orientation(cam_id))
+
+    def frame_at(self, cam_id: str, seq: int):
+        """One frame by its EXPOSED sequence number, or None if it was dropped."""
+        for record, pixels in self.frames(cam_id):
+            if int(record["seq"]) == int(seq):
+                return record, pixels
+        return None
+
+    def accounting(self) -> dict[str, Any]:
+        """Kept, dropped and unaccounted, recomputed from the files.
+
+        Recomputed rather than read out of the journal, deliberately. The
+        journal says what the rig believed; this says what is on the disk, and
+        the acceptance criterion for the whole stage is that they agree.
+        """
+        out: dict[str, Any] = {"heads": {}, "unaccounted": 0}
+        for cam_id in sorted(self.heads):
+            seqs: list[int] = []
+            for chunk in self.heads[cam_id]:
+                seqs.extend(int(f["seq"]) for f in chunk["index"].get("frames") or [])
+            summary = self.head_summary(cam_id)
+            exposed_claimed = int(summary.get("frames_exposed") or 0)
+            exposed_seen = (seqs[-1] - seqs[0] + 1) if seqs else 0
+            gaps = []
+            for a, b in zip(seqs, seqs[1:], strict=False):
+                if b > a + 1:
+                    gaps.append((a + 1, b - 1))
+            row = {
+                "stored_on_disk": len(seqs),
+                "stored_claimed": int(summary.get("frames_stored") or 0),
+                "exposed_claimed": exposed_claimed,
+                "exposed_span": exposed_seen,
+                "dropped_claimed": int(summary.get("frames_dropped") or 0),
+                "dropped_in_gaps": sum(b - a + 1 for a, b in gaps),
+                "gaps": len(gaps),
+                "longest_gap_frames": max((b - a + 1 for a, b in gaps), default=0),
+                "first_seq": seqs[0] if seqs else None,
+                "last_seq": seqs[-1] if seqs else None,
+            }
+            # A frame the rig says it exposed that is neither on the disk nor
+            # inside a gap. This is the number the stage's acceptance criterion
+            # is written against, and it is checked here rather than trusted.
+            row["unaccounted"] = max(
+                0, exposed_claimed - len(seqs) - row["dropped_in_gaps"]) \
+                if exposed_claimed else 0
+            row["agrees"] = (row["stored_on_disk"] == row["stored_claimed"]
+                             and row["unaccounted"] == 0)
+            out["heads"][cam_id] = row
+            out["unaccounted"] += row["unaccounted"]
+        out["agrees"] = all(h["agrees"] for h in out["heads"].values())
+        return out
+
+    def inter_head_offset_ms(self) -> np.ndarray | None:
+        """Nearest-neighbour SensorTimestamp difference, for exactly two heads.
+
+        The honest statement of this rig's stereo timing, and the reason the
+        journal refuses to claim synchronisation: these sensors are
+        free-running, so this is a distribution rather than a number.
+        """
+        if len(self.heads) != 2:
+            return None
+        stamps = []
+        for cam_id in sorted(self.heads):
+            t = [f.get("sensor_timestamp") for chunk in self.heads[cam_id]
+                 for f in (chunk["index"].get("frames") or [])]
+            t = np.array([v for v in t if v is not None], dtype=np.int64)
+            if t.size == 0:
+                return None
+            stamps.append(t)
+        a, b = stamps
+        if b.size < 2:
+            return (a - b[0]) / 1e6
+        idx = np.searchsorted(b, a).clip(1, b.size - 1)
+        left, right = b[idx - 1], b[idx]
+        pick = np.where(np.abs(a - left) <= np.abs(a - right), left, right)
+        return (a - pick) / 1e6
+
+
+def _apply_orientation(pixels: np.ndarray, orient: dict[str, Any]) -> np.ndarray:
+    """Rotate and flip stored sensor pixels into the frame the operator saw.
+
+    The same order the rig uses at acquisition: rotate clockwise first, then
+    the mirrors, so "flip horizontal" means "flip what I am looking at" rather
+    than "flip the sensor". Getting the order wrong is wrong only for the two
+    combinations that include a quarter turn AND a mirror, which is exactly the
+    kind of error that survives a casual check.
+    """
+    out = pixels
+    turns = (int(orient.get("rotate_deg") or 0) // 90) % 4
+    if turns:
+        # Clockwise as seen in the image, which is k=-turns for np.rot90.
+        out = np.rot90(out, k=-turns)
+    if orient.get("flip_horizontal"):
+        out = out[:, ::-1]
+    if orient.get("flip_vertical"):
+        out = out[::-1, :]
+    return np.ascontiguousarray(out)
+
+
+def is_recording(path: Path) -> bool:
+    return (Path(path) / "recording.json").exists()
+
+
+def open_recording(path: Path) -> Recording:
+    path = Path(path)
+    journal = json.loads((path / "recording.json").read_text(encoding="utf-8"))
+
+    schema = journal.get("schema")
+    if schema is not None and int(schema) > SUPPORTED_RECORDING_SCHEMA:
+        raise SystemExit(
+            f"{path.name}: recording schema {schema}, and this reader "
+            f"understands up to {SUPPORTED_RECORDING_SCHEMA}. Refused rather "
+            f"than half-read -- update the reader from the commit that wrote "
+            f"the recording.")
+
+    rec = Recording(path=path, journal=journal)
+    for head_dir in sorted(p for p in path.iterdir() if p.is_dir()):
+        chunks = []
+        for npy in sorted(head_dir.glob("*.npy")):
+            index_path = npy.with_suffix(".index.json")
+            if not index_path.exists():
+                # A chunk with no index is an interrupted write. It is NOT
+                # readable as data: without the index there is no record of
+                # which exposures those frames were, so treating them as
+                # consecutive would invent a timeline.
+                print(f"warning: {npy.name} has no index beside it. It is an "
+                      f"interrupted write and is being skipped -- its frames "
+                      f"cannot be placed in time.", file=sys.stderr)
+                continue
+            chunks.append({
+                "npy": npy,
+                "index": json.loads(index_path.read_text(encoding="utf-8")),
+            })
+        if chunks:
+            rec.heads[head_dir.name] = chunks
+    if not rec.heads:
+        raise SystemExit(f"{path}: a journal, but no readable chunks under it")
+    return rec
+
+
+def describe_recording(rec: Recording) -> None:
+    plan = rec.plan
+    print(f"recording   {rec.path}")
+    print(f"  kind      {rec.kind}"
+          + ("" if rec.complete else "   INCOMPLETE")
+          + (f"   stopped: {rec.journal.get('stop_reason')}"
+             if rec.journal.get("stop_reason") else ""))
+    print(f"  format    {plan.get('format')} ({plan.get('format_label')}), "
+          f"{plan.get('fps')} fps requested, "
+          f"{plan.get('width')} x {plan.get('height')} sensor pixels")
+    print(f"  validity  ceiling {rec.validity_ceiling}"
+          + ("" if plan.get("exact", True)
+             else "   LOSSY FORMAT -- never science"))
+    print(f"  duration  {rec.journal.get('duration_s')} s")
+    print(f"  generation {rec.journal.get('storage_generation')}")
+
+    acc = rec.accounting()
+    print("  accounting (recomputed from the files, not read from the journal)")
+    for cam_id, row in acc["heads"].items():
+        orient = rec.orientation_recorded(cam_id)
+        print(f"    {cam_id}")
+        print(f"      frames   {row['stored_on_disk']} on disk, "
+              f"{row['exposed_claimed']} exposed, "
+              f"{row['dropped_claimed']} dropped")
+        pct = (100.0 * row["dropped_claimed"] / row["exposed_claimed"]
+               if row["exposed_claimed"] else 0.0)
+        print(f"      loss     {pct:.1f}% in {row['gaps']} gap(s), "
+              f"longest {row['longest_gap_frames']} frames")
+        print(f"      seq      {row['first_seq']} .. {row['last_seq']}")
+        print(f"      orient   rotate {orient.get('rotate_deg', 0)}deg"
+              f"  flipH {bool(orient.get('flip_horizontal'))}"
+              f"  flipV {bool(orient.get('flip_vertical'))}"
+              + ("   (ALREADY applied when written)" if rec.pixels_oriented
+                 else "   (applied by this reader; the files are unoriented)"))
+        if not row["agrees"]:
+            print(f"      !!       {row['unaccounted']} frame(s) unaccounted "
+                  f"for, and the index disagrees with the journal")
+
+    print(f"  accounted {'yes' if acc['agrees'] else 'NO -- see above'}")
+
+    offsets = rec.inter_head_offset_ms()
+    if offsets is not None and offsets.size:
+        print(f"  heads     free-running, NO synchronisation claimed. "
+              f"Measured offset {np.mean(offsets):+.3f} ms mean, "
+              f"{np.std(offsets):.3f} ms sd, "
+              f"{np.min(offsets):+.3f} .. {np.max(offsets):+.3f} ms")
+    note = rec.journal.get("degradation_note")
+    if note:
+        print(f"  note      {note}")
+
+
+def read_recording(args) -> int:
+    """The recording path through main(). Describe, then step or export.
+
+    Separate from the still path and not merged into it, because almost every
+    option means something different here: `--grid` would need the MLA
+    parameters a recording does not carry, `--detect` on eighteen thousand
+    frames is not something to do by accident, and `--save` of a whole
+    recording as PNGs is a different request from saving one frame. Exporting a
+    frame as a still with a sidecar is the bridge: that file then goes through
+    the ordinary tools.
+    """
+    rec = open_recording(args.path)
+    describe_recording(rec)
+
+    heads = [args.head] if args.head else sorted(rec.heads)
+    for cam_id in heads:
+        if cam_id not in rec.heads:
+            raise SystemExit(
+                f"no head {cam_id!r} in this recording; have "
+                f"{sorted(rec.heads)}")
+
+    if args.export:
+        args.export.mkdir(parents=True, exist_ok=True)
+        written = 0
+        for cam_id in heads:
+            for i, (record, pixels) in enumerate(rec.frames(cam_id)):
+                if args.seq is not None and int(record["seq"]) != args.seq:
+                    continue
+                if args.seq is None and i % max(1, args.every):
+                    continue
+                written += _export_frame(rec, cam_id, record, pixels, args.export)
+        print(f"\nexported {written} frame(s) to {args.export}")
+        if args.seq is not None and not written:
+            print(f"frame {args.seq} is not in the recording -- it was one of "
+                  f"the dropped ones. The gaps are listed above.",
+                  file=sys.stderr)
+        return 0
+
+    if not (args.show or args.save):
+        return 0
+
+    cv2 = _cv2()
+    for cam_id in heads:
+        for i, (record, pixels) in enumerate(rec.frames(cam_id)):
+            if args.seq is not None and int(record["seq"]) != args.seq:
+                continue
+            if args.seq is None and i % max(1, args.every):
+                continue
+            shown = to_display(pixels, stretch=not args.no_stretch)
+            label = (f"{cam_id} seq {record['seq']} "
+                     f"({record.get('validity', '?')})")
+            if args.save:
+                out = (Path(args.save) /
+                       f"{cam_id}_{int(record['seq']):08d}.png")
+                out.parent.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(out), shown)
+            if args.show:
+                cv2.imshow(label, shown)
+                print(f"  {label}   any key = next, q = stop")
+                key = cv2.waitKey(0) & 0xFF
+                cv2.destroyWindow(label)
+                if key in (ord("q"), 27):
+                    return 0
+    return 0
+
+
+def _export_frame(rec: Recording, cam_id: str, record: dict[str, Any],
+                  pixels: np.ndarray, out_dir: Path) -> int:
+    """Write one recorded frame as a still, with an honest sidecar.
+
+    The sidecar is built from the recording's journal and the frame's index
+    entry, and it carries the SAME validity the recording carried -- never a
+    better one. A frame lifted out of a recording stored in a lossy format is
+    still diagnostic, and the per-frame validity from the index wins over the
+    plan's ceiling when it is worse.
+    """
+    plan = rec.plan
+    per_frame = str(record.get("validity") or "unknown")
+    ceiling = rec.validity_ceiling
+    order = {"diagnostic": 0, "unknown": 1, "unvalidated": 2, "science": 3}
+    validity = min([per_frame, ceiling], key=lambda v: order.get(v, 1))
+
+    prefix = "" if validity == "science" else f"{validity}_"
+    stem = f"{prefix}rec_{cam_id}_{int(record['seq']):08d}"
+    npy_path = out_dir / f"{stem}.npy"
+    np.save(npy_path, pixels, allow_pickle=False)
+
+    sidecar = {
+        "schema": SUPPORTED_SCHEMA,
+        "file": npy_path.name,
+        "cam_id": cam_id,
+        "tag": "rec",
+        "acquisition": {
+            "seq": record.get("seq"),
+            "t_monotonic": record.get("t_mono"),
+            "t_wall": record.get("t_wall"),
+            "space": "raw",
+            "validity": validity,
+            "source_kind": "raw",
+            "dtype": str(pixels.dtype),
+            "shape": list(pixels.shape),
+            "sensor_metadata": {
+                "SensorTimestamp": record.get("sensor_timestamp"),
+                "raw_observed_max": record.get("observed_max"),
+                "raw_reservations": record.get("reservations") or [],
+                # The recording stored unoriented pixels and this export has
+                # already applied the transform, so the sidecar must record it
+                # as DONE or a reader would apply it a second time.
+                **(rec.orientation_recorded(cam_id) or {}),
+                # Oriented by the time it reaches this file, whether the
+                # recording stored it turned or this reader turned it. Recorded
+                # as DONE so no later reader applies it a second time.
+                "raw_oriented": True,
+            },
+        },
+        "validity": validity,
+        "source_kind": "raw",
+        "space": "raw",
+        "dtype": str(pixels.dtype),
+        "shape": list(pixels.shape),
+        "processing": {"ran": False, "from_recording": True},
+        "exported_from": {
+            "recording": str(rec.path),
+            "kind": rec.kind,
+            "format": plan.get("format"),
+            "exact": plan.get("exact"),
+            "requested_fps": plan.get("fps"),
+            "storage_generation": rec.journal.get("storage_generation"),
+            "complete": rec.complete,
+            # Carried so an exported frame cannot be mistaken for one from a
+            # clean recording. A frame out of a recording that stopped on the
+            # drop ceiling is fine in itself; the context is not noise.
+            "stop_reason": rec.journal.get("stop_reason"),
+        },
+    }
+    npy_path.with_suffix(".json").write_text(
+        json.dumps(sidecar, indent=2), encoding="utf-8")
+    return 1
+
+
 def gather(target: Path) -> list[Path]:
     if target.is_file():
         return [target]
@@ -796,8 +1262,19 @@ def main() -> int:
     ap.add_argument("--allow-diagnostic", action="store_true",
                     help="run --detect on captures the rig tagged diagnostic "
                          "(for looking at, never for measuring)")
+    ap.add_argument("--head", help="recordings: which camera to read (default: all)")
+    ap.add_argument("--seq", type=int,
+                    help="recordings: one frame by its EXPOSED sequence number")
+    ap.add_argument("--every", type=int, default=1, metavar="N",
+                    help="recordings: step through every Nth stored frame")
+    ap.add_argument("--export", type=Path, metavar="DIR",
+                    help="recordings: write the selected frame(s) as .npy plus "
+                         "a sidecar, so the still tools can read them")
 
     args = ap.parse_args()
+
+    if args.path.is_dir() and is_recording(args.path):
+        return read_recording(args)
 
     files = gather(args.path)
     many = len(files) > 1

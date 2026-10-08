@@ -10,13 +10,15 @@ path that says otherwise. Two of the tests below are that scenario.
 from __future__ import annotations
 
 import sys
+import threading
+import time
 
 import numpy as np
 import pytest
 
 from trilobite.config import StorageConfig
-from trilobite.storage import devices
-from trilobite.storage.writer import SessionWriter
+from trilobite.storage import devices, identity
+from trilobite.storage.writer import SessionWriter, StorageRefused
 from trilobite.types import SCIENCE, SRC_RAW, Frame
 
 
@@ -129,17 +131,178 @@ def test_the_manifest_follows_the_session_to_a_new_device(writer, tmp_path):
 # -- survival ---------------------------------------------------------------
 
 
+def _unplug(monkeypatch, path):
+    """Simulate the real failure: the mount point survives, the volume does not.
+
+    Pulling a USB stick leaves its mount point behind as an ordinary, writable
+    directory on the parent filesystem. `exists()`, `os.access` and
+    `devices.is_mounted` all keep saying yes; the only thing that changes is
+    the `st_dev` behind the path. Patching `st_dev_of` is therefore a *more*
+    faithful simulation than deleting the directory -- deleting it exercises
+    the easy case and leaves the silent one untested, which is how the old
+    `is_mounted`-based check passed while catching nothing.
+    """
+    real = identity.st_dev_of
+
+    def shifted(p):
+        got = real(p)
+        if got is not None and str(p).startswith(str(path)):
+            return got + 1000       # some other filesystem is here now
+        return got
+
+    monkeypatch.setattr(identity, "st_dev_of", shifted)
+
+
 def test_a_vanished_device_falls_back_to_the_internal_root(writer, tmp_path, monkeypatch):
     stick = tmp_path / "stick"
     stick.mkdir()
     writer.retarget(stick)
-    # The mount point survives the unplug as an empty directory; only the
-    # device behind it is gone. That is exactly the silent case.
-    monkeypatch.setattr(devices, "is_mounted", lambda p: False)
+    _unplug(monkeypatch, stick)
 
     assert writer.check_and_recover() is True
     assert writer.root == writer.default_root
-    assert writer.notes and "disappeared" in writer.notes[-1]
+    assert any("DIFFERENT" in n or "wrong-volume" in n for n in writer.notes)
+
+
+def test_the_vanished_device_is_quarantined_and_cannot_be_reselected(
+    writer, tmp_path, monkeypatch
+):
+    """Recovery used to be able to fail and leave every later capture pointed
+    at the same disk. A device that lost a session does not get another one by
+    accident."""
+    stick = tmp_path / "stick"
+    stick.mkdir()
+    writer.retarget(stick)
+    _unplug(monkeypatch, stick)
+    writer.check_and_recover()
+
+    monkeypatch.undo()
+    with pytest.raises(ValueError, match="quarantined"):
+        writer.retarget(stick)
+    # The override exists, because this is a refusal to do it by accident, not
+    # a refusal to do it at all.
+    writer.retarget(stick, force=True)
+    assert writer.root == stick
+
+
+def test_a_write_to_a_swapped_volume_is_refused_before_it_starts(
+    writer, tmp_path, monkeypatch
+):
+    stick = tmp_path / "stick"
+    stick.mkdir()
+    writer.retarget(stick)
+    _unplug(monkeypatch, stick)
+
+    state, reason = writer.target_state()
+    assert state == identity.WRONG_VOLUME
+    assert "DIFFERENT" in reason
+    with pytest.raises(StorageRefused) as exc:
+        writer.admit(1 << 20, internal_ok=True)
+    assert exc.value.state == identity.WRONG_VOLUME
+
+
+def test_the_reserve_is_enforced_before_a_large_write(writer, tmp_path, monkeypatch):
+    stick = tmp_path / "stick"
+    stick.mkdir()
+    writer.retarget(stick)
+    # 3 GB free against a 2 GB reserve: a 2 GB flush must be refused while the
+    # data is still in RAM, not discovered half way through it.
+    monkeypatch.setattr(devices, "_usage", lambda p: (10 << 30, 3 << 30))
+
+    assert writer.target_state(1 << 29)[0] == identity.OK
+    assert writer.target_state(2 << 30)[0] == identity.FULL
+    with pytest.raises(StorageRefused) as exc:
+        writer.admit(2 << 30)
+    assert exc.value.state == identity.FULL
+
+
+def test_a_full_external_target_does_not_divert_to_the_internal_disk(
+    writer, tmp_path, monkeypatch
+):
+    """Full is not a recovery: diverting because the external disk filled up is
+    how the SD card gets filled next."""
+    stick = tmp_path / "stick"
+    stick.mkdir()
+    writer.retarget(stick)
+    monkeypatch.setattr(devices, "_usage", lambda p: (10 << 30, 1 << 20))
+
+    assert writer.target_state()[0] == identity.FULL
+    assert writer.check_and_recover() is False
+    assert writer.root == stick
+
+
+def test_a_multi_gigabyte_write_to_the_internal_disk_needs_an_override(writer):
+    assert writer.root == writer.default_root
+    with pytest.raises(StorageRefused) as exc:
+        writer.admit(2 << 30)
+    assert exc.value.state == "internal-refused"
+    assert writer.admit(2 << 30, internal_ok=True) == writer.generation
+    writer.done()
+
+
+def test_release_waits_for_an_in_flight_write(writer, tmp_path):
+    stick = tmp_path / "stick"
+    stick.mkdir()
+    writer.retarget(stick)
+
+    assert writer.admit(1 << 20, internal_ok=True) == writer.generation
+    # A release that cannot drain must NOT report the disk as released: the UI
+    # advice is "release, then remove the disk", so this is the only handoff.
+    out = writer.release(timeout=0.2)
+    assert out["released"] is False
+    assert out["inflight"] == 1
+    assert writer.root == stick
+
+    writer.done()
+    out = writer.release(timeout=2.0)
+    assert out["released"] is True
+    assert writer.root == writer.default_root
+
+
+def test_no_new_write_is_admitted_while_a_release_is_draining(writer, tmp_path):
+    stick = tmp_path / "stick"
+    stick.mkdir()
+    writer.retarget(stick)
+    writer.admit(1 << 20, internal_ok=True)
+
+    done = threading.Event()
+    result: dict = {}
+
+    def releaser():
+        result["out"] = writer.release(timeout=5.0)
+        done.set()
+
+    t = threading.Thread(target=releaser, daemon=True)
+    t.start()
+    time.sleep(0.15)
+    with pytest.raises(StorageRefused) as exc:
+        writer.admit(1 << 20, internal_ok=True)
+    assert exc.value.state == "releasing"
+
+    writer.done()
+    assert done.wait(10.0)
+    assert result["out"]["released"] is True
+    t.join(1.0)
+
+
+def test_the_generation_changes_on_every_retarget_and_release(writer, tmp_path):
+    first = writer.generation
+    stick = tmp_path / "stick"
+    stick.mkdir()
+    writer.retarget(stick)
+    assert writer.generation > first
+    second = writer.generation
+    writer.release(timeout=1.0)
+    assert writer.generation > second
+
+
+def test_a_still_records_the_generation_and_identity_it_went_out_under(writer, tmp_path):
+    stick = tmp_path / "stick"
+    stick.mkdir()
+    writer.retarget(stick)
+    out = writer.save_still(frame())
+    assert out["saved"]["storage_generation"] == writer.generation
+    assert out["saved"]["storage_identity"]["st_dev"] == identity.st_dev_of(stick)
 
 
 def test_recovery_is_a_no_op_while_the_device_is_healthy(writer, tmp_path):
@@ -153,6 +316,12 @@ def test_recovery_is_a_no_op_while_the_device_is_healthy(writer, tmp_path):
 def test_a_capture_is_never_lost_when_the_device_goes_away_mid_write(
     writer, tmp_path, monkeypatch
 ):
+    """The disk fails DURING the write, with its identity still intact.
+
+    A genuinely failing drive rather than a pulled one, so admission has
+    nothing to object to and the evidence only arrives as a failed write. One
+    retry, on the internal disk, and the frame survives.
+    """
     stick = tmp_path / "stick"
     stick.mkdir()
     writer.retarget(stick)
@@ -167,10 +336,42 @@ def test_a_capture_is_never_lost_when_the_device_goes_away_mid_write(
         return real(stem, f)
 
     monkeypatch.setattr(writer, "_write_image", flaky)
-    monkeypatch.setattr(devices, "is_mounted", lambda p: False)
 
     out = writer.save_still(frame())
     assert calls["n"] == 2
+    assert out["image"].startswith(str(writer.default_root))
+    # The sidecar names the generation it actually went out under, not the one
+    # it was admitted under before the recovery moved the target.
+    assert out["saved"]["storage_generation"] == writer.generation
+    assert out["saved"]["storage_identity"] is None      # the internal disk
+    # And the drive that ate a write does not get the rest of the session.
+    assert writer._quarantine
+
+
+def test_a_capture_is_never_lost_when_the_device_is_already_gone(
+    writer, tmp_path, monkeypatch
+):
+    """The disk is pulled BEFORE the write. Admission catches it, so nothing is
+    written to the dead path at all -- which is new. The old order attempted
+    the write, let it fail and recovered from the failure; this never attempts
+    it."""
+    stick = tmp_path / "stick"
+    stick.mkdir()
+    writer.retarget(stick)
+
+    attempted: list[str] = []
+    real = writer._write_image
+
+    def watched(stem, f):
+        attempted.append(str(writer.session_dir))
+        return real(stem, f)
+
+    monkeypatch.setattr(writer, "_write_image", watched)
+    _unplug(monkeypatch, stick)
+
+    out = writer.save_still(frame())
+    assert len(attempted) == 1
+    assert not attempted[0].startswith(str(stick))
     assert out["image"].startswith(str(writer.default_root))
 
 

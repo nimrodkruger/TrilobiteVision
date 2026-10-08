@@ -482,12 +482,21 @@ def diagnostics() -> dict[str, Any]:
 
 
 def is_mounted(path: str | Path) -> bool:
-    """Is `path` still backed by a live mount?
+    """Is `path`, or some parent of it, a writable directory?
 
-    `Path.exists()` is not enough: pulling a USB stick can leave the mount
-    point directory behind as an empty directory on the parent filesystem, so
-    the writes succeed, go to the SD card, and are invisible under the path the
-    user believes they are using. Comparing device ids catches that.
+    **This is weaker than its name and weaker than its old docstring claimed.**
+    It walked up to the first extant parent and asked `os.access`, while
+    describing itself as comparing device ids to catch a pulled stick leaving
+    its mount point behind. It never compared anything: the leftover directory
+    is extant and writable, and so is every parent of it, so this returns True
+    in precisely the case it claimed to catch. Corrected in Stage 5a rather
+    than quietly changed, because the wrong docstring is what let the gap sit
+    there.
+
+    What it is good for: a cheap liveness poll where a false positive costs a
+    wasted check. What it must not be used for: admitting a write. That goes
+    through `identity.verify`, which does compare `st_dev` against the value
+    recorded when the volume was selected.
     """
     p = Path(path)
     try:
@@ -496,6 +505,69 @@ def is_mounted(path: str | Path) -> bool:
         return p.exists() and os.access(p, os.W_OK)
     except OSError:
         return False
+
+
+def describe_mount(mount: str) -> dict[str, Any]:
+    """Descriptive fields for one mount point: device node, fstype, label, model.
+
+    Used by `identity.identify` to make a refusal readable. Everything here is
+    best-effort: on a host with no lsblk the answer comes from /proc/mounts
+    alone, and on one with neither it comes back empty, which is a worse
+    message rather than a failure.
+    """
+    out: dict[str, Any] = {}
+    for dev, mnt, fstype, _opts in _read_proc_mounts():
+        if mnt == mount:
+            out["device"], out["fstype"] = dev, fstype
+            break
+    for row in _lsblk():
+        if row.get("mountpoint") == mount:
+            out.setdefault("device", row.get("path") or "")
+            out.setdefault("fstype", row.get("fstype") or "")
+            out["label"] = row.get("label") or ""
+            out["model"] = (row.get("model") or "").strip()
+            break
+    if out.get("device") and not out.get("label"):
+        fstype, label = _probe_fstype(str(out["device"]))
+        out.setdefault("fstype", fstype)
+        out["label"] = label
+    return out
+
+
+def usb_transport() -> dict[str, Any]:
+    """Which USB storage driver is bound: `uas` or the slower `usb-storage`.
+
+    A diagnostic rather than a check, and it is here because it is the single
+    most likely explanation for a USB 3 SSD that measures half the throughput
+    it should. UASP (`uas`) allows queued commands; the BOT fallback
+    (`usb-storage`) serialises them and can halve sustained write rate on the
+    same drive and the same cable. The enclosure's bridge chip decides, and
+    nothing in the application can change it -- but knowing which one is active
+    turns "the disk is slow" into "the enclosure is the wrong enclosure".
+
+    Read from `lsusb -t`, which names the driver per interface. Absent lsusb,
+    or on a non-USB target, this reports what it could not determine rather
+    than guessing.
+    """
+    rc, out, err = _run(["lsusb", "-t"], 5.0)
+    if rc != 0:
+        return {"available": False, "reason": err.strip() or f"lsusb rc={rc}"}
+    drivers = []
+    for line in out.splitlines():
+        if "Driver=" not in line:
+            continue
+        driver = line.split("Driver=", 1)[1].split(",", 1)[0].strip()
+        if driver in {"uas", "usb-storage"}:
+            speed = ""
+            if "," in line.split("Driver=", 1)[1]:
+                speed = line.split("Driver=", 1)[1].split(",", 1)[1].strip()
+            drivers.append({"driver": driver, "speed": speed})
+    return {
+        "available": True,
+        "storage_interfaces": drivers,
+        "uas": any(d["driver"] == "uas" for d in drivers),
+        "bot_only": bool(drivers) and all(d["driver"] == "usb-storage" for d in drivers),
+    }
 
 
 def mount_of(path: str | Path) -> str:

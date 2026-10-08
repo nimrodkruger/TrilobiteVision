@@ -30,6 +30,7 @@ from .config import AppConfig, CameraConfig
 from .health import host_health
 from .optics.orientation import Orientation
 from .processing.pipeline import Pipeline
+from .recording.manager import RecordingManager
 from .state import StateStore
 from .storage.writer import SessionWriter
 from .types import DIAGNOSTIC, Frame
@@ -129,6 +130,17 @@ class CameraRuntime:
         # the UI can ask for it without a round-trip through the queue. It is
         # a property of the configuration and does not change while running.
         self._control_spec: dict[str, dict[str, Any]] = {}
+        # Set by the Application once, after construction. None means this
+        # runtime cannot record, which is the correct state for a camera
+        # constructed on its own in a test.
+        self.recorder: Any = None
+        # Published preview frames while recording, at their own much lower
+        # rate: the browser cap competes for the same cores as the JPEG encode
+        # and the write path, and a preview frame is never worth a recorded
+        # frame.
+        self._rec_preview_due = 0.0
+        self.recorded = 0
+        self.record_dropped = 0
         # 'running' | 'stopped' | 'failed-stop'. The third is the one that
         # matters: a camera whose thread would not join is NOT stopped, and
         # closing it anyway races a thread that may be inside capture_request.
@@ -176,6 +188,31 @@ class CameraRuntime:
         # Bound after open, because open is legitimately off-owner.
         self.source.bind_owner(self.owner)
         self._control_spec = self.source.control_spec()
+        # Snapshotted here, on the one thread that exists at this moment, for
+        # the same reason as the control spec: the recording pre-flight needs
+        # to know which raw formats this sensor offers, and the web thread must
+        # not reach into a camera to find out. Sensor modes do not change while
+        # the device is open.
+        if self.recorder is not None:
+            info = self.source.describe()
+            w, h = info.full_resolution
+            oriented = bool(self.source.records_oriented)
+            if not oriented and self.source.quarter_turns % 2:
+                # This backend hands the recorder UNORIENTED pixels, so the
+                # plan's geometry must be the sensor's own frame.
+                # `full_resolution` reports the POST-rotation size, so a
+                # quarter turn has to be undone here or every chunk header
+                # would disagree with every frame written into it.
+                #
+                # A backend that DOES orient -- the offline ones, which go
+                # through `capture_full` -- is registered at the post-rotation
+                # size as it stands, and the journal then records the transform
+                # as already applied so the reader does not apply it twice.
+                w, h = h, w
+            self.recorder.register(
+                self.cam_id, self.source.raw_capabilities(),
+                width=int(w), height=int(h), fps=float(self.cfg.fps),
+                orientation=self.source.orientation, oriented=oriented)
         # The MLA parameters are in SENSOR pixels, so the sensor frame has to be
         # declared before any of them mean anything -- here, once, from the
         # camera itself, rather than inferred from whatever frame arrives first.
@@ -226,6 +263,12 @@ class CameraRuntime:
                 return
         self.source.close()
         self.lifecycle = "stopped"
+        # A closed camera cannot be recorded, so it must not appear in a plan's
+        # heads. Leaving it registered would let a recording be armed for a
+        # head that will never deliver a frame, which would read as a 100%
+        # drop rate rather than as the configuration error it is.
+        if self.recorder is not None:
+            self.recorder.unregister(self.cam_id)
         log.info("%s: stopped", self.cam_id)
 
     def _run(self) -> None:
@@ -245,12 +288,21 @@ class CameraRuntime:
         (sensor fps - process fps) x uptime, the cap is not doing what it says.
         """
         self.owner.adopt()
+        # Declared here rather than at `register`, because what the recording
+        # start barrier needs to know is not "is this head configured" but "is
+        # a loop actually turning that will reach the recording branch". Those
+        # differ for exactly one frame at startup and for the whole lifetime of
+        # a head whose thread died.
+        if self.recorder is not None:
+            self.recorder.attach_loop(self.cam_id)
         try:
             self._loop()
         finally:
             # Whatever ended the loop -- stop, or an exception that escaped the
             # per-iteration handler -- nothing else may now reach the camera
             # through this owner, and anything queued must be told.
+            if self.recorder is not None:
+                self.recorder.detach_loop(self.cam_id)
             self.owner.retire()
 
     def _loop(self) -> None:
@@ -263,6 +315,16 @@ class CameraRuntime:
                 # because the sensor has to be drained at its own rate whatever
                 # else is pending.
                 self.owner.service()
+                # Recording takes priority over the preview cap, and that
+                # ordering is the policy: while armed, EVERY delivered frame is
+                # offered to the recorder, and the preview is published from
+                # the same request at its own much lower rate. `skip_preview`
+                # releases frames without decoding them, which is exactly
+                # wrong here -- a released frame is a lost frame.
+                if (self.recorder is not None
+                        and self.recorder.wants(self.cam_id)
+                        and self._record_tick()):
+                    continue
                 if self.process_interval > 0:
                     now = time.monotonic()
                     if now < due:
@@ -299,6 +361,61 @@ class CameraRuntime:
                 # while still recovering quickly from a transient one.
                 self._stop.wait(backoff)
                 backoff = min(backoff * 2, 5.0)
+
+    def _record_tick(self) -> bool:
+        """Take one raw frame for the recorder. True if it was handled here.
+
+        Returns False when the recorder turns out not to want frames after all
+        (it stopped between the check and here), so the caller falls through to
+        the ordinary preview path rather than losing a frame to a race.
+
+        The preview published from this request is deliberately throttled hard
+        and deliberately published from *this* request rather than taken
+        separately: a second request per frame would double the camera access
+        at the worst possible moment, and the preview is then not even the same
+        exposure as the frame being recorded.
+        """
+        now = time.monotonic()
+        # Two conditions, and they answer different questions: the clock says
+        # whether a preview is due, the recorder says whether one is wanted at
+        # all. It stops wanting them once the recording starts losing frames.
+        want_preview = (now >= self._rec_preview_due
+                        and self.recorder.wants_preview(self.cam_id))
+        read = self.source.read_raw(with_preview=want_preview)
+        if read is None:
+            time.sleep(0.05)
+            return True
+        self.acquired.tick()
+
+        # Three outcomes. `None` means the recording ended between the `wants`
+        # check above and this call, so the frame was never part of it -- it is
+        # NOT a drop, and counting it as one would put a phantom loss in the
+        # one comparison that detects a real one. See RecordingManager.offer.
+        kept = self.recorder.offer(self.cam_id, read.frame.data, read.frame)
+        if kept is True:
+            self.recorded += 1
+        elif kept is False:
+            self.record_dropped += 1
+
+        if read.preview is not None:
+            interval = 1.0 / max(self.cfg_recording_preview_fps, 0.1)
+            self._rec_preview_due = now + interval
+            # The pipeline still runs, so the overlays and levels the operator
+            # uses to judge framing keep working -- but at 2 Hz rather than 12,
+            # which is the point.
+            try:
+                self.preview.publish(self.pipeline(read.preview))
+                self.rate.tick()
+            except Exception:
+                log.exception("%s: preview pipeline failed while recording",
+                              self.cam_id)
+        return True
+
+    @property
+    def cfg_recording_preview_fps(self) -> float:
+        rec = self.recorder
+        cfg = getattr(rec, "cfg", None)
+        return float(getattr(cfg, "recording_preview_fps", 2.0) or 2.0)
 
     # -- actions --------------------------------------------------------
 
@@ -471,6 +588,13 @@ class CameraRuntime:
             # bench run reads: if neither ever approached its bound, the
             # capacity is not what is limiting anything.
             "commands": self.owner.state(),
+            # Per-head recording counters, from the CAPTURE side. The recorder
+            # reports its own; these are what the loop saw, and the two must
+            # agree -- a divergence means a frame went missing between the
+            # capture thread and the recorder, which is the one loss neither
+            # side can see alone.
+            "recorded": self.recorded,
+            "record_dropped": self.record_dropped,
             "preview_shape": list(frame.shape) if frame is not None else None,
             "live": self.live_controls(),
             "info": self.source.describe().as_dict() if self.source.is_open else None,
@@ -570,10 +694,16 @@ class Application:
     ) -> None:
         self.cfg = cfg
         self.writer = SessionWriter(cfg.storage, cfg.storage_root)
+        # Stage 5. One manager for the whole rig, not one per camera: a
+        # recording spans the heads, and two managers would each apply a
+        # conservative memory limit whose sum is not conservative.
+        self.recording = RecordingManager(cfg.storage, self.writer)
         self.cameras: dict[str, CameraRuntime] = {
             c.cam_id: CameraRuntime(c, self.writer, process_fps=cfg.server.preview_fps)
             for c in cfg.cameras
         }
+        for cam in self.cameras.values():
+            cam.recorder = self.recording
         self.started_at = time.time()
         # Declared before a session, frozen once one starts. Persisted with
         # everything else so the board and acceptance settings survive a
@@ -735,6 +865,14 @@ class Application:
                 self.writer.check_and_recover()
             except Exception:
                 log.exception("storage watch failed")
+            try:
+                # The recorder's ceilings live here too -- the drop ceiling
+                # needs a denominator, the free-space reserve is a statvfs
+                # call, and finishing a recording means closing chunk files and
+                # writing a journal. None of those belongs in a frame callback.
+                self.recording.watch()
+            except Exception:
+                log.exception("recording watch failed")
 
     def mark_dirty(self) -> None:
         """Call after any parameter or control change so autosave picks it up."""
@@ -807,7 +945,25 @@ class Application:
         )
 
     def stop(self) -> None:
-        # The session first: its loop pulls frames from the cameras, so
+        # The recording first, and before the storage watch: a continuous
+        # recording holds open chunk files and a storage admission, and
+        # stopping the cameras underneath it would leave both. An unsaved
+        # BURST is deliberately not flushed here -- writing gigabytes during a
+        # shutdown that systemd gives fifteen seconds for would be a worse
+        # failure than losing it, and the state machine already says in plain
+        # words that RAM does not survive a restart.
+        try:
+            if self.recording.active == "continuous":
+                self.recording.stop_continuous()
+        except Exception:
+            log.exception("error stopping the recording")
+        if self.recording.burst.unsaved:
+            log.error(
+                "shutting down with an UNSAVED burst in RAM (%s). It is being "
+                "lost: RAM does not survive a process restart, and flushing "
+                "gigabytes inside a shutdown budget is not safe either.",
+                {c: b.count for c, b in self.recording.burst.buffers.items()})
+        # The session next: its loop pulls frames from the cameras, so
         # stopping it after the sources close would raise on the way out.
         self.session_stop()
         self._storage_stop.set()
@@ -844,5 +1000,6 @@ class Application:
             "network": net.describe(port, host),
             "session_running": self.session_running,
             "state_file": str(self.state.path) if self.state else None,
+            "recording": self.recording.status(),
             "cameras": [c.status() for c in self.cameras.values()],
         }

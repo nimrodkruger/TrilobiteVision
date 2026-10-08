@@ -218,3 +218,75 @@ def test_the_poll_recovers_when_the_rig_answers_again(browser, rig):
         page.wait_for_selector("#poll-dead", state="hidden", timeout=15000)
     finally:
         ctx.close()
+
+
+# -- the recording tab ------------------------------------------------------
+#
+# These exist because the Video tab's whole job is to put consequences in front
+# of a person before they press Start, and "the number is on screen" is not
+# something a Python test can check. The three below are the three claims the
+# page makes that would be worst to get wrong.
+
+
+def test_the_video_tab_renders_without_a_measurement(page):
+    tab(page, "Video")
+    assert page.locator("#rec-preflight").is_visible()
+    assert page.locator("#rec-plans").is_visible()
+    assert page.locator("#rec-live").is_visible()
+    # Until the target has been measured the page says so, in the badge rather
+    # than only in the text: a stale or absent measurement that looks like a
+    # fresh one is how a configuration gets chosen off the wrong number.
+    assert "NOT MEASURED" in page.locator("#rec-preflight").inner_text()
+
+
+def test_an_unmeasured_target_shows_unknown_loss_and_never_zero(page):
+    """The one answer this page must never give by omission."""
+    tab(page, "Video")
+    text = page.locator("#rec-plans").inner_text()
+    assert "unknown" in text
+    assert "0%" not in text
+
+
+def test_a_lossy_configuration_is_offered_with_its_consequence_attached(page):
+    tab(page, "Video")
+    rows = page.locator("#rec-plans").inner_text()
+    # Synthetic cameras advertise no 8-bit mode, so only the exact format is
+    # offered here -- which is itself the rule under test: a rung that was not
+    # established is not offered.
+    assert "raw16" in rows
+    assert "science" in rows
+
+
+def test_the_internal_storage_override_is_never_pre_ticked(page):
+    """The point of the override is that it is a deliberate act. A remembered
+    preference is the opposite of one."""
+    tab(page, "Video")
+    assert page.locator("#rec-internal").is_checked() is False
+
+
+def test_arming_a_burst_reports_the_duration_before_start(page):
+    tab(page, "Video")
+    page.locator("button[data-kind='burst']").click()
+    page.wait_for_timeout(300)
+    page.locator("#rec-arm").click()
+    page.wait_for_selector("#rec-arm-note:not(:empty)", timeout=20000)
+    note = page.locator("#rec-arm-note").inner_text()
+    assert "armed" in note and "frames per head" in note
+
+
+def test_an_unsaved_burst_says_in_words_that_ram_is_not_storage(page):
+    tab(page, "Video")
+    page.locator("button[data-kind='burst']").click()
+    page.wait_for_timeout(300)
+    page.locator("#rec-arm").click()
+    page.wait_for_selector("#rec-arm-note:not(:empty)", timeout=20000)
+    page.locator("#rec-start").click()
+    page.wait_for_timeout(1200)
+    page.locator("#rec-stop").click()
+    page.wait_for_timeout(1500)
+    live = page.locator("#rec-live").inner_text()
+    assert "NOT SAVED" in live
+    assert "lost on a process restart" in live
+    # And the way out of it is on screen, with Discard distinct from Save.
+    assert page.locator("#rec-save").is_visible()
+    assert page.locator("#rec-discard").is_visible()

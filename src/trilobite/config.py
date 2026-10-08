@@ -202,6 +202,66 @@ class StorageConfig(BaseModel):
     # no ISP, and trivially loadable in numpy on the desktop.
     still_format: Literal["npy", "png", "tiff"] = "npy"
 
+    # Free space that must survive every write, on the SELECTED (removable)
+    # target. A session that fills the disk it is writing to loses the tail of
+    # itself and gives no warning on the way, because the first sign is a
+    # failed write. 2 GB is about ten seconds of a full-rate pair recording,
+    # which is enough to stop cleanly and write a manifest.
+    reserve_mb: int = 2048
+
+    # The same thing for the INTERNAL disk, and deliberately much larger. The
+    # internal root on this rig is the SD card the operating system runs from:
+    # filling it is not a lost session but a Pi that will not boot, and the
+    # recovery is a reflash. Any fallback write -- and any deliberate
+    # internal-storage override -- is refused below this.
+    internal_reserve_mb: int = 8192
+
+    # -- recording (Stage 5) ---------------------------------------------
+
+    # Fraction of MemAvailable the burst buffer may claim, measured at arm
+    # time rather than taken from a constant: the right number on an 8 GB
+    # board is the wrong one on a 4 GB board, and `np.empty` succeeding proves
+    # nothing because Linux does not commit pages until they are touched.
+    # Half leaves room for the application, libcamera's own buffer pools, and
+    # the flush working set -- dirty page cache counts against available
+    # memory until writeback completes, so a large write shrinks free RAM
+    # while the buffer is still held.
+    burst_memory_fraction: float = 0.5
+
+    # Hard ceiling on the burst buffer regardless of what is available.
+    burst_max_mb: int = 4096
+
+    # Fraction of MemAvailable the continuous recorder's queues may claim, in
+    # total across all heads. Smaller than the burst fraction because the
+    # queue is only there to ride out a stall: no finite queue survives a
+    # sustained deficit, so making it bigger buys seconds and costs the
+    # headroom the writer needs.
+    queue_memory_fraction: float = 0.25
+
+    # Frames per chunk file, per head. 128 x 1.5 MiB is about 194 MiB, which
+    # is a comfortable file and keeps the file count for a five-minute
+    # recording in the dozens rather than the tens of thousands.
+    chunk_frames: int = 128
+
+    # The write unit inside a chunk, in frames. Large enough that the
+    # per-write overhead disappears, small enough that a stall is noticed
+    # before the queue drains. fsync happens at this boundary, never per
+    # frame: 60 fsyncs a second destroys sustained throughput and a completion
+    # journal gives the same guarantee more cheaply.
+    write_block_frames: int = 4
+
+    # Fraction of exposed frames a continuous recording may lose before it
+    # stops with an explicit incomplete result. Dropping is permitted and
+    # counted; past some point the honest answer is that this target cannot do
+    # this job, and continuing to shed frames produces a recording nobody will
+    # trust. Recorded in every manifest.
+    max_drop_fraction: float = 0.10
+
+    # Preview rate while a recording is running, in Hz. The browser cap
+    # competes for the same cores as the JPEG encode and the write path, and a
+    # preview frame is never worth a recorded frame.
+    recording_preview_fps: float = 2.0
+
 
 class ServerConfig(BaseModel):
     host: str = "0.0.0.0"
