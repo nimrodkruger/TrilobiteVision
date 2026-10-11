@@ -372,6 +372,27 @@ class CameraSource(ABC):
         """Apply driver-level controls (exposure, gain, ...). Optional."""
         log.debug("%s: set_controls ignored by %s", self.cam_id, type(self).__name__)
 
+    def request_frame_rate(self, fps: float | None) -> float | None:
+        """Ask the sensor to deliver at `fps`. `None` restores the configured rate.
+
+        Returns the rate that was requested, or **`None` to mean this backend
+        cannot change its rate**, which callers must treat as a refusal rather
+        than route around. That matters because the recording plan's whole
+        arithmetic -- bytes per second, predicted drops, how long the disk
+        lasts -- is computed from the requested rate. A rate that was asked for
+        and silently not applied produces a manifest that describes a recording
+        that did not happen.
+
+        It is the rate reduction rung of the ladder, and it is a reduction at
+        the SOURCE: fewer exposures, uniformly spaced, each with more time to
+        integrate. Decimating delivered frames instead would throw away
+        exposures that were already taken and leave gaps indistinguishable in
+        the index from frames the disk could not absorb.
+
+        Default: cannot. A backend that can says so by overriding.
+        """
+        return None
+
     @property
     def auto_exposure(self) -> bool:
         """Whether auto-exposure is currently on. Backends that have no AE

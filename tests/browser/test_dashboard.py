@@ -41,8 +41,12 @@ def test_only_the_tab_on_screen_streams(page):
     three tiles each is eight, at which point every button press queues behind
     them and never completes.
     """
+    # Video holds two: an operator frames the shot and judges exposure before
+    # pressing Start, and the first version of that tab showed numbers only,
+    # so the only way to see the scene was to leave it. Two is the same as
+    # Imaging and the cap is unchanged -- no tab holds more.
     for label, expected in [("Imaging", 2), ("Left", 1), ("System", 0),
-                            ("Video", 0), ("Calibration", 0)]:
+                            ("Video", 2), ("Calibration", 0)]:
         tab(page, label)
         assert page.locator("img.view").count() == expected, label
 
@@ -230,31 +234,65 @@ def test_the_poll_recovers_when_the_rig_answers_again(browser, rig):
 
 def test_the_video_tab_renders_without_a_measurement(page):
     tab(page, "Video")
-    assert page.locator("#rec-preflight").is_visible()
-    assert page.locator("#rec-plans").is_visible()
+    assert page.locator("#rec-actions").is_visible()
     assert page.locator("#rec-live").is_visible()
-    # Until the target has been measured the page says so, in the badge rather
-    # than only in the text: a stale or absent measurement that looks like a
-    # fresh one is how a configuration gets chosen off the wrong number.
-    assert "NOT MEASURED" in page.locator("#rec-preflight").inner_text()
+    assert page.locator("#rec-preflight").is_visible()
+    # Until the target has been measured the page says so, on the ACTION row
+    # rather than only in the Target panel: the warning has to be where the
+    # controls it affects are, not behind a heading somebody has to expand.
+    assert "UNMEASURED" in page.locator("#rec-actions").inner_text()
 
 
 def test_an_unmeasured_target_shows_unknown_loss_and_never_zero(page):
     """The one answer this page must never give by omission."""
     tab(page, "Video")
-    text = page.locator("#rec-plans").inner_text()
+    # Lower-cased: the badge is styled with uppercase, which is a CSS choice
+    # and not something a test should depend on either way.
+    text = page.locator("#rec-actions").inner_text().lower()
     assert "unknown" in text
     assert "0%" not in text
 
 
 def test_a_lossy_configuration_is_offered_with_its_consequence_attached(page):
+    """A lossy rung is offered, and never without what it costs beside it."""
     tab(page, "Video")
-    rows = page.locator("#rec-plans").inner_text()
-    # Synthetic cameras advertise no 8-bit mode, so only the exact format is
-    # offered here -- which is itself the rule under test: a rung that was not
-    # established is not offered.
-    assert "raw16" in rows
-    assert "science" in rows
+    depths = page.locator("#rec-format button")
+    labels = [b.inner_text() for b in depths.all()]
+    assert any("lossy" in t.lower() for t in labels), labels
+    # Choosing it changes the stated validity ceiling on the same row.
+    before = page.locator("#rec-consequence").inner_text().lower()
+    assert "science" in before
+    for b in depths.all():
+        if "lossy" in b.inner_text().lower():
+            b.click()
+            break
+    page.wait_for_timeout(300)
+    assert "diagnostic" in page.locator("#rec-consequence").inner_text().lower()
+
+
+def test_the_selected_format_and_rate_are_shown_as_selected(page):
+    """Conventional selection styling, the same `on` class the rest of the
+    dashboard uses -- not a second vocabulary for the same idea."""
+    tab(page, "Video")
+    assert page.locator("#rec-format button.on").count() == 1
+    assert page.locator("#rec-rate-pick button.on").count() == 1
+    assert page.locator("#rec-mode button.on").count() == 1
+
+    rates = page.locator("#rec-rate-pick button").all()
+    assert len(rates) > 1, "only one frame rate on offer"
+    target = next(b for b in rates if "on" not in (b.get_attribute("class") or ""))
+    label = target.inner_text()
+    target.click()
+    page.wait_for_timeout(300)
+    assert page.locator("#rec-rate-pick button.on").count() == 1
+    assert page.locator("#rec-rate-pick button.on").inner_text() == label
+
+
+def test_the_video_tab_shows_the_live_image_before_anything_is_armed(page):
+    tab(page, "Video")
+    assert page.locator(".panes img.view").count() == 2
+    for img in page.locator(".panes img.view").all():
+        assert "/stream/" in (img.get_attribute("src") or "")
 
 
 def test_the_internal_storage_override_is_never_pre_ticked(page):
@@ -266,7 +304,7 @@ def test_the_internal_storage_override_is_never_pre_ticked(page):
 
 def test_arming_a_burst_reports_the_duration_before_start(page):
     tab(page, "Video")
-    page.locator("button[data-kind='burst']").click()
+    page.locator("#rec-mode button[data-kind='burst']").click()
     page.wait_for_timeout(300)
     page.locator("#rec-arm").click()
     page.wait_for_selector("#rec-arm-note:not(:empty)", timeout=20000)
@@ -276,7 +314,7 @@ def test_arming_a_burst_reports_the_duration_before_start(page):
 
 def test_an_unsaved_burst_says_in_words_that_ram_is_not_storage(page):
     tab(page, "Video")
-    page.locator("button[data-kind='burst']").click()
+    page.locator("#rec-mode button[data-kind='burst']").click()
     page.wait_for_timeout(300)
     page.locator("#rec-arm").click()
     page.wait_for_selector("#rec-arm-note:not(:empty)", timeout=20000)
@@ -290,3 +328,72 @@ def test_an_unsaved_burst_says_in_words_that_ram_is_not_storage(page):
     # And the way out of it is on screen, with Discard distinct from Save.
     assert page.locator("#rec-save").is_visible()
     assert page.locator("#rec-discard").is_visible()
+
+    # Then take it: an unsaved burst blocks arming anything else, deliberately,
+    # so a test that leaves one behind breaks whatever runs after it on this
+    # module-scoped rig. Clearing it here also exercises the way out.
+    # Two clicks: discarding frames that exist nowhere else is deliberate, and
+    # the first click only arms the button. It is not a native `confirm()` --
+    # that blocks the page and cannot be driven from here, which left the one
+    # destructive path in the UI untested.
+    page.locator("#rec-discard").click()
+    page.wait_for_timeout(300)
+    assert "click again" in page.locator("#rec-discard").inner_text().lower()
+    page.locator("#rec-discard").click()
+    page.wait_for_timeout(800)
+    page.locator("#rec-free").click()
+    page.wait_for_function(
+        """() => !(document.querySelector('#rec-live') || {})
+                   .innerText?.includes('NOT SAVED')""",
+        timeout=20000)
+
+
+def test_the_recording_indicator_lights_and_then_clears_by_itself(page):
+    """The requirement that costs something to get right.
+
+    An indicator wired to the Start and Stop buttons is correct for the one
+    path where the operator stops the recording, and wrong for every other
+    way a recording ends -- the duration limit here, and in the field also the
+    drop ceiling, a full disk and a pulled drive. None of those press Stop.
+
+    So this arms a two-second recording, starts it, watches the indicator
+    light, and then waits past the limit WITHOUT touching Stop. The indicator
+    must go out on its own.
+    """
+    tab(page, "Video")
+    page.locator("#rec-mode button[data-kind='continuous']").click()
+    page.wait_for_timeout(200)
+    page.fill("#rec-duration", "2")
+    # The browser rig's target is the internal disk, so the arm is refused
+    # without the override -- which is the storage protection doing its job.
+    # Ticking it here is also the only place the override is exercised against
+    # a continuous recording rather than a burst flush.
+    page.check("#rec-internal")
+    page.locator("#rec-arm").click()
+    page.wait_for_selector("#rec-arm-note:not(:empty)", timeout=20000)
+    assert "armed" in page.locator("#rec-arm-note").inner_text()
+
+    # Not lit by arming: armed is not recording, and a light that cannot tell
+    # the difference is worse than none.
+    assert page.locator("#rec-on-air.live").count() == 0
+
+    page.locator("#rec-start").click()
+    page.wait_for_selector("#rec-on-air.live", timeout=20000)
+    assert "REC" in page.locator("#rec-on-air").inner_text()
+    # The tab itself carries it too, so it is visible from another tab.
+    assert "live" in (page.locator("#mode-video").get_attribute("class") or "")
+
+    # Past the two seconds, with nothing pressed.
+    page.wait_for_selector("#rec-on-air.live", state="detached", timeout=25000)
+    assert page.locator("#rec-on-air").inner_text().strip() == ""
+    assert "live" not in (page.locator("#mode-video").get_attribute("class") or "")
+    assert "recording" not in (
+        page.locator("body").get_attribute("class") or "")
+    # The live panel has its own one-second refresh and the stop is finished
+    # on the rig's storage timer, so it trails the indicator slightly. The
+    # indicator going out first is the correct order -- it says "not
+    # capturing", which became true before the chunks were closed.
+    page.wait_for_function(
+        """() => (document.querySelector('#rec-live') || {}).innerText
+                 ?.includes('requested duration reached')""",
+        timeout=30000)

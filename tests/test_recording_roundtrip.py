@@ -72,8 +72,9 @@ def rig(tmp_path):
     app.stop()
 
 
-def _record(app, seconds: float = 1.5, **kw) -> dict:
-    app.recording.arm_continuous("raw16", 20.0, **kw)
+def _record(app, seconds: float = 1.5, key: str = "raw16",
+            fps: float = 20.0, **kw) -> dict:
+    app.recording.arm_continuous(key, fps, **kw)
     app.recording.start_continuous()
     time.sleep(seconds)
     return app.recording.stop_continuous()
@@ -369,3 +370,103 @@ def test_the_matlab_accounting_recomputes_the_same_losses(rig):
         assert claimed["frames_stored"] == stored
         assert claimed["frames_exposed"] == exposed
         assert claimed["frames_dropped"] == dropped
+
+
+# -- every offered configuration, end to end --------------------------------
+#
+# The operator is going to try each option on the list, so each option on the
+# list has to survive being recorded and read back. These run the real capture
+# loop at each offered format and a reduced rate, then open the result with the
+# desktop reader and check the stored samples mean what the journal says.
+
+
+def _offered(app):
+    opts = app.recording.options()
+    return [(p["format"], p["fps"]) for p in opts["plans"]]
+
+
+def test_every_offered_configuration_is_one_the_rig_can_actually_record(rig):
+    """A configuration that appears on the list and cannot be delivered is
+    worse than one that is absent, because it gets chosen."""
+    for key, fps in _offered(rig):
+        out = _record(rig, 0.6, key=key, fps=fps)
+        try:
+            assert out["every_frame_accounted"] is True, (key, fps)
+            assert out["totals"]["frames_stored"] > 0, (key, fps)
+            assert out["rate"]["requested_fps"] == pytest.approx(fps)
+        finally:
+            pass
+
+
+def test_a_reduced_rate_actually_slows_the_sensor(rig):
+    """The whole point of the rate rung. Measured from the frames that arrived,
+    not from the plan -- a plan is what was asked for."""
+    fast = _record(rig, 2.0, key="raw16", fps=20.0)
+    slow = _record(rig, 2.0, key="raw16", fps=5.0)
+    fast_n = fast["heads"]["left"]["frames_exposed"]
+    slow_n = slow["heads"]["left"]["frames_exposed"]
+    # 20 vs 5 fps over the same wall time. Generous bounds: the loop also
+    # starts and stops inside that window.
+    assert slow_n < fast_n / 2, (fast_n, slow_n)
+    assert slow["rate"]["applied"] is True
+    assert slow["rate"]["per_head"] == {"left": 5.0, "right": 5.0}
+
+
+def test_an_eight_bit_recording_reads_back_as_diagnostic_at_the_right_scale(
+    rig, reader
+):
+    out = _record(rig, 1.0, key="raw8", fps=20.0)
+    rec = reader.open_recording(Path(out["directory"]))
+
+    assert rec.plan["validity_ceiling"] == "diagnostic"
+    assert rec.plan["exact"] is False
+    stored = out["stored_samples"]
+    assert stored["stored_dtype"] == "uint8"
+    assert stored["scale_to_counts"] == 2 ** stored["shift"]
+
+    for cam_id in ("left", "right"):
+        chunk = rec.heads[cam_id][0]["npy"]
+        assert np.load(chunk, mmap_mode="r").dtype == np.uint8
+        _meta, pixels = next(iter(rec.frames(cam_id)))
+        assert pixels.dtype == np.uint8
+        assert pixels.shape == (96, 128)
+
+    acc = rec.accounting()
+    assert acc["unaccounted"] == 0
+
+
+def test_the_matlab_arithmetic_holds_for_eight_bit_chunks_too(rig):
+    """uint8 chunks have a different frame stride and a one-byte dtype, which
+    is the part of the .m reader most likely to be wrong for them."""
+    out = _record(rig, 0.8, key="raw8", fps=20.0)
+    directory = Path(out["directory"])
+    for cam_id in ("left", "right"):
+        for ipath in sorted((directory / cam_id).glob("*.index.json")):
+            index = json.loads(ipath.read_text(encoding="utf-8"))
+            npy = directory / cam_id / index["file"]
+            whole = np.load(npy, mmap_mode="r")
+            assert whole.dtype == np.uint8
+            assert index["frame_bytes"] == whole.shape[1] * whole.shape[2]
+            for row in range(1, len(index["frames"]) + 1):
+                got = _matlab_style_frame(npy, row)
+                assert np.array_equal(got, np.asarray(whole[row - 1]))
+
+
+# The exact shift is asserted deterministically in
+# `tests/test_recording.py` -- a known sample of 300 counts must store as 75
+# and not as 44 -- because the synthetic scene spans the full tone range, so a
+# wrapped frame and a shifted one have similar statistics and no end-to-end
+# assertion on this backend's own pixels would tell them apart. What the round
+# trip adds is everything around the shift: the stored dtype, the frame
+# stride, the journal's scale factor and both readers.
+
+
+def test_a_full_depth_recording_from_this_backend_is_ten_bit(rig):
+    """And the counterpart: raw16 keeps the scaled samples, so the two
+    configurations differ by exactly the shift the journal reports."""
+    out = _record(rig, 0.8, key="raw16", fps=20.0)
+    chunk = next(Path(out["directory"]).joinpath("left").glob("*.npy"))
+    arr = np.load(chunk)
+    assert arr.dtype == np.uint16
+    assert arr[0].max() > 600          # 255 << 2 = 1020, scaled tone
+    assert out["stored_samples"]["scale_to_counts"] == 1

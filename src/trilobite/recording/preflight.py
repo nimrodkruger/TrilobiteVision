@@ -112,7 +112,9 @@ def available_format_keys(camera_caps: dict[str, Any]) -> set[str]:
     """
     keys = {RAW16.key}
     caps = [c for c in camera_caps.values() if isinstance(c, dict)]
-    if caps and all(c.get("eight_bit_available") for c in caps):
+    # EVERY head must be able to supply the rung. One plan covers both, so a
+    # format one head cannot deliver is not a format this rig can record.
+    if caps and all(c.get("reducible_to_eight") for c in caps):
         keys.add(RAW8.key)
     if caps and all(c.get("packed_available") for c in caps):
         keys.add("raw10p")

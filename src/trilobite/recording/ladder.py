@@ -45,6 +45,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
+
 from ..types import DIAGNOSTIC, SCIENCE
 
 # Mechanism identifiers, used in manifests and in the UI.
@@ -69,12 +71,21 @@ class RecordingFormat:
     """
 
     key: str
-    raw_format: str | None        # what to ask libcamera for; None = whatever is configured
     bytes_per_pixel: float
     exact: bool
     validity: str
     label: str
     note: str
+    # How the stored samples are produced from what the camera delivers.
+    # `"as-delivered"` stores the uint16 frame unchanged. `"shift-to-8"` takes
+    # the top 8 bits of each sample, by a shift derived from that frame's own
+    # recorded alignment -- never a blind cast, which wraps modulo 256 and
+    # turns a bright frame into noise.
+    reduction: str = "as-delivered"
+    # False for a rung that is described here but **not wired up end to end**.
+    # It is not offered to the operator, because a configuration that cannot
+    # be delivered is worse than one that is absent: it gets chosen.
+    offered: bool = True
 
     @property
     def lossy(self) -> bool:
@@ -84,36 +95,67 @@ class RecordingFormat:
 # uint16 is the default and the only one that needs no capability check: every
 # uncompressed mono format picamera2 can decode arrives as uint16 already.
 RAW16 = RecordingFormat(
-    key="raw16", raw_format=None, bytes_per_pixel=2.0, exact=True,
-    validity=SCIENCE, label="10-bit in a 16-bit word",
-    note="Exact. What a still capture already stores, so the readers need no "
-         "change. Costs 2 bytes per pixel for 10 bits of information, which is "
-         "the whole of the bandwidth problem.",
-)
-
-# Packed 10-bit. 4 pixels in 5 bytes, as the MIPI RAW10 layout. Offered ONLY
-# when the pre-flight found that libcamera will deliver it for this sensor:
-# packing in software would cost a full-rate pass per frame to save bandwidth
-# this rig may not need to save.
-RAW10P = RecordingFormat(
-    key="raw10p", raw_format="R10_CSI2P", bytes_per_pixel=1.25, exact=True,
-    validity=SCIENCE, label="packed 10-bit",
-    note="Exact, and 0.625x the bytes. Free if the ISP delivers it; not worth "
-         "doing in software. Readers must unpack, which is why it is not the "
-         "default.",
+    key="raw16", bytes_per_pixel=2.0, exact=True,
+    validity=SCIENCE, label="full depth",
+    note="Exact. The frame as the camera delivered it, which is what a still "
+         "already stores, so both readers need no special case. Two bytes per "
+         "pixel for ten bits of information -- the whole bandwidth problem.",
+    reduction="as-delivered",
 )
 
 RAW8 = RecordingFormat(
-    key="raw8", raw_format="R8", bytes_per_pixel=1.0, exact=False,
+    key="raw8", bytes_per_pixel=1.0, exact=False,
     validity=DIAGNOSTIC, label="8-bit",
-    note="LOSSY: the low 2 bits of every pixel are gone, so this can never be "
-         "better than diagnostic however good the sensor data was. Half the "
-         "bytes. Produced by the ISP, so it costs no CPU -- never truncate "
-         "uint16 in software to get here.",
+    note="Half the bytes, and LOSSY: the low bits of every sample are gone, "
+         "so this is diagnostic however clean the data was. The top 8 bits "
+         "are taken by a shift derived from the frame's own recorded "
+         "alignment; multiply by the journal's scale_to_counts to get back to "
+         "approximate sensor counts.",
+    reduction="shift-to-8",
 )
 
-FORMATS = (RAW16, RAW10P, RAW8)
+# Packed 10-bit: 4 pixels in 5 bytes, the MIPI RAW10 layout. Described because
+# it is the one rung that would buy bandwidth with no loss at all -- and NOT
+# OFFERED, because nothing asks the ISP for it and neither reader unpacks it.
+# Three things have to be true before `offered=True` here: the pre-flight shows
+# libcamera delivers a packed mode for this sensor, the recorder requests that
+# format rather than converting, and `read_capture.py` plus the MATLAB readers
+# unpack it. Until then it would be an option that silently cannot be served.
+RAW10P = RecordingFormat(
+    key="raw10p", bytes_per_pixel=1.25, exact=True,
+    validity=SCIENCE, label="packed 10-bit",
+    note="Exact, 0.625x the bytes. NOT AVAILABLE: no ISP request and no "
+         "unpacking in the readers yet.",
+    reduction="packed-10",
+    offered=False,
+)
+
+FORMATS = (RAW16, RAW8, RAW10P)
+OFFERED = tuple(f for f in FORMATS if f.offered)
 BY_KEY = {f.key: f for f in FORMATS}
+
+# The frame rates offered, highest first, filtered to what the sensor can
+# actually deliver. A conventional ladder rather than halves of whatever the
+# sensor happens to be configured for: an operator picking a rate wants 10 fps,
+# not 7.5, and the frame duration is set in microseconds so there is no divisor
+# to respect. Each is only offered when it is at or below the configured sensor
+# rate AND the backend can actually apply it -- see
+# `CameraSource.request_frame_rate`.
+RATE_LADDER = (120.0, 90.0, 60.0, 50.0, 30.0, 25.0, 20.0, 15.0,
+               10.0, 5.0, 2.0, 1.0)
+
+
+def rates_for(sensor_fps: float) -> tuple[float, ...]:
+    """The rate ladder, capped at the sensor rate, with that rate included.
+
+    The sensor's own rate is always first even when it is not on the ladder --
+    it is the only one that needs no rate request at all, so it must never be
+    missing from the list.
+    """
+    cap = float(sensor_fps)
+    rates = [cap]
+    rates.extend(r for r in RATE_LADDER if r < cap * 0.99 and r >= 1.0)
+    return tuple(rates)
 
 
 @dataclass(frozen=True)
@@ -155,6 +197,10 @@ class Plan:
     @property
     def pixels(self) -> int:
         return int(self.width) * int(self.height)
+
+    @property
+    def store_dtype(self) -> str:
+        return "uint8" if self.fmt.bytes_per_pixel <= 1.0 else "uint16"
 
     @property
     def bytes_per_frame(self) -> int:
@@ -282,15 +328,11 @@ def enumerate_plans(
     reduction that stays on a clean divisor of the sensor clock.
     """
     keys = {RAW16.key} if available_formats is None else set(available_formats)
-    candidates = [f for f in FORMATS if f.key in keys] or [RAW16]
-
-    if rates:
-        rate_list = tuple(rates)
-    else:
-        rate_list = tuple(
-            r for r in (sensor_fps, sensor_fps / 2, sensor_fps / 4)
-            if r >= 1.0
-        )
+    # `offered` is applied here as well as at the capability stage, so a rung
+    # that is not wired up cannot reach the operator even if something upstream
+    # claims it is available.
+    candidates = [f for f in OFFERED if f.key in keys] or [RAW16]
+    rate_list = tuple(rates) if rates else rates_for(sensor_fps)
 
     out: list[dict[str, Any]] = []
     for fmt in candidates:
@@ -317,7 +359,10 @@ def _mechanisms(fmt: RecordingFormat, fps: float, sensor_fps: float) -> list[dic
             "effect": f"{fps:.0f} fps instead of {sensor_fps:.0f}: exact, "
                       f"uniformly sampled, and a longer exposure per frame",
         })
-    if fmt.key == RAW10P:
+    # `RAW10P` and not `RAW10P.key` here until 10 October, so this branch was
+    # comparing a string to a dataclass and was dead. It never showed, because
+    # the rung is not offered either -- two faults hiding one another.
+    if fmt.key == RAW10P.key:
         used.append({
             "mechanism": PACKED, "when": CONFIGURATION,
             "effect": "0.625x the bytes, exact; the readers unpack",
@@ -333,3 +378,56 @@ def _mechanisms(fmt: RecordingFormat, fps: float, sensor_fps: float) -> list[dic
                   "counted, and recorded as explicit gaps",
     })
     return used
+
+
+def shift_to_eight(meta: dict[str, Any] | None) -> int:
+    """How far to shift a delivered sample right to keep its top 8 bits.
+
+    Derived from the frame's **own** recorded alignment rather than assumed,
+    because the two alignments differ by 64x per pixel on a 10-bit sensor and
+    the wrong one is not a subtle error:
+
+        lsb-aligned 10-bit in uint16   value in bits 0..9    shift 2
+        msb-aligned 10-bit in uint16   value in bits 6..15   shift 8
+
+    `shift = (bits - 8) + sample_shift`, where `bits` is the sample depth and
+    `sample_shift` is how far the sample was left-shifted in its container.
+    Both come from `rawformat`'s admission metadata, which is the only place
+    either is established.
+
+    A missing or nonsensical value returns 0 rather than a guess: storing the
+    low 8 bits is wrong, but it is visibly wrong -- a noise field -- where a
+    guessed shift produces a plausible picture at the wrong scale. The caller
+    records the shift it used in the journal either way.
+    """
+    meta = meta or {}
+    bits = meta.get("raw_bits_nominal")
+    shift = meta.get("raw_sample_shift", 0)
+    try:
+        bits = int(bits)
+        shift = int(shift)
+    except (TypeError, ValueError):
+        return 0
+    if bits <= 8:
+        return 0
+    return max(0, (bits - 8) + shift)
+
+
+def reduce_to_store(pixels: Any, dtype: Any, shift: int) -> Any:
+    """Convert one delivered frame to what the plan says to store.
+
+    For `uint16` storage this is the frame itself -- no copy, no conversion.
+    For `uint8` it is `(pixels >> shift)`, which **is** the lossy step, and it
+    is a shift and not a cast: `np.copyto(uint8_buffer, uint16_frame,
+    casting="unsafe")` keeps the LOW byte, so a sample of 300 counts arrives as
+    44 and a bright frame arrives as noise. That was the behaviour here until
+    10 October and it is the same failure mode as the white-noise incident in
+    Stage 2 -- a conversion that produces an array of the right shape and the
+    wrong meaning.
+    """
+    want = np.dtype(dtype)
+    if want.itemsize >= pixels.dtype.itemsize and want.kind == pixels.dtype.kind:
+        return pixels
+    if shift > 0:
+        return (pixels >> shift).astype(want, copy=False)
+    return pixels.astype(want, copy=False)

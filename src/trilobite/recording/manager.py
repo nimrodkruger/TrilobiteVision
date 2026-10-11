@@ -24,6 +24,7 @@ from ..config import StorageConfig
 from ..storage.writer import SessionWriter
 from . import burst as burst_mod
 from . import continuous as cont_mod
+from . import ladder
 from . import preflight as preflight_mod
 from .buffer import FrameMeta
 from .ladder import Plan, enumerate_plans
@@ -89,6 +90,16 @@ class RecordingManager:
         self.active: str | None = None
         self.last_error: str | None = None
         # The start barrier. See `_begin`.
+        # Storage reduction, locked to the first frame of each recording.
+        self._store_dtype: str | None = None
+        self._store_shift: int | None = None
+        self._store_shift_meta: dict[str, Any] = {}
+        # Set by the Application: (cam_id, fps|None) -> achieved fps or None.
+        # None from the setter means "this backend cannot change its rate",
+        # which is a refusal rather than something to work around.
+        self.rate_setter: Any = None
+        self._rate_applied: dict[str, Any] = {}
+
         self._entered: set[str] = set()
         self._loops: set[str] = set()
         self._entered_cv = threading.Condition()
@@ -214,17 +225,80 @@ class RecordingManager:
         made every recording end with one phantom drop.
         """
         meta = meta_from_frame(frame)
+        store = self._reduce(pixels, frame)
         kept: bool | None = None
         if self.burst.wants(cam_id):
-            kept = self.burst.offer(cam_id, pixels, meta)
+            kept = self.burst.offer(cam_id, store, meta)
         elif self.continuous.wants(cam_id):
-            kept = self.continuous.offer(cam_id, pixels, meta)
+            kept = self.continuous.offer(cam_id, store, meta)
         if kept is not None and self._awaiting_entry:
             # This head's capture loop has reached the recording branch, so it
             # can no longer release a frame to the preview cap. One plain bool
             # read per frame once the barrier is satisfied; see `_begin`.
             self._note_entry(cam_id)
         return kept
+
+    def _reduce(self, pixels: np.ndarray, frame: Any) -> np.ndarray:
+        """Apply the plan's storage reduction, on the capture thread.
+
+        Centralised here rather than in each recorder so there is **one** place
+        where delivered pixels become stored pixels, and one place where the
+        shift that did it is established.
+
+        The shift is locked to the first frame of the recording and every later
+        frame is checked against it. A recording whose frames do not all mean
+        the same thing is the failure this stage is written to exclude, and a
+        per-frame shift would be exactly that -- so a frame whose alignment
+        disagrees fails the recording rather than being quietly re-scaled.
+        """
+        if self._store_dtype is None:
+            return pixels
+        if self._store_shift is None:
+            self._store_shift = ladder.shift_to_eight(frame.meta)
+            self._store_shift_meta = {
+                "bits": (frame.meta or {}).get("raw_bits_nominal"),
+                "sample_shift": (frame.meta or {}).get("raw_sample_shift"),
+                "alignment": (frame.meta or {}).get("raw_alignment"),
+            }
+        else:
+            now = ladder.shift_to_eight(frame.meta)
+            if now != self._store_shift:
+                raise RuntimeError(
+                    f"{getattr(frame, 'cam_id', '?')}: this frame's sample "
+                    f"alignment implies a "
+                    f"shift of {now} and the recording has been storing with "
+                    f"{self._store_shift}. The stored values would stop "
+                    f"meaning the same thing part way through the file.")
+        return ladder.reduce_to_store(pixels, self._store_dtype,
+                                      self._store_shift)
+
+    def _arm_reduction(self, plan: Plan) -> None:
+        self._store_shift = None
+        self._store_shift_meta = {}
+        self._store_dtype = (plan.store_dtype
+                             if plan.fmt.reduction == "shift-to-8" else None)
+
+    def reduction_report(self) -> dict[str, Any]:
+        """What the stored samples are, for the journal and both readers.
+
+        `scale_to_counts` is the multiplier that takes a stored value back
+        towards sensor counts. It is the only way a reader can relate an 8-bit
+        recording to a 16-bit one from the same sensor, and it is approximate
+        by construction -- the discarded bits are gone.
+        """
+        if self._store_dtype is None:
+            return {"stored_dtype": "uint16", "reduction": "as-delivered",
+                    "shift": 0, "scale_to_counts": 1}
+        shift = self._store_shift
+        return {
+            "stored_dtype": self._store_dtype,
+            "reduction": "shift-to-8",
+            "shift": shift,
+            "scale_to_counts": (None if shift is None else 2 ** shift),
+            "derived_from": dict(self._store_shift_meta),
+            "note": ("the top 8 bits of each sample; multiply by "
+                     "scale_to_counts for approximate sensor counts"),
+        }
 
     # -- the start barrier -----------------------------------------------
 
@@ -397,6 +471,100 @@ class RecordingManager:
                          for c, g in self.geometry.items()},
             oriented=self.oriented)
 
+    # -- the rate rung ---------------------------------------------------
+
+    def _apply_rate(self, plan: Plan) -> dict[str, Any]:
+        """Ask every head for the plan's frame rate, or refuse the plan.
+
+        This is the rung the plan document puts first, and until 10 October it
+        was **not implemented at all**: `Plan.fps` was used for arithmetic, for
+        the predicted drop fraction and for the directory name, and nothing
+        ever asked a sensor for it. Choosing 15 fps on a 30 fps sensor produced
+        a recording at 30 fps whose manifest said 15, whose predicted
+        bandwidth was half the real one, and whose `frames_per_head` was wrong
+        by a factor of two. A plan that is not applied is worse than a plan
+        that is refused.
+
+        So: at the sensor's own rate, nothing is requested, because nothing
+        needs to be. Below it, every head must accept the rate. A head that
+        cannot -- a backend with no rate control, a driver without
+        `FrameDurationLimits`, a stopped camera -- fails the arm, naming
+        itself.
+        """
+        _w, _h, sensor_fps = self.common_geometry()
+        heads = self.heads()
+        if plan.fps >= sensor_fps * 0.99:
+            self._rate_applied = {
+                "requested_fps": plan.fps, "sensor_fps": sensor_fps,
+                "applied": False,
+                "reason": "the plan runs at the sensor's configured rate",
+            }
+            return dict(self._rate_applied)
+
+        if self.rate_setter is None:
+            raise RuntimeError(
+                f"{plan.fps:.3g} fps was asked for and the sensor runs at "
+                f"{sensor_fps:.3g}, but this application has no way to change "
+                f"a sensor's rate. Record at {sensor_fps:.3g} fps instead.")
+
+        applied: dict[str, Any] = {}
+        failed: list[str] = []
+        for cam_id in heads:
+            try:
+                got = self.rate_setter(cam_id, plan.fps)
+            except Exception as exc:                          # noqa: BLE001
+                failed.append(f"{cam_id} ({type(exc).__name__}: {exc})")
+                continue
+            if got is None:
+                failed.append(f"{cam_id} (cannot change its frame rate)")
+            else:
+                applied[cam_id] = float(got)
+
+        if failed:
+            # Put back whatever was accepted before the failure, so a refused
+            # arm leaves the rig at the rate it was found at. Recorded first,
+            # because `_restore_rate` restores what it is told was applied --
+            # and on this path that is the heads that said yes before the one
+            # that said no, not the plan.
+            self._rate_applied = {"applied": True, "per_head": applied}
+            self._restore_rate()
+            raise RuntimeError(
+                f"{plan.fps:.3g} fps could not be set on: "
+                f"{'; '.join(failed)}. Refused rather than recording at "
+                f"{sensor_fps:.3g} fps under a manifest that says "
+                f"{plan.fps:.3g}.")
+
+        self._rate_applied = {
+            "requested_fps": plan.fps, "sensor_fps": sensor_fps,
+            "applied": True, "per_head": applied,
+            # What was asked of the driver. What the sensor actually delivered
+            # is measured during the recording and reported separately, since a
+            # frame duration the driver accepts is not a cadence it guarantees.
+            "note": "requested frame duration; achieved rate is measured",
+        }
+        return dict(self._rate_applied)
+
+    def _restore_rate(self) -> None:
+        """Put every head back on its configured rate. Never raises.
+
+        Called on every path out of a recording, including the failures: a rig
+        left at 2 fps after an aborted arm looks like a dead camera, and the
+        operator has no control that obviously undoes it.
+        """
+        if self.rate_setter is None or not self._rate_applied.get("applied"):
+            self._rate_applied = {}
+            return
+        for cam_id in tuple(self._rate_applied.get("per_head") or ()):
+            try:
+                self.rate_setter(cam_id, None)
+            except Exception:                                 # noqa: BLE001
+                log.exception("%s: could not restore the configured frame rate",
+                              cam_id)
+        self._rate_applied = {}
+
+    def rate_report(self) -> dict[str, Any]:
+        return dict(self._rate_applied)
+
     # -- burst -----------------------------------------------------------
 
     def arm_burst(self, key: str, fps: float,
@@ -405,8 +573,15 @@ class RecordingManager:
         with self._lock:
             self._require_free(BURST)
             plan = self.plan(key, fps, duration_s)
-            out = self.burst.arm(plan, frames=frames)
+            self._apply_rate(plan)
+            try:
+                self._arm_reduction(plan)
+                out = self.burst.arm(plan, frames=frames)
+            except BaseException:
+                self._restore_rate()
+                raise
             self.active = BURST
+            out["rate"] = self.rate_report()
             return out
 
     def start_burst(self, wait_s: float = START_WAIT_S) -> dict[str, Any]:
@@ -423,7 +598,9 @@ class RecordingManager:
 
     def save_burst(self, internal_ok: bool = False,
                    label: str | None = None) -> dict[str, Any]:
-        out = self.burst.flush(internal_ok=internal_ok, label=label)
+        out = self.burst.flush(internal_ok=internal_ok, label=label,
+                               rate=self.rate_report(),
+                               reduction=self.reduction_report())
         return out
 
     def discard_burst(self) -> dict[str, Any]:
@@ -434,6 +611,8 @@ class RecordingManager:
         with self._lock:
             if self.active == BURST:
                 self.active = None
+        # The buffers are gone, so the rate the burst asked for has no owner.
+        self._restore_rate()
         return out
 
     # -- continuous ------------------------------------------------------
@@ -453,10 +632,17 @@ class RecordingManager:
         with self._lock:
             self._require_free(CONTINUOUS)
             plan = self.plan(key, fps, duration_s)
-            out = self.continuous.arm(
-                plan, slots=slots, internal_ok=internal_ok,
-                max_drop_fraction=max_drop_fraction)
+            self._apply_rate(plan)
+            try:
+                self._arm_reduction(plan)
+                out = self.continuous.arm(
+                    plan, slots=slots, internal_ok=internal_ok,
+                    max_drop_fraction=max_drop_fraction)
+            except BaseException:
+                self._restore_rate()
+                raise
             self.active = CONTINUOUS
+            out["rate"] = self.rate_report()
             return out
 
     def start_continuous(self, wait_s: float = START_WAIT_S) -> dict[str, Any]:
@@ -479,9 +665,11 @@ class RecordingManager:
         return out
 
     def stop_continuous(self) -> dict[str, Any]:
-        out = self.continuous.stop()
+        out = self.continuous.stop(
+            rate=self.rate_report(), reduction=self.reduction_report())
         with self._lock:
             self.active = None
+        self._restore_rate()
         return out
 
     # -- state -----------------------------------------------------------

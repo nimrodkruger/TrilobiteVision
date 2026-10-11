@@ -99,18 +99,18 @@ def test_a_format_that_was_not_established_is_not_offered():
                            available_formats=None)
     assert {r["format"] for r in rows} == {"raw16"}
 
-    caps_no_8bit = {"left": {"eight_bit_available": False,
+    caps_no_8bit = {"left": {"reducible_to_eight": False,
                              "packed_available": False}}
     assert available_format_keys(caps_no_8bit) == {"raw16"}
-    caps_8bit = {"left": {"eight_bit_available": True,
+    caps_8bit = {"left": {"reducible_to_eight": True,
                           "packed_available": False}}
     assert available_format_keys(caps_8bit) == {"raw16", "raw8"}
 
 
 def test_eight_bit_is_offered_only_when_every_head_has_it():
     """A plan spans the heads, so a rung one head cannot supply is not a rung."""
-    mixed = {"left": {"eight_bit_available": True, "packed_available": False},
-             "right": {"eight_bit_available": False, "packed_available": False}}
+    mixed = {"left": {"reducible_to_eight": True, "packed_available": False},
+             "right": {"reducible_to_eight": False, "packed_available": False}}
     assert available_format_keys(mixed) == {"raw16"}
 
 
@@ -626,7 +626,7 @@ def test_a_recording_holds_its_admission_until_it_stops(cont, writer):
 @pytest.fixture
 def manager(writer):
     m = RecordingManager(writer.cfg, writer)
-    caps = {"eight_bit_available": True, "packed_available": False,
+    caps = {"reducible_to_eight": True, "packed_available": False,
             "measured": True}
     m.register("left", caps, W, H, 30.0)
     m.register("right", dict(caps), W, H, 30.0)
@@ -650,7 +650,7 @@ def test_the_manager_refuses_to_arm_over_an_unsaved_burst(manager):
 
 
 def test_heads_of_different_sizes_cannot_share_one_plan(manager):
-    manager.register("right", {"eight_bit_available": True,
+    manager.register("right", {"reducible_to_eight": True,
                                "packed_available": False}, W + 8, H, 30.0)
     with pytest.raises(RuntimeError, match="different sensor frames"):
         manager.common_geometry()
@@ -965,3 +965,210 @@ def test_the_manager_passes_the_suppression_on_to_the_capture_loop(manager):
     finally:
         manager.stop_continuous()
     assert manager.wants_preview("left") is True
+
+
+# -- the rate rung, which must actually reach the sensor --------------------
+
+
+class _FakeRuntime:
+    """Stands in for a CameraRuntime's rate control."""
+
+    def __init__(self, sensor_fps=30.0, capable=True, raises=None):
+        self.sensor_fps = sensor_fps
+        self.capable = capable
+        self.raises = raises
+        self.calls: list[tuple[str, float | None]] = []
+
+    def __call__(self, cam_id, fps):
+        self.calls.append((cam_id, fps))
+        if self.raises:
+            raise self.raises
+        if not self.capable:
+            return None
+        return self.sensor_fps if fps is None else float(fps)
+
+
+def test_a_reduced_rate_is_requested_from_every_head(manager):
+    setter = _FakeRuntime()
+    manager.rate_setter = setter
+    out = manager.arm_continuous("raw16", 15.0)
+    try:
+        assert out["rate"]["applied"] is True
+        assert out["rate"]["per_head"] == {"left": 15.0, "right": 15.0}
+        assert sorted(setter.calls) == [("left", 15.0), ("right", 15.0)]
+    finally:
+        manager.stop_continuous()
+    # ...and put back when the recording ends, or the rig is left slow with no
+    # obvious control that undoes it.
+    assert ("left", None) in setter.calls
+    assert ("right", None) in setter.calls
+
+
+def test_the_sensor_rate_needs_no_request(manager):
+    setter = _FakeRuntime()
+    manager.rate_setter = setter
+    out = manager.arm_continuous("raw16", 30.0)
+    try:
+        assert out["rate"]["applied"] is False
+        assert setter.calls == []
+    finally:
+        manager.stop_continuous()
+
+
+def test_a_rate_that_cannot_be_applied_refuses_the_arm(manager):
+    """The failure this rung exists to prevent is a manifest that says 15 fps
+    over a file recorded at 30. Refused, not recorded."""
+    manager.rate_setter = _FakeRuntime(capable=False)
+    with pytest.raises(RuntimeError, match="could not be set on"):
+        manager.arm_continuous("raw16", 15.0)
+    assert manager.active is None
+    assert manager.continuous.state in ("idle", "complete", "incomplete")
+
+
+def test_a_rate_refusal_restores_the_heads_it_had_already_set(manager):
+    """One head accepts, the second does not. The first must not be left slow."""
+    class Half(_FakeRuntime):
+        def __call__(self, cam_id, fps):
+            self.calls.append((cam_id, fps))
+            if cam_id == "right" and fps is not None:
+                return None
+            return self.sensor_fps if fps is None else float(fps)
+
+    setter = Half()
+    manager.rate_setter = setter
+    with pytest.raises(RuntimeError, match="right"):
+        manager.arm_continuous("raw16", 10.0)
+    assert ("left", None) in setter.calls
+
+
+def test_a_rate_request_that_raises_names_the_head(manager):
+    manager.rate_setter = _FakeRuntime(raises=ValueError("1 fps is 1000000 us"))
+    with pytest.raises(RuntimeError, match=r"left \(ValueError"):
+        manager.arm_continuous("raw16", 1.0)
+
+
+def test_without_a_rate_setter_a_reduced_rate_is_refused(manager):
+    manager.rate_setter = None
+    with pytest.raises(RuntimeError, match="no way to change"):
+        manager.arm_continuous("raw16", 15.0)
+
+
+def test_a_burst_restores_the_rate_when_its_memory_is_released(manager):
+    setter = _FakeRuntime()
+    manager.rate_setter = setter
+    manager.arm_burst("raw16", 10.0, frames=4)
+    manager.release_burst()
+    assert ("left", None) in setter.calls
+
+
+# -- 8-bit storage: a shift, never a cast ----------------------------------
+
+
+def test_eight_bit_storage_keeps_the_top_bits(manager):
+    """`np.copyto(uint8, uint16, casting="unsafe")` keeps the LOW byte, so 300
+    counts arrive as 44 and a bright frame arrives as noise. The reduction has
+    to be a shift derived from the frame's own alignment."""
+    manager.rate_setter = _FakeRuntime()
+    manager.arm_continuous("raw8", 30.0)
+    manager.start_continuous(wait_s=0.0)
+    head = manager.continuous.heads["left"]
+    assert head.ring.store.dtype == np.uint8
+
+    frame = _frame(1)
+    frame.data = np.full((H, W), 300, dtype=np.uint16)
+    frame.meta = {"raw_bits_nominal": 10, "raw_sample_shift": 0,
+                  "raw_alignment": "lsb"}
+    manager.offer("left", frame.data, frame)
+    _drain(manager.continuous)
+    out = manager.stop_continuous()
+
+    stored = out["stored_samples"]
+    assert stored["reduction"] == "shift-to-8"
+    assert stored["shift"] == 2
+    assert stored["scale_to_counts"] == 4
+
+    chunk = next(Path(out["directory"]).joinpath("left").glob("*.npy"))
+    arr = np.load(chunk)
+    assert arr.dtype == np.uint8
+    assert int(arr[0, 0, 0]) == 300 >> 2          # 75, not 300 & 0xFF == 44
+
+
+def test_an_msb_aligned_frame_shifts_by_eight_not_two(manager):
+    manager.rate_setter = _FakeRuntime()
+    manager.arm_continuous("raw8", 30.0)
+    manager.start_continuous(wait_s=0.0)
+    frame = _frame(1)
+    frame.data = np.full((H, W), 300 << 6, dtype=np.uint16)
+    frame.meta = {"raw_bits_nominal": 10, "raw_sample_shift": 6,
+                  "raw_alignment": "msb"}
+    manager.offer("left", frame.data, frame)
+    _drain(manager.continuous)
+    out = manager.stop_continuous()
+    assert out["stored_samples"]["shift"] == 8
+    chunk = next(Path(out["directory"]).joinpath("left").glob("*.npy"))
+    assert int(np.load(chunk)[0, 0, 0]) == (300 << 6) >> 8
+
+
+def test_the_shift_is_locked_for_the_whole_recording(manager):
+    """A recording whose frames do not all mean the same thing is the failure
+    this stage excludes. A frame whose alignment disagrees fails it."""
+    manager.rate_setter = _FakeRuntime()
+    manager.arm_continuous("raw8", 30.0)
+    manager.start_continuous(wait_s=0.0)
+    first = _frame(1)
+    first.data = np.full((H, W), 400, dtype=np.uint16)
+    first.meta = {"raw_bits_nominal": 10, "raw_sample_shift": 0}
+    manager.offer("left", first.data, first)
+
+    second = _frame(2)
+    second.data = np.full((H, W), 400, dtype=np.uint16)
+    second.meta = {"raw_bits_nominal": 10, "raw_sample_shift": 6}
+    with pytest.raises(RuntimeError, match="stop meaning the same thing"):
+        manager.offer("left", second.data, second)
+    manager.stop_continuous()
+
+
+def test_full_depth_storage_does_not_copy_or_convert(manager):
+    manager.arm_continuous("raw16", 30.0)
+    manager.start_continuous(wait_s=0.0)
+    frame = _frame(1)
+    frame.data = np.full((H, W), 1023, dtype=np.uint16)
+    assert manager._reduce(frame.data, frame) is frame.data
+    manager.stop_continuous()
+    assert manager.reduction_report()["scale_to_counts"] == 1
+
+
+def test_a_rung_that_is_not_wired_up_is_not_offered_even_if_claimed():
+    """Two guards, and this is the second one.
+
+    Packed 10-bit is described in the ladder because it is the one rung that
+    would buy bandwidth with no loss -- and nothing asks the ISP for it and
+    neither reader unpacks it. Today the capability probe reports it as
+    unavailable, so it never reaches the enumerator. That is one guard, in a
+    different module, and it would be a thin thing to depend on: a probe that
+    starts reporting the sensor's packed modes honestly would put an
+    unserviceable option in front of the operator.
+
+    So the enumerator refuses it on its own, from the format's `offered` flag,
+    whatever it is told is available.
+    """
+    plans = enumerate_plans(
+        heads=("left",), width=W, height=H, sensor_fps=30.0,
+        available_formats={"raw16", "raw8", "raw10p"})
+    assert {p["format"] for p in plans} == {"raw16", "raw8"}
+
+    from trilobite.recording.ladder import RAW10P
+    assert RAW10P.offered is False
+    assert "NOT AVAILABLE" in RAW10P.note
+
+
+def test_the_rate_ladder_only_offers_rates_at_or_below_the_sensor():
+    from trilobite.recording.ladder import rates_for
+    assert rates_for(30.0) == (30.0, 25.0, 20.0, 15.0, 10.0, 5.0, 2.0, 1.0)
+    # The sensor's own rate is always first, even when it is not a round
+    # number on the ladder: it is the one rate that needs no request at all.
+    assert rates_for(41.7)[0] == 41.7
+    assert max(rates_for(41.7)[1:]) <= 30.0
+    # Nothing above the sensor rate, ever: a recording cannot run faster than
+    # the frames arrive.
+    assert all(r <= 12.0 for r in rates_for(12.0))

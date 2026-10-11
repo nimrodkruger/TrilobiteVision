@@ -153,6 +153,70 @@ MUTATIONS: list[Mutation] = [
         "                    head.drop_fraction > self.max_drop_fraction and False):",
         (REC,),
     ),
+    # -- the configuration rungs are APPLIED, not merely described --------
+    Mutation(
+        "a reduced frame rate is never asked of the sensor",
+        "src/trilobite/recording/manager.py",
+        "            plan = self.plan(key, fps, duration_s)\n"
+        "            self._apply_rate(plan)\n"
+        "            try:\n"
+        "                self._arm_reduction(plan)\n"
+        "                out = self.continuous.arm(",
+        "            plan = self.plan(key, fps, duration_s)\n"
+        "            try:\n"
+        "                self._arm_reduction(plan)\n"
+        "                out = self.continuous.arm(",
+        (REC,),
+    ),
+    Mutation(
+        "a head that cannot change its rate is treated as if it had",
+        "src/trilobite/recording/manager.py",
+        "            if got is None:\n"
+        "                failed.append(f\"{cam_id} (cannot change its frame rate)\")",
+        "            if False:\n"
+        "                failed.append(f\"{cam_id} (cannot change its frame rate)\")",
+        (REC, ROUND),
+    ),
+    Mutation(
+        "the configured rate is never restored after a recording",
+        "src/trilobite/recording/manager.py",
+        "        for cam_id in tuple(self._rate_applied.get(\"per_head\") or ()):",
+        "        for cam_id in ():",
+        (REC,),
+    ),
+    # -- 8-bit storage is a shift, never a cast ---------------------------
+    Mutation(
+        "8-bit storage keeps the low byte instead of the top bits",
+        "src/trilobite/recording/ladder.py",
+        "    if shift > 0:\n"
+        "        return (pixels >> shift).astype(want, copy=False)",
+        "    if False:\n"
+        "        return (pixels >> shift).astype(want, copy=False)",
+        (REC, ROUND),
+    ),
+    Mutation(
+        "the shift ignores how the samples are aligned in their container",
+        "src/trilobite/recording/ladder.py",
+        "    return max(0, (bits - 8) + shift)",
+        "    return max(0, bits - 8)",
+        (REC,),
+    ),
+    Mutation(
+        "the storage shift may change part way through a recording",
+        "src/trilobite/recording/manager.py",
+        "            if now != self._store_shift:",
+        "            if False and now != self._store_shift:",
+        (REC,),
+    ),
+    # -- only wired-up rungs are offered ----------------------------------
+    Mutation(
+        "a format that is described but not implemented is offered",
+        "src/trilobite/recording/ladder.py",
+        "    candidates = [f for f in OFFERED if f.key in keys] or [RAW16]",
+        "    candidates = [f for f in FORMATS if f.key in keys] or [RAW16]",
+        (REC,),
+    ),
+
     # -- an unsaved burst is never overwritten -----------------------------
     Mutation(
         "arming is allowed over an unsaved burst",

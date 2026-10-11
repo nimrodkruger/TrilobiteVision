@@ -35,6 +35,12 @@ from .base import CameraSource, RawRead
 
 log = logging.getLogger(__name__)
 
+# The synthetic raw path's sample depth. 10 bits, lsb-aligned in a 16-bit word,
+# matching the mono IMX296 as this rig negotiates it -- see
+# SyntheticSource.read_raw for why the renderer's 8 bits are not enough.
+SYNTH_BITS = 10
+SYNTH_SHIFT = SYNTH_BITS - 8
+
 
 class SyntheticSource(CameraSource):
     """A drifting sinusoidal target plus a static grid and noise.
@@ -212,6 +218,43 @@ class SyntheticSource(CameraSource):
     # hands over pixels in the SENSOR frame and leaves the turn to the reader.
     records_oriented = False
 
+    def raw_capabilities(self) -> dict[str, Any]:
+        """What this backend's raw path can be asked to store.
+
+        `reducible_to_eight` is the honest gate for the 8-bit rung, and it is
+        a statement about the samples that ARRIVE rather than about sensor
+        modes. The reduction is a shift applied to the delivered frame, so what
+        matters is whether there are bits above the low eight to discard -- not
+        whether the sensor advertises an R8 mode it is not being asked for.
+        """
+        return {
+            "measured": True,
+            "negotiated": f"synthetic-{SYNTH_BITS}",
+            "formats": [],
+            "delivered_bits": SYNTH_BITS,
+            "reducible_to_eight": SYNTH_BITS > 8,
+            "packed_available": False,
+            "packed_note": "synthetic frames are never packed",
+            "note": ("rendered, not measured: 8-bit tone scaled into "
+                     f"{SYNTH_BITS}-bit samples so the storage ladder is "
+                     "exercisable with no camera"),
+        }
+
+    def request_frame_rate(self, fps: float | None) -> float | None:
+        """Change the render cadence. The analogue of a frame-duration request.
+
+        Implemented so the rate rung of the recording ladder is exercised end
+        to end with no camera attached -- otherwise the one mechanism whose
+        failure mode is "the manifest says 15 fps and the file holds 30" would
+        have no test.
+        """
+        self._check_owner("request_frame_rate")
+        want = float(self.cfg.fps) if fps is None else float(fps)
+        if want <= 0:
+            raise ValueError(f"{self.cam_id}: frame rate must be positive")
+        self._period = 1.0 / want
+        return want
+
     def read_raw(self, with_preview: bool = False) -> RawRead:
         """A rendered frame in the sensor frame, deliberately **not** oriented.
 
@@ -238,6 +281,13 @@ class SyntheticSource(CameraSource):
         self._check_owner("read_raw")
         if not self._open:
             raise RuntimeError(f"{self.cam_id}: synthetic source is closed")
+        # The raw path delivers 10-bit samples in a uint16 word, like the
+        # sensor, rather than the uint8 the renderer works in. The point of
+        # this backend is that the whole application can be exercised with no
+        # camera attached, and the storage ladder's 8-bit rung is arithmetic on
+        # the sample depth -- so a backend that delivered 8 bits would make
+        # that rung untestable and would make `raw8` and `raw16` the same
+        # thing. The preview stays 8-bit, which is all it ever was.
         now = time.monotonic()
         wait = self._period - (now - self._last)
         if wait > 0:
@@ -248,12 +298,17 @@ class SyntheticSource(CameraSource):
         seq = self._next_seq()
 
         frame = Frame.now(
-            self._render(self._full, phase),
+            self._render(self._full, phase).astype(np.uint16) << SYNTH_SHIFT,
             self.cam_id,
             seq,
             space="raw",
             source_kind=SRC_SYNTHETIC,
             Synthetic=True,
+            raw_bits_nominal=SYNTH_BITS,
+            raw_bits_source="synthetic",
+            raw_sample_shift=0,
+            raw_alignment="lsb",
+            raw_container_bits=16,
             **self.orientation,
             **self._controls,
         )

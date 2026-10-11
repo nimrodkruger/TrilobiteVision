@@ -545,8 +545,20 @@ class Picamera2Source(CameraSource):
                 f"Not offered as a recording format yet: storing packed needs "
                 f"an unpack step in read_capture.py and the MATLAB readers, "
                 f"and this rig has not shown it needs the bandwidth."),
-            "eight_bit_available": any(
+            # The sensor advertising an 8-bit MODE, which is a different
+            # question from whether 8-bit STORAGE is possible, and is kept
+            # only as a diagnostic. Nothing asks the ISP for R8 -- changing the
+            # negotiated format means reopening the camera, which would also
+            # change the still path -- so this is not the gate.
+            "eight_bit_mode_advertised": any(
                 c["admissible"] and c["bits"] == 8 for c in classified.values()),
+            # The gate that matters: the delivered samples have bits above the
+            # low eight to discard, so the storage reduction has something to
+            # do. See ladder.shift_to_eight.
+            "delivered_bits": getattr(classify(negotiated), "bits", None),
+            "reducible_to_eight": bool(
+                (f2 := classify(negotiated)) and f2.admissible
+                and (f2.bits or 0) > 8),
             "negotiated_admissible": bool(
                 (f := classify(negotiated)) and f.admissible),
         }
@@ -838,6 +850,64 @@ class Picamera2Source(CameraSource):
                 )
             self._picam.set_controls(supported)
         self._requested.update(controls)
+
+    def request_frame_rate(self, fps: float | None) -> float | None:
+        """Set the sensor's frame duration, which is how its rate is set.
+
+        `FrameDurationLimits` takes a (min, max) pair in microseconds, and both
+        are set to the same value: a range lets libcamera choose, and the
+        recording plan's arithmetic is written against one rate.
+
+        **Exposure is not set here, and must not be.** A longer frame duration
+        permits a longer integration; it does not impose one. With AE on the AE
+        algorithm decides, and with a fixed `ExposureTime` that value stands
+        until it exceeds the frame duration. So the honest claim for this rung
+        is "fewer exposures, uniformly spaced, with room for a longer one", not
+        "a longer exposure".
+
+        Returns the rate requested. The rate ACHIEVED is a different number --
+        measured from the frames that arrive and reported in the recording
+        journal -- because a driver that cannot hold the requested duration
+        delivers a different cadence without complaining.
+        """
+        self._check_owner("request_frame_rate")
+        if not self._open:
+            raise RuntimeError(f"{self.cam_id}: camera not open")
+        want = float(self.cfg.fps) if fps is None else float(fps)
+        if want <= 0:
+            raise ValueError(f"{self.cam_id}: frame rate must be positive")
+        micros = int(round(1_000_000.0 / want))
+        with self._lock:
+            available = getattr(self._picam, "camera_controls", {}) or {}
+            if "FrameDurationLimits" not in available:
+                log.warning("%s: the driver does not expose "
+                            "FrameDurationLimits, so the frame rate cannot be "
+                            "set", self.cam_id)
+                return None
+            self._check_duration(available.get("FrameDurationLimits"),
+                                 micros, want)
+            self._picam.set_controls({"FrameDurationLimits": (micros, micros)})
+        self._requested["FrameDurationLimits"] = (micros, micros)
+        return want
+
+    def _check_duration(self, limits: Any, micros: int, want: float) -> None:
+        """Refuse a duration the sensor has said it will not accept.
+
+        Refused rather than clamped. Clamping would deliver a rate other than
+        the one the plan was built from, which is the single failure this rung
+        has to avoid -- and the driver reports the range, so there is no need
+        to discover it by being wrong.
+        """
+        try:
+            lo, hi = int(limits[0]), int(limits[1])
+        except (TypeError, ValueError, IndexError):
+            return          # the driver did not give a usable range
+        if lo <= micros <= hi:
+            return
+        raise ValueError(
+            f"{self.cam_id}: {want:.3g} fps is a frame duration of {micros} us "
+            f"and this sensor accepts {lo}-{hi} us "
+            f"({1e6 / hi:.3g}-{1e6 / lo:.3g} fps).")
 
     def _resolve_ae(self, controls: dict[str, Any]) -> dict[str, Any]:
         """Make auto-exposure transitions actually take effect.

@@ -620,8 +620,17 @@ class ContinuousRecorder:
         log.info("recording stopping: %s", reason)
 
     def stop(self, reason: str = STOP_REQUESTED,
-             timeout: float = 60.0) -> dict[str, Any]:
-        """Stop, drain, close the chunks and write the journal."""
+             timeout: float = 60.0,
+             rate: dict[str, Any] | None = None,
+             reduction: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Stop, drain, close the chunks and write the journal.
+
+        `rate` and `reduction` are what the manager actually did to the sensor
+        and to the samples -- the frame rate it requested and the shift it
+        stored with. They belong in the journal and not only in the plan,
+        because the plan is what was ASKED for and these are what was DONE,
+        and a reader has no way to tell the two apart otherwise.
+        """
         with self._lock:
             if self.state in (IDLE, COMPLETE, INCOMPLETE):
                 return self.status()
@@ -642,6 +651,8 @@ class ContinuousRecorder:
                          for s in summaries.values())
                  and all(s.get("accounted") for s in summaries.values()))
         payload = self._journal(plan, root, summaries, clean)
+        payload["rate"] = dict(rate or {})
+        payload["stored_samples"] = dict(reduction or {})
         try:
             if root is not None:
                 Journal(root, payload).write()

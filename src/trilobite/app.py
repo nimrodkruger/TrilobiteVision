@@ -495,6 +495,19 @@ class CameraRuntime:
             CONTROL_DEADLINE_S,
         )
 
+    def request_frame_rate(self, fps: float | None) -> float | None:
+        """Ask this head's sensor for a frame rate. None restores the config.
+
+        Through the command queue like any other camera access, and the result
+        is returned rather than fired and forgotten: the recording refuses to
+        arm if a rate it asked for was not applied, so the answer is the point.
+        """
+        cmd = self.owner.submit(
+            "control", lambda: self.source.request_frame_rate(fps),
+            CONTROL_DEADLINE_S,
+        )
+        return cmd.result
+
     def control_spec(self) -> dict[str, dict[str, Any]]:
         """Advertised control ranges, snapshotted at open.
 
@@ -704,6 +717,10 @@ class Application:
         }
         for cam in self.cameras.values():
             cam.recorder = self.recording
+        # The recorder asks for a frame rate through this rather than holding
+        # the runtimes: every camera access belongs to that head's owner
+        # thread, and the manager is called from the web thread.
+        self.recording.rate_setter = self._request_frame_rate
         self.started_at = time.time()
         # Declared before a session, frozen once one starts. Persisted with
         # everything else so the board and acceptance settings survive a
@@ -985,6 +1002,19 @@ class Application:
             return self.cameras[cam_id]
         except KeyError:
             raise KeyError(f"no camera {cam_id!r}; have {sorted(self.cameras)}") from None
+
+    def _request_frame_rate(self, cam_id: str,
+                            fps: float | None) -> float | None:
+        """Ask one head for a frame rate. `None` back means it cannot.
+
+        A head that is not running also answers `None`: it has no owner thread
+        to apply anything, and a recording must not be armed believing a rate
+        was set on a camera that is stopped.
+        """
+        cam = self.cameras.get(cam_id)
+        if cam is None or cam.lifecycle != "running":
+            return None
+        return cam.request_frame_rate(fps)
 
     def status(self) -> dict[str, Any]:
         # `network` is here so a rig whose DHCP lease moved can be asked where

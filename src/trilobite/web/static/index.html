@@ -43,6 +43,30 @@
   .viewport h2 .stat { margin-left:auto; color:var(--muted); font-size:11px;
                        font-variant-numeric:tabular-nums; }
   .view { display:block; width:100%; height:40vh; object-fit:contain; background:#000; }
+  /* Video tab: both heads side by side above the controls. */
+  .panes { display:flex; gap:1px; background:var(--line); }
+  .panes .pane { flex:1 1 0; margin:0; min-width:0; position:relative; }
+  .panes .pane .view { height:min(34vh, 380px); }
+  .panes .pane figcaption { position:absolute; left:0; right:0; bottom:0;
+    display:flex; gap:8px; align-items:center; padding:3px 8px; font-size:11px;
+    color:var(--muted); background:rgba(0,0,0,.55); }
+  @media (max-width:820px) { .panes { flex-direction:column; } }
+
+  /* On air. Steady red, not a blink: a blinking element in the corner of a
+     long session is noise, and this has to be readable rather than noticed
+     once. The border on the card is what makes it unmissable while framing. */
+  .rec-dot { display:none; }
+  .rec-dot.live { display:inline-flex; align-items:center; gap:6px;
+    color:#fff; background:var(--err); font-weight:700; letter-spacing:.04em;
+    padding:2px 8px; border-radius:999px; }
+  .rec-dot.live::before { content:""; width:8px; height:8px; border-radius:50%;
+    background:#fff; }
+  body.recording .cam > .viewport { box-shadow: inset 0 0 0 2px var(--err); }
+  #modes button.live { color:#fff; background:var(--err); border-color:var(--err); }
+  /* A rate the measured disk cannot hold. Marked, not hidden: recording it is
+     a legitimate choice once the loss is accepted. It must not look free. */
+  .foot button.ghost.warn { border-color:var(--warn); color:var(--warn); }
+  .foot button.ghost.warn.on { background:var(--warn); color:#000; }
 
   .subaps { display:none; grid-template-columns:repeat(3,1fr); gap:6px; padding:6px 8px;
             border-top:1px solid var(--line); }
@@ -333,6 +357,13 @@
   <span class="meta" id="stale" hidden
         style="color:var(--warn);font-weight:650;cursor:pointer"
         title="Click to reload">⟳ page is out of date — reload</span>
+  <!-- On air. In the header and not on the Video tab, because a recording
+       started there keeps running while the operator is somewhere else, and
+       an indicator that only exists on one tab is off exactly when it is
+       needed. Driven by polled recorder state, never by a button press: a
+       recording also ends by itself, at the duration limit or the drop
+       ceiling, and those paths press nothing. -->
+  <span class="meta rec-dot" id="rec-on-air"></span>
   <span class="spacer"></span>
   <!-- Filled at start-up from /api/cameras: one tab per camera between System
        and Imaging, so a three-camera rig needs no edit here. -->
@@ -1330,6 +1361,19 @@ function renderSystem(s) {
 let REC_SEL = { kind: "continuous", format: "raw16", fps: null, duration: 60 };
 let REC_TIMER = null;
 let REC_NOTE = { text: "", cls: "" };
+let REC_OPTS = null;
+/* Whether a recording is running, as of the last poll. Read by the indicator
+   in the header, which is why it lives outside the Video tab: a recording
+   started here keeps running while the operator is on another tab, and an
+   indicator that only exists on this tab would be off exactly when it matters.
+   Driven by polled state and never set by a button handler -- see
+   `setRecordingIndicator`. */
+let REC_LIVE = false;
+/* Discard is a two-click action; see the handler for why it is not a
+   `confirm()`. Module scope because the panel it lives on is re-rendered every
+   second, so the armed state cannot live on the button. */
+let REC_DISCARD_ARMED = false;
+let REC_DISCARD_TIMER = null;
 
 function setRecNote(text, cls = "") {
   REC_NOTE = { text, cls };
@@ -1337,31 +1381,87 @@ function setRecNote(text, cls = "") {
   if (el) { el.textContent = text; el.className = "note " + cls; }
 }
 
+/* The on-air indicator.
+
+   One function, one input: the recorder's own state from /api/recording. It is
+   NOT set when Start is pressed and NOT cleared when Stop is pressed, because
+   a recording can also end by itself -- the duration limit, the drop ceiling,
+   a full disk, a pulled drive -- and an indicator driven by button presses
+   stays lit after every one of those. Every path out of `recording` goes
+   through the state this reads, so every path clears it.
+
+   It also clears when the status request fails: an indicator that keeps
+   claiming "recording" on a rig that has stopped answering is worse than one
+   that goes blank, because the blank one is visibly uncertain. */
+function setRecordingIndicator(on, detail = "") {
+  REC_LIVE = !!on;
+  document.body.classList.toggle("recording", REC_LIVE);
+  const dot = $("#rec-on-air");
+  if (dot) {
+    dot.classList.toggle("live", REC_LIVE);
+    dot.textContent = REC_LIVE ? `REC ${detail}`.trim() : "";
+    dot.title = REC_LIVE
+      ? "A recording is running. It is writing frames to the selected target."
+      : "";
+  }
+  const tab = $("#mode-video");
+  if (tab) tab.classList.toggle("live", REC_LIVE);
+}
+
+/* ---------------------------------------------------------------------------
+   The Video tab's layout, in the order a returning operator uses it.
+
+   The first version of this put Measure at the top and a sixteen-row table of
+   configurations under it, on the argument that the numbers are meaningless
+   without a measurement. That is true once per disk, and false every other
+   time: an operator who has measured this drive wants the picture, the rate
+   and Start, and has to scroll past an explainer to reach them.
+
+   So the order is now: the live image, the action row, the running figures,
+   and then the things that are consulted rarely -- the target measurement,
+   which matters when the disk changes, and the explainer, which is read once
+   and collapsed thereafter. The warning that nothing has been measured still
+   appears next to the controls it affects, where it cannot be scrolled past.
+--------------------------------------------------------------------------- */
 async function buildVideo() {
   const gen = ++BUILD;
+  let cams = [];
+  try { cams = await jget("/api/cameras"); } catch { /* controls still build */ }
+  if (gen !== BUILD) return;
+
   const root = $("#cams");
   root.innerHTML = "";
   root.className = "single";
 
   const card = document.createElement("section");
   card.className = "cam";
+  // The live image, before Start as well as during it. Framing a shot, judging
+  // exposure and seeing that a head is alive are all needed BEFORE a recording
+  // rather than after it, and the first version of this tab showed numbers
+  // only -- so the one way to see the scene was to leave the tab.
+  const views = cams.map(c => `
+    <figure class="pane">
+      <img class="view" src="/stream/${c.cam_id}.mjpg" alt="${c.cam_id}">
+      <figcaption>${c.label || c.cam_id}
+        <span class="stat" data-fps="${c.cam_id}">&mdash;</span></figcaption>
+    </figure>`).join("");
   card.innerHTML = `
-    <div class="viewport"><h2><span class="ttl">Recording</span>
-      <span class="sub">raw sensor counts, both heads, free-running</span>
-      <span class="stat" id="rec-state">&mdash;</span></h2></div>
+    <div class="viewport">
+      <h2><span class="ttl">Recording</span>
+        <span class="sub">raw sensor counts · both heads · free-running</span>
+        <span class="stat" id="rec-state">&mdash;</span></h2>
+      <div class="panes">${views || `<div class="empty">no cameras</div>`}</div>
+    </div>
     <div class="controls" id="rec-body">
+      <div id="rec-actions"></div>
       <div class="panel"><div class="hdr"><span class="chev">▾</span>
-        <strong>Target</strong><span class="type">measured, not assumed</span></div>
-        <div class="body" id="rec-preflight"><div class="empty">…</div></div></div>
-      <div class="panel"><div class="hdr"><span class="chev">▾</span>
-        <strong>Configuration</strong><span class="type">fixed before Start</span></div>
-        <div class="body" id="rec-plans"><div class="empty">…</div></div></div>
-      <div class="panel"><div class="hdr"><span class="chev">▾</span>
-        <strong>Recording</strong><span class="type">live figures</span></div>
+        <strong>Live</strong></div>
         <div class="body" id="rec-live"><div class="empty">…</div></div></div>
       <div class="panel"><div class="hdr"><span class="chev">▾</span>
-        <strong>How degradation works here</strong>
-        <span class="type">read once</span></div>
+        <strong>Target</strong><span class="type" id="rec-target-tag"></span></div>
+        <div class="body" id="rec-preflight"><div class="empty">…</div></div></div>
+      <div class="panel collapsed"><div class="hdr"><span class="chev">▸</span>
+        <strong>How loss works here</strong></div>
         <div class="body"><div class="notes tall">${REC_EXPLAINER}</div></div></div>
     </div>`;
   root.appendChild(card);
@@ -1381,33 +1481,20 @@ async function buildVideo() {
   }, 1000);
 }
 
+/* Short. The long version is in docs/implementation-plan.md, which is where an
+   argument belongs; this is a reminder for somebody who has read it. */
 const REC_EXPLAINER = [
-  "Five things can close a gap between what the sensors produce and what the",
-  "disk can absorb. They are not interchangeable, and what matters is which",
-  "are chosen here and which may act while the recording runs:",
+  "Chosen here, before Start:",
+  "  frame rate    fewer exposures, uniformly spaced, exact",
+  "  8-bit         half the bytes, LOSSY -> diagnostic",
   "",
-  "  lower the frame rate      exact, UNIFORMLY sampled     chosen here",
-  "  packed 10-bit             exact                        chosen here",
-  "  8-bit                     LOSSY -> diagnostic          chosen here",
-  "  drop whole frames         exact per frame, gaps        WHILE RUNNING",
-  "  lossless compression      exact, far too slow live     after capture",
+  "While running, and the only thing that changes:",
+  "  dropped frames    whole frames, counted, recorded as gaps",
   "",
-  "The configuration is fixed before Start and the only thing that changes",
-  "during a recording is whether a frame is kept. Nothing alters bit depth,",
-  "geometry or rate mid-stream: a file whose frames differ in shape breaks",
-  "every reader, and a recording that silently changed its own fidelity half",
-  "way through is worse than one that lost frames, because the loss is at",
-  "least countable.",
-  "",
+  "Depth, geometry and rate never change mid-recording: one file, one meaning.",
   "Lowering the rate beats dropping when the shortfall is known in advance.",
-  "Dropping throws away exposures already taken and leaves irregular",
-  "sampling; asking the sensor for a lower rate gives uniform sampling and a",
-  "longer exposure. Dropping is the safety valve for a stall.",
-  "",
-  "The heads drop independently. Nothing triggers these two sensors together",
-  "and no synchronisation is claimed: a recording is two independently",
-  "sampled sequences sharing a recorded clock, reconciled afterwards from the",
-  "per-frame SensorTimestamp in each head's index.",
+  "The heads drop independently -- no trigger couples them, none is claimed.",
+  "Reconcile the pair offline from the per-frame SensorTimestamp.",
 ].join("\n");
 
 async function refreshRecording() {
@@ -1415,33 +1502,218 @@ async function refreshRecording() {
   try { opts = await jget("/api/recording/options"); }
   catch (e) { setRecNote(e.message, "err"); return; }
   if (!opts.available) {
-    $("#rec-preflight").innerHTML = `<div class="empty"></div>`;
-    $("#rec-preflight").querySelector(".empty").textContent = opts.reason || "no cameras";
+    const host = $("#rec-preflight");
+    host.innerHTML = `<div class="empty"></div>`;
+    host.querySelector(".empty").textContent = opts.reason || "no cameras";
     return;
   }
   REC_OPTS = opts;
   if (REC_SEL.fps === null) REC_SEL.fps = opts.sensor.fps;
+  if (!opts.plans.some(p => p.format === REC_SEL.format)) {
+    REC_SEL.format = (opts.plans[0] || {}).format || "raw16";
+  }
+  renderActions(opts);
   renderPreflight(opts);
-  renderPlans(opts);
   await refreshRecordingLive();
 }
 
-let REC_OPTS = null;
+/* The formats and rates actually on offer, as two separate choices.
+
+   Not a cross product. Two formats and eight rates is sixteen rows as a list,
+   and an operator does not think "raw8 at 15" -- they pick a depth and then a
+   rate. Two rows of chips is the same information in a fifth of the space, and
+   it is the conventional shape for a small exclusive choice.
+
+   Only what the rig can deliver appears: the formats come from what the
+   pre-flight established the cameras will supply, and the rates from what the
+   sensor accepts. A rung that is described in the ladder but not wired up end
+   to end -- packed 10-bit, today -- is not here at all. An option that cannot
+   be served is worse than an absent one, because it gets chosen. */
+function renderActions(opts) {
+  const host = $("#rec-actions");
+  host.innerHTML = "";
+
+  const formats = [];
+  const rates = [];
+  for (const p of opts.plans) {
+    if (!formats.some(f => f.format === p.format)) formats.push(p);
+    if (!rates.includes(p.fps)) rates.push(p.fps);
+  }
+  const current = opts.plans.find(
+    p => p.format === REC_SEL.format && Math.abs(p.fps - REC_SEL.fps) < 0.01)
+    || opts.plans[0];
+
+  const row = document.createElement("div");
+  row.className = "dev active";
+  row.innerHTML = `
+    <div class="top"><span class="name">Record</span>
+      <span class="tag" id="rec-consequence"></span>
+      ${opts.preflight_current ? "" : `<span class="tag rm"
+        title="Loss cannot be predicted until the target has been measured. Expand Target below and press Measure.">UNMEASURED</span>`}</div>
+    <div class="foot" id="rec-mode"></div>
+    <div class="foot" id="rec-format"></div>
+    <div class="foot" id="rec-rate-pick"></div>
+    <div class="foot" id="rec-go"></div>
+    <div class="note" id="rec-arm-note"></div>`;
+  host.appendChild(row);
+
+  const chip = (label, on, title, onclick, data = {}) => {
+    const b = document.createElement("button");
+    b.className = "ghost";
+    b.textContent = label;
+    if (title) b.title = title;
+    for (const [k, v] of Object.entries(data)) b.dataset[k] = v;
+    // `on` is the class the rest of the dashboard already uses for a chosen
+    // button -- the sub-aperture picker, the mode tabs, the stage toggles. A
+    // selection that looked different here would read as a different kind of
+    // thing.
+    b.classList.toggle("on", !!on);
+    b.onclick = onclick;
+    return b;
+  };
+
+  const modes = row.querySelector("#rec-mode");
+  modes.appendChild(document.createElement("span")).className = "cap";
+  modes.lastChild.textContent = "mode";
+  for (const [kind, label, title] of [
+    ["continuous", "Continuous",
+     "Bounded by the disk. Minutes. Drops frames when the disk cannot keep up, and counts them."],
+    ["burst", "RAM burst",
+     "Bounded by memory. Seconds at full rate with no drops, written afterwards. The frames exist only in RAM until saved."],
+  ]) {
+    modes.appendChild(chip(label, REC_SEL.kind === kind, title, () => {
+      REC_SEL.kind = kind; renderActions(opts);
+    }, { kind }));
+  }
+
+  const fmts = row.querySelector("#rec-format");
+  fmts.appendChild(document.createElement("span")).className = "cap";
+  fmts.lastChild.textContent = "depth";
+  for (const p of formats) {
+    fmts.appendChild(chip(
+      p.exact ? p.format_label : `${p.format_label} (lossy)`,
+      p.format === REC_SEL.format, p.format_note,
+      () => { REC_SEL.format = p.format; renderActions(opts); },
+      { fmt: p.format }));
+  }
+
+  const rateHost = row.querySelector("#rec-rate-pick");
+  rateHost.appendChild(document.createElement("span")).className = "cap";
+  rateHost.lastChild.textContent = "fps";
+  for (const fps of rates) {
+    const plan = opts.plans.find(
+      p => p.format === REC_SEL.format && Math.abs(p.fps - fps) < 0.01);
+    const loss = plan && plan.predicted_drop_percent;
+    const b = chip(
+      String(fps), Math.abs(REC_SEL.fps - fps) < 0.01,
+      plan ? `${plan.mb_s} MB/s`
+             + (loss == null ? ", predicted loss unknown"
+                             : `, predicted loss ${loss}%`) : "",
+      () => { REC_SEL.fps = fps; renderActions(opts); }, { fps });
+    // Marked, not hidden: a rate the measured disk cannot hold is still a
+    // legitimate thing to record if the operator accepts the loss, and the
+    // whole design permits that. It just must not look free.
+    if (plan && plan.feasible === false) b.classList.add("warn");
+    rateHost.appendChild(b);
+  }
+
+  const go = row.querySelector("#rec-go");
+  if (REC_SEL.kind === "continuous") {
+    const lab = document.createElement("label");
+    lab.innerHTML = `seconds <input id="rec-duration" type="number" min="1"
+      max="3600" value="${REC_SEL.duration}" style="width:4.5em">`;
+    go.appendChild(lab);
+  }
+  const internal = document.createElement("label");
+  internal.title = "Writes to the disk the operating system runs from. "
+    + "Unticked every time, deliberately: this is a decision, not a preference.";
+  internal.innerHTML = `<input type="checkbox" id="rec-internal"> internal OK`;
+  go.appendChild(internal);
+  for (const [id, label, title] of [
+    ["rec-arm", "Arm", "Reserve the memory and the disk space, and fix the configuration."],
+    ["rec-start", "Start", "Begins when every head is confirmed recording."],
+    ["rec-stop", "Stop", "Closes the chunks and writes the journal."],
+  ]) {
+    const b = document.createElement("button");
+    b.className = "ghost";
+    b.id = id; b.textContent = label; b.title = title;
+    go.appendChild(b);
+  }
+
+  // One line, next to the buttons: what this configuration costs.
+  const cons = row.querySelector("#rec-consequence");
+  if (current) {
+    const loss = current.predicted_drop_percent;
+    cons.textContent =
+      `${current.mb_s} MB/s · `
+      + (loss == null ? "loss unknown" : `${loss}% predicted loss`)
+      + ` · ${current.validity_ceiling}`;
+    cons.classList.toggle("rm", !current.exact || loss == null || loss > 0);
+  }
+
+  wireRecordingActions(row);
+}
+
+function wireRecordingActions(row) {
+  const note = (t, c = "") => {
+    const el = $("#rec-arm-note");
+    if (el) { el.textContent = t; el.className = "note " + c; }
+  };
+  const body = () => ({
+    kind: REC_SEL.kind, format: REC_SEL.format, fps: REC_SEL.fps,
+    duration_s: REC_SEL.kind === "continuous"
+      ? Number(($("#rec-duration") || {}).value) || null : null,
+    internal_ok: !!($("#rec-internal") || {}).checked,
+  });
+  row.querySelector("#rec-arm").onclick = async () => {
+    try {
+      const r = await jsend("/api/recording/arm", body());
+      const rate = r.rate || {};
+      note(`armed: ${r.slots_per_head || r.frames_per_head} frames per head`
+           + (r.duration_s ? `, ${r.duration_s} s` : "")
+           + (rate.applied ? `, sensor set to ${rate.requested_fps} fps` : "")
+           + `, generation ${r.storage_generation || "-"}`, "ok");
+      await refreshRecordingLive();
+    } catch (e) { note(e.message, "err"); }
+  };
+  row.querySelector("#rec-start").onclick = async () => {
+    try {
+      const r = await jsend("/api/recording/start", { kind: REC_SEL.kind });
+      const heads = (r.heads_confirmed || []).join(", ");
+      note(heads ? `recording: ${heads}` : "recording", "ok");
+      // Not set here. The indicator follows the polled state so that it also
+      // clears when the recording ends by itself; see setRecordingIndicator.
+      await refreshRecordingLive();
+    } catch (e) { note(e.message, "err"); }
+  };
+  row.querySelector("#rec-stop").onclick = async () => {
+    try {
+      const r = await jsend("/api/recording/stop", { kind: REC_SEL.kind });
+      note(r.stop_reason ? `stopped: ${r.stop_reason}` : "stopped", "ok");
+      await refreshRecordingLive();
+    } catch (e) { note(e.message, "err"); }
+  };
+}
 
 function renderPreflight(opts) {
   const host = $("#rec-preflight");
   const pf = opts.preflight || {};
   const st = pf.storage || {};
-  const el = document.createElement("div");
-  el.className = "dev active";
   const measured = opts.preflight_current;
+  const tag = $("#rec-target-tag");
+  if (tag) {
+    tag.textContent = measured
+      ? `${st.sustained_mb_s} MB/s sustained` : "not measured";
+    tag.className = "type" + (measured ? "" : " rm");
+  }
+  const el = document.createElement("div");
+  el.className = "dev";
   el.innerHTML = `
     <div class="top"><span class="name">Target</span>
       <span class="tag ${opts.storage.removable ? "rm" : ""}">${
         opts.storage.removable ? "external" : "internal"}</span>
       <span class="tag ${opts.storage.state === "ok" ? "" : "rm"}">${
-        opts.storage.state_human || opts.storage.state}</span>
-      ${measured ? "" : `<span class="tag rm">NOT MEASURED</span>`}</div>
+        opts.storage.state_human || opts.storage.state}</span></div>
     <div class="path"></div>
     <div class="foot">
       <span class="cap" id="rec-rate"></span>
@@ -1453,7 +1725,7 @@ function renderPreflight(opts) {
   el.querySelector(".path").textContent =
     `${opts.storage.root}   (${opts.storage.usable_gb} GB usable above the reserve)`;
   el.querySelector("#rec-rate").textContent = measured
-    ? `sustained ${st.sustained_mb_s} MB/s (mean ${st.mean_mb_s})`
+    ? `sustained ${st.sustained_mb_s} MB/s, mean ${st.mean_mb_s}`
       + (st.filesystem ? `, ${st.filesystem}` : "")
     : "sustained rate unknown";
   el.querySelector("#rec-findings").textContent =
@@ -1477,114 +1749,6 @@ function renderPreflight(opts) {
     } finally {
       btn.disabled = false; btn.textContent = "Measure";
     }
-  };
-}
-
-function renderPlans(opts) {
-  const host = $("#rec-plans");
-  host.innerHTML = "";
-
-  const kinds = document.createElement("div");
-  kinds.className = "dev";
-  kinds.innerHTML = `<div class="top"><span class="name">Mode</span></div>
-    <div class="foot">
-      <button class="ghost" data-kind="continuous"
-        title="Bounded by the disk. Minutes. Drops frames when the disk cannot keep up, and counts them.">Continuous</button>
-      <button class="ghost" data-kind="burst"
-        title="Bounded by RAM. Seconds, at full rate, with no drops — then written afterwards. The frames exist only in memory until saved.">RAM burst</button>
-    </div>`;
-  for (const b of kinds.querySelectorAll("button")) {
-    b.classList.toggle("on", b.dataset.kind === REC_SEL.kind);
-    b.onclick = () => { REC_SEL.kind = b.dataset.kind; renderPlans(opts); };
-  }
-  host.appendChild(kinds);
-
-  const table = document.createElement("div");
-  table.className = "notes tall";
-  const rows = [
-    "  format            rate    needs   max fps   predicted loss   validity",
-  ];
-  for (const p of opts.plans) {
-    const sel = p.format === REC_SEL.format && Math.abs(p.fps - REC_SEL.fps) < 0.01;
-    rows.push(
-      `${sel ? ">" : " "} ${p.format.padEnd(16)}`
-      + `${String(p.fps).padStart(5)}  `
-      + `${String(p.mb_s).padStart(6)}  `
-      + `${(p.max_fps == null ? "    ?" : p.max_fps.toFixed(1)).padStart(8)}  `
-      + `${(p.predicted_drop_percent == null
-            ? "unknown" : p.predicted_drop_percent + "%").padStart(14)}   `
-      + `${p.validity_ceiling}${p.exact ? "" : "  LOSSY"}`);
-  }
-  table.textContent = rows.join("\n");
-  host.appendChild(table);
-
-  const pick = document.createElement("div");
-  pick.className = "dev";
-  pick.innerHTML = `<div class="top"><span class="name">Selected</span></div>
-    <div class="foot" id="rec-pick"></div>`;
-  host.appendChild(pick);
-  const picks = pick.querySelector("#rec-pick");
-  for (const p of opts.plans) {
-    const b = document.createElement("button");
-    b.className = "ghost";
-    b.textContent = `${p.format} @ ${p.fps} fps`;
-    b.title = p.format_note;
-    b.classList.toggle(
-      "on", p.format === REC_SEL.format && Math.abs(p.fps - REC_SEL.fps) < 0.01);
-    b.onclick = () => {
-      REC_SEL.format = p.format; REC_SEL.fps = p.fps; renderPlans(opts);
-    };
-    picks.appendChild(b);
-  }
-
-  const actions = document.createElement("div");
-  actions.className = "dev";
-  const dur = REC_SEL.kind === "continuous"
-    ? `<label>seconds <input id="rec-duration" type="number" min="1" max="3600"
-         value="${REC_SEL.duration}" style="width:5em"></label>` : "";
-  actions.innerHTML = `<div class="top"><span class="name">Arm</span>
-      <span class="tag">${REC_SEL.kind}</span></div>
-    <div class="foot">${dur}
-      <label title="Saving gigabytes to the disk the operating system runs from. Unticked every time, deliberately: the reserve still applies, but this is a decision, not a preference.">
-        <input type="checkbox" id="rec-internal"> allow internal storage</label>
-      <button class="ghost" id="rec-arm">Arm</button>
-      <button class="ghost" id="rec-start">Start</button>
-      <button class="ghost" id="rec-stop">Stop</button>
-    </div>
-    <div class="note" id="rec-arm-note"></div>`;
-  host.appendChild(actions);
-
-  const note = (t, c = "") => {
-    const el = $("#rec-arm-note");
-    if (el) { el.textContent = t; el.className = "note " + c; }
-  };
-  const body = () => ({
-    kind: REC_SEL.kind, format: REC_SEL.format, fps: REC_SEL.fps,
-    duration_s: REC_SEL.kind === "continuous"
-      ? Number($("#rec-duration").value) || null : null,
-    internal_ok: !!($("#rec-internal") || {}).checked,
-  });
-  actions.querySelector("#rec-arm").onclick = async () => {
-    try {
-      const r = await jsend("/api/recording/arm", body());
-      note(`armed: ${r.slots_per_head || r.frames_per_head} frames per head`
-           + (r.duration_s ? `, ${r.duration_s} s` : "")
-           + `, generation ${r.storage_generation || "-"}`, "ok");
-      await refreshRecordingLive();
-    } catch (e) { note(e.message, "err"); }
-  };
-  actions.querySelector("#rec-start").onclick = async () => {
-    try {
-      await jsend("/api/recording/start", { kind: REC_SEL.kind });
-      note("recording", "ok");
-    } catch (e) { note(e.message, "err"); }
-  };
-  actions.querySelector("#rec-stop").onclick = async () => {
-    try {
-      const r = await jsend("/api/recording/stop", { kind: REC_SEL.kind });
-      note(r.stop_reason ? `stopped: ${r.stop_reason}` : "stopped", "ok");
-      await refreshRecordingLive();
-    } catch (e) { note(e.message, "err"); }
   };
 }
 
@@ -1620,6 +1784,12 @@ async function refreshRecordingLive() {
       c.elapsed_s != null ? `elapsed    ${c.elapsed_s} s` : "",
       c.write_mb_s != null ? `to disk    ${c.write_mb_s} MB/s` : "",
       `ceiling    ${(c.drop_ceiling * 100).toFixed(0)}% of frames`,
+      // WHY it ended, and not only that it did. A continuous recording stops
+      // by itself at the duration limit, at the drop ceiling, on a full disk
+      // and on a lost volume -- and this line was absent until 10 October, so
+      // all four looked identical to a recording the operator had stopped.
+      c.stop_reason ? `stopped    ${c.stop_reason}` : "",
+      c.last_error ? `!!         ${c.last_error}` : "",
       "");
     for (const h of Object.values(c.heads || {})) {
       lines.push(
@@ -1678,9 +1848,33 @@ async function refreshRecordingLive() {
       } catch (e) { n(e.message, "err"); }
       finally { btn.disabled = false; btn.textContent = "Save"; }
     };
-    act.querySelector("#rec-discard").onclick = async () => {
-      if (!confirm("Discard the burst? The frames are in RAM only and exist "
-                   + "nowhere else.")) return;
+    // Two clicks, not a `confirm()`. The intent was right -- throwing away
+    // frames that exist nowhere else should take a deliberate act -- but a
+    // native dialog blocks the page, cannot be styled, and is the one thing
+    // the browser scenarios cannot drive, so the destructive path was the only
+    // path with no test. Arming the button instead is deliberate, visible and
+    // scriptable, and it reverts on its own if nothing follows.
+    const discard = act.querySelector("#rec-discard");
+    if (REC_DISCARD_ARMED) {
+      discard.textContent = "Discard — click again";
+      discard.classList.add("warn", "on");
+    }
+    discard.onclick = async () => {
+      if (!REC_DISCARD_ARMED) {
+        REC_DISCARD_ARMED = true;
+        discard.textContent = "Discard — click again";
+        discard.classList.add("warn", "on");
+        n("the frames exist nowhere else; click Discard again to throw them "
+          + "away", "err");
+        clearTimeout(REC_DISCARD_TIMER);
+        REC_DISCARD_TIMER = setTimeout(() => {
+          REC_DISCARD_ARMED = false;
+          refreshRecordingLive();
+        }, 5000);
+        return;
+      }
+      clearTimeout(REC_DISCARD_TIMER);
+      REC_DISCARD_ARMED = false;
       try { await jsend("/api/recording/discard"); n("discarded", "ok"); }
       catch (e) { n(e.message, "err"); }
       await refreshRecordingLive();
@@ -2585,6 +2779,10 @@ function renderPollHealth() {
     ? `⚠ no reply from the rig for ${age.toFixed(0)} s — everything below is stale`
     : "⚠ no reply from the rig yet — nothing below has been confirmed";
   el.title = lastStatusError || "the status request has not completed";
+  // An indicator still claiming REC on a rig that stopped answering is worse
+  // than a blank one: the blank one is visibly uncertain, and the lit one is
+  // a statement about right now that nothing is backing.
+  if (REC_LIVE) setRecordingIndicator(false);
 }
 
 let tick = 0;
@@ -2592,6 +2790,17 @@ async function poll() {
   try {
     const s = await jget("/api/status", POLL_TIMEOUT_MS);
     const st = s.storage || {};
+
+    // On air, from the rig's own recorder state, on every tab. `/api/status`
+    // carries the recording block, so the Video tab does not have to be open
+    // for this to be right -- and when the recording ends by itself the next
+    // status says `recording: false` and the indicator clears with no button
+    // having been pressed. See setRecordingIndicator.
+    const rc = (s.recording || {}).continuous || {};
+    const rb = (s.recording || {}).burst || {};
+    const live = rc.state === "recording" || rb.state === "recording";
+    setRecordingIndicator(live, live && rc.state === "recording"
+      ? `${rc.elapsed_s != null ? rc.elapsed_s + "s" : ""}` : "");
     const el = $("#session");
     el.textContent =
       `${s.session_dir}` +

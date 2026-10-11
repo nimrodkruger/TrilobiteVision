@@ -273,7 +273,9 @@ class BurstRecorder:
         return total + (1 << 20) * max(1, len(self.buffers))
 
     def flush(self, internal_ok: bool = False,
-              label: str | None = None) -> dict[str, Any]:
+              label: str | None = None,
+              rate: dict[str, Any] | None = None,
+              reduction: dict[str, Any] | None = None) -> dict[str, Any]:
         """Write the buffered frames to the verified target.
 
         `internal_ok` is per call and never remembered. See the module
@@ -297,7 +299,9 @@ class BurstRecorder:
             # in RAM and can go somewhere else -- which is the one thing a
             # burst can do that a continuous recording cannot.
             with self.writer.writing(need, internal_ok=internal_ok) as generation:
-                result = self._write_all(plan, generation, label)
+                result = self._write_all(
+                    plan, generation, label,
+                    rate=rate, reduction=reduction)
         except StorageRefused as exc:
             with self._lock:
                 self.state = CAPTURED          # still in RAM, still unsaved
@@ -318,7 +322,9 @@ class BurstRecorder:
         return result
 
     def _write_all(self, plan: Plan, generation: int,
-                   label: str | None) -> dict[str, Any]:
+                   label: str | None,
+                   rate: dict[str, Any] | None = None,
+                   reduction: dict[str, Any] | None = None) -> dict[str, Any]:
         root = Path(self.writer.session_dir) / _burst_dirname(label)
         root.mkdir(parents=True, exist_ok=True)
 
@@ -340,6 +346,10 @@ class BurstRecorder:
         payload = {
             "schema": RECORDING_SCHEMA,
             "kind": "burst",
+            # What was DONE to the sensor and to the samples, as against the
+            # plan, which is what was asked for. See ContinuousRecorder.stop.
+            "rate": dict(rate or {}),
+            "stored_samples": dict(reduction or {}),
             "plan": plan.as_dict(),
             "storage_generation": generation,
             "storage_identity": self.writer.identity_dict(),
