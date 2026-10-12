@@ -191,6 +191,10 @@ class HeadRecorder:
         self._q: queue.SimpleQueue = queue.SimpleQueue()
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        # Serialises `offer` against `close`, so no frame can be queued after
+        # the writer has been told to stop. See `offer`.
+        self._gate = threading.Lock()
+        self._closing = False
 
         # Counters. `exposed` counts every frame the SDK delivered during the
         # armed window, which is the denominator the acceptance criterion is
@@ -260,30 +264,61 @@ class HeadRecorder:
             except OSError as exc:
                 self.write_error = self.write_error or exc
 
-    def offer(self, pixels: np.ndarray, meta: FrameMeta) -> bool:
-        """Take one frame from the capture thread. False means it was dropped.
+    def offer(self, pixels: np.ndarray, meta: FrameMeta) -> bool | None:
+        """Take one frame from the capture thread.
 
-        Never blocks. The copy into the slot is the only work done on the
-        capture thread, and the request the pixels came from can be released
-        the moment this returns.
+        `True` stored, `False` dropped for want of a slot, **`None` the
+        recording was already closing** and this frame was never part of it.
+
+        Never blocks on the writer. The copy into the slot is the only work
+        done on the capture thread, and the request the pixels came from can
+        be released the moment this returns.
+
+        ## Why there is a lock here
+
+        `_gate` is taken for the counter bump, the slot acquire and the queue
+        put, and `close()` takes it before signalling the writer to stop. It
+        closes a race the acceptance criterion caught intermittently:
+
+          1. the capture thread passes the state check and increments
+             `exposed`, then is pre-empted before `_q.put`;
+          2. `stop()` runs: the state leaves RECORDING, `close()` sets `_stop`
+             and the writer, finding the queue momentarily empty, breaks;
+          3. the capture thread resumes and puts a frame nobody will take.
+
+        That frame is counted in `exposed`, never in `stored`, never in
+        `dropped` -- `unaccounted = 1`, which is precisely the discrepancy
+        "every exposed frame is in the output or in a named gap" exists to
+        detect. It fired in one run out of three or four of the portability
+        matrix, which is how it was found.
+
+        The gate is contended only by `close`, once, so the cost at sensor
+        rate is an uncontended acquire per frame.
         """
-        self.exposed += 1
-        if self.first_seq is None:
-            self.first_seq = meta.seq
-        self.last_seq = meta.seq
+        with self._gate:
+            if self._closing:
+                return None
+            self.exposed += 1
+            if self.first_seq is None:
+                self.first_seq = meta.seq
+            self.last_seq = meta.seq
 
-        index = self.ring.acquire()
-        if index is None:
-            self.dropped += 1
-            self._recent.append(False)
-            return False
-        np.copyto(self.ring.store[index], pixels, casting="unsafe")
-        self._q.put((index, meta))
-        self._recent.append(True)
-        return True
+            index = self.ring.acquire()
+            if index is None:
+                self.dropped += 1
+                self._recent.append(False)
+                return False
+            np.copyto(self.ring.store[index], pixels, casting="unsafe")
+            self._q.put((index, meta))
+            self._recent.append(True)
+            return True
 
     def close(self, timeout: float = 30.0) -> dict[str, Any]:
         """Drain the queue, finish the chunks, return the summary."""
+        # Shut the gate FIRST. After this, `offer` returns None without
+        # counting, so nothing can be queued behind the sentinel. See `offer`.
+        with self._gate:
+            self._closing = True
         self._stop.set()
         self._q.put(None)
         if self._thread is not None:
@@ -562,6 +597,10 @@ class ContinuousRecorder:
         head = self.heads.get(cam_id)
         if head is None or self.state != RECORDING:
             return None
+        # `None` from the head means the same thing as `None` here: the frame
+        # arrived after the recording had begun closing and was never part of
+        # it. Propagated rather than collapsed to False, for the reason the
+        # docstring above gives.
         kept = head.offer(pixels, meta)
         if head.write_error is not None:
             self._stop(STOP_WRITE_ERROR)

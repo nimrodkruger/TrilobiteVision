@@ -116,6 +116,25 @@ class CameraConfig(BaseModel):
     # here once probe_cameras.py has told you which ones this sensor offers.
     raw_format: str | None = None
 
+    # The sensor's physical pixel pitch in millimetres, if the driver does not
+    # publish it.
+    #
+    # Only the calibration arithmetic needs this: `f_px` and `baseline_mm`
+    # relate a length in pixels to a length in millimetres, and the pitch is
+    # the only thing connecting them. It used to be a module constant --
+    # 3.45 um, the IMX296's -- so any other sensor silently inherited it and
+    # produced confident millimetres that were wrong by the ratio of the
+    # pitches.
+    #
+    # Precedence: this value, then the driver's `UnitCellSize` camera property,
+    # then a documented per-model table, then **not established** -- at which
+    # point the metric figures are reported as unavailable rather than guessed.
+    # Setting this is an explicit operator statement and beats the driver, so
+    # that a wrong tuning file can be worked around.
+    #
+    # Take it from the datasheet, in millimetres: 3.45 um is 0.00345.
+    pixel_pitch_mm: float | None = None
+
     # The escape hatch, and it is deliberately awkward to reach.
     #
     # By default the camera REFUSES TO OPEN if the raw format it would capture

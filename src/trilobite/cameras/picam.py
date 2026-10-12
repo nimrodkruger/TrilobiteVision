@@ -47,6 +47,22 @@ from .rawformat import RawFormatError, admit, best_format, classify, describe_re
 log = logging.getLogger(__name__)
 
 
+# Documented physical pixel pitch, millimetres, keyed on the model string the
+# driver reports. **A fallback for a driver that does not publish
+# `UnitCellSize`, and nothing more.** It is keyed on the model precisely so
+# that an unlisted sensor gets no pitch at all rather than inheriting one:
+# until 11 October the IMX296's 3.45 um was a module constant in
+# calibration/settings.py, so every other sensor would have produced
+# millimetres that looked right and were wrong by the ratio of the pitches.
+#
+# Add a row only with a datasheet reference in the comment. An entry here is a
+# claim about hardware.
+KNOWN_PIXEL_PITCH_MM: dict[str, float] = {
+    # Sony IMX296LLR, 3.45 um square. Raspberry Pi Global Shutter Camera.
+    "imx296": 3.45e-3,
+}
+
+
 class Picamera2Source(CameraSource):
     def __init__(self, cfg: CameraConfig) -> None:
         super().__init__(cfg)
@@ -73,6 +89,25 @@ class Picamera2Source(CameraSource):
         # stream ACTUALLY is. Admission checks against this and nothing else.
         self._raw_negotiated: dict[str, Any] = {
             "format": "", "size": (0, 0), "stride": None}
+        # Negotiated, like the raw stream, and for the same reason. Each is a
+        # DIFFERENT quantity and the review that prompted this is explicit that
+        # collapsing them is the defect:
+        #
+        #   _sensor_res         the physical pixel array
+        #   _raw_negotiated     the raw stream: sensor-mode output
+        #   _main_negotiated    the processed full-size stream
+        #   _lores_negotiated   the preview stream
+        #   oriented_size(...)  what a consumer actually holds, after rotation
+        self._sensor_res: tuple[int, int] = (0, 0)
+        self._main_negotiated: dict[str, Any] = {}
+        self._lores_negotiated: dict[str, Any] = {}
+        # Where each size came from, and whether the driver adjusted it.
+        self._geometry_notes: list[str] = []
+        # The sample depth of the selected sensor mode, and its provenance.
+        # None means the driver gave no mode information, in which case the
+        # format name's nominal depth is used and says so.
+        self._sample_bits: int | None = None
+        self._sample_bits_source: str = "format-name"
         # True only if a failed startup could not give the device back. Reported
         # rather than assumed away: it changes the recovery advice from "fix the
         # config" to "restart the service".
@@ -174,8 +209,15 @@ class Picamera2Source(CameraSource):
 
     def _configure_and_start(self, picam: Any) -> None:
         sensor_res = picam.sensor_resolution
-        full = tuple(self.cfg.full_resolution or sensor_res)
-        self._full_res = (int(full[0]), int(full[1]))
+        self._sensor_res = (int(sensor_res[0]), int(sensor_res[1]))
+        requested_main = tuple(self.cfg.full_resolution or sensor_res)
+        requested_main = (int(requested_main[0]), int(requested_main[1]))
+        requested_lores = tuple(self.cfg.preview_resolution)
+        requested_lores = (int(requested_lores[0]), int(requested_lores[1]))
+        # Provisional. Replaced by the NEGOTIATED size after `configure`; see
+        # `_read_back_streams`. Set here only so a failure between this point
+        # and the read-back has something to log.
+        self._full_res = requested_main
 
         # The mono IMX296 advertises an R8/R10 raw format; the colour part
         # advertises a Bayer pattern. Detect rather than assume, because the
@@ -194,8 +236,8 @@ class Picamera2Source(CameraSource):
             raw_stream["format"] = chosen
 
         config = picam.create_video_configuration(
-            main={"size": self._full_res},
-            lores={"size": tuple(self.cfg.preview_resolution), "format": "YUV420"},
+            main={"size": requested_main},
+            lores={"size": requested_lores, "format": "YUV420"},
             raw=raw_stream,
             buffer_count=4,
         )
@@ -213,6 +255,20 @@ class Picamera2Source(CameraSource):
         #     native size. Checking a raw buffer against the main resolution
         #     happens to work only while the two are equal.
         self._raw_negotiated = self._read_back_raw(picam)
+        # ...and the same for main and lores, which until 11 October were never
+        # read back at all. `describe()` reported the REQUEST, so a driver that
+        # adjusted a size -- to an alignment constraint, a mode limit, or a
+        # format's own rules -- left every consumer of `full_resolution`
+        # working against a frame that does not exist: the MLA reference frame,
+        # the readiness checks, the recording plan's geometry, the session
+        # manifest and the click-to-sensor mapping. On this rig the request is
+        # honoured, which is exactly why it never showed.
+        self._read_back_streams(picam, requested_main, requested_lores)
+        # The sample depth from the SELECTED SENSOR MODE, which is a different
+        # quantity from the container width in the format's name. See
+        # `_mode_sample_bits` and rawformat.admit's `sample_bits`.
+        self._sample_bits, self._sample_bits_source = self._mode_sample_bits(
+            picam, str(self._raw_negotiated.get("format") or ""))
 
         if "MONO" in str(self._raw_negotiated.get("format", "")).upper():
             # A configured mono sensor reports a MONO_* raw format. That is a
@@ -555,10 +611,18 @@ class Picamera2Source(CameraSource):
             # The gate that matters: the delivered samples have bits above the
             # low eight to discard, so the storage reduction has something to
             # do. See ladder.shift_to_eight.
-            "delivered_bits": getattr(classify(negotiated), "bits", None),
+            #
+            # From the SENSOR MODE where the driver states it, falling back to
+            # the format name. Taking it from the name was wrong for exactly
+            # the case the portability review separates out: a 12-bit sensor
+            # negotiated as R16 reports 16 here, which would offer an "8-bit"
+            # rung that discards 8 real bits instead of 4 and call the result
+            # a reduction from a depth the sensor never had.
+            "delivered_bits": self._delivered_bits(),
+            "delivered_bits_source": self._sample_bits_source,
             "reducible_to_eight": bool(
                 (f2 := classify(negotiated)) and f2.admissible
-                and (f2.bits or 0) > 8),
+                and (self._delivered_bits() or 0) > 8),
             "negotiated_admissible": bool(
                 (f := classify(negotiated)) and f.admissible),
         }
@@ -667,6 +731,115 @@ class Picamera2Source(CameraSource):
                  self.cam_id, chosen)
         return chosen
 
+    def _read_back_streams(self, picam: Any, requested_main: tuple[int, int],
+                           requested_lores: tuple[int, int]) -> None:
+        """What the driver negotiated for `main` and `lores`, not what we asked.
+
+        Added 11 October, for the same reason `_read_back_raw` exists and the
+        same failure mode: a request is not a result. The difference is that a
+        substituted raw FORMAT changes the meaning of every value and is caught
+        loudly, while an adjusted main or lores SIZE changes nothing visible --
+        the arrays are simply a different shape from the one `describe()`
+        advertises, and everything built on `full_resolution` is then describing
+        a frame that does not exist.
+
+        A driver adjusts these for ordinary reasons: stream alignment, a mode's
+        output limits, a format's own constraints. So an adjustment is a
+        warning and a recorded note, not a refusal -- but it must be the
+        negotiated size that is reported onwards.
+        """
+        self._geometry_notes = []
+        try:
+            cfg = picam.camera_configuration()
+        except Exception as exc:                          # noqa: BLE001
+            # Not fatal: the raw stream is what admission needs and that has
+            # already been read back. Recorded so the geometry block says the
+            # sizes are the requested ones rather than implying otherwise.
+            self._main_negotiated = {"size": requested_main, "source": "requested"}
+            self._lores_negotiated = {"size": requested_lores, "source": "requested"}
+            self._geometry_notes.append(
+                f"the driver did not report its stream configuration "
+                f"({type(exc).__name__}), so main and lores are the sizes that "
+                f"were requested and not confirmed")
+            self._full_res = requested_main
+            return
+
+        def one(name: str, requested: tuple[int, int]) -> dict[str, Any]:
+            block = dict((cfg or {}).get(name) or {})
+            size = block.get("size")
+            if not size:
+                self._geometry_notes.append(
+                    f"the driver reports no {name} stream, so its size is the "
+                    f"requested {requested[0]}x{requested[1]}, unconfirmed")
+                return {"size": requested, "source": "requested"}
+            got = (int(size[0]), int(size[1]))
+            out = {"size": got, "source": "negotiated",
+                   "format": str(block.get("format") or ""),
+                   "requested": list(requested)}
+            if block.get("stride"):
+                out["stride"] = int(block["stride"])
+            if got != requested:
+                note = (f"{name} was requested at {requested[0]}x{requested[1]} "
+                        f"and the driver negotiated {got[0]}x{got[1]}")
+                self._geometry_notes.append(note)
+                log.warning("%s: %s -- the negotiated size is what is used",
+                            self.cam_id, note)
+            return out
+
+        self._main_negotiated = one("main", requested_main)
+        self._lores_negotiated = one("lores", requested_lores)
+        # The authority from here on.
+        self._full_res = tuple(self._main_negotiated["size"])      # type: ignore[assignment]
+
+    def _mode_sample_bits(self, picam: Any,
+                          negotiated_format: str) -> tuple[int | None, str]:
+        """The SAMPLE depth of the selected sensor mode, if the driver says.
+
+        `sensor_modes` carries `bit_depth` per mode, which is the sensor's own
+        statement about its samples. The format name carries the CONTAINER
+        width: `R16` and `SBGGR16` are 16-bit words and a 12-bit sensor
+        delivering into them is the ordinary Pi 5 case, not an exotic one.
+
+        Matched on the negotiated format against each mode's `format` and
+        `unpacked` names. When several modes share a name -- different sizes at
+        the same format -- the negotiated raw SIZE disambiguates. When nothing
+        matches, or the modes disagree about the depth for one format, this
+        returns None and the format name's nominal depth is used, labelled as
+        such. A guess here would set the scale of every value in the archive.
+        """
+        try:
+            modes = list(getattr(picam, "sensor_modes", None) or [])
+        except Exception:                                 # noqa: BLE001
+            return None, "format-name"
+        if not modes:
+            return None, "format-name"
+
+        want = negotiated_format.upper()
+        size = tuple(self._raw_negotiated.get("size") or ())
+        candidates = []
+        for mode in modes:
+            names = {str(mode.get("format") or "").upper(),
+                     str(mode.get("unpacked") or "").upper()}
+            if want and want in names:
+                candidates.append(mode)
+        if size:
+            exact = [m for m in candidates
+                     if tuple(m.get("size") or ()) == size]
+            if exact:
+                candidates = exact
+
+        depths = {int(m["bit_depth"]) for m in candidates
+                  if m.get("bit_depth")}
+        if len(depths) == 1:
+            return depths.pop(), "sensor-mode"
+        if len(depths) > 1:
+            log.warning(
+                "%s: the sensor advertises %s for format %s at several depths "
+                "(%s); using the depth the format name implies and recording "
+                "that it was not established",
+                self.cam_id, "modes", negotiated_format, sorted(depths))
+        return None, "format-name"
+
     def _read_back_raw(self, picam: Any) -> dict[str, Any]:
         """What the driver ACTUALLY negotiated for the raw stream (R5).
 
@@ -774,6 +947,10 @@ class Picamera2Source(CameraSource):
                 data, fmt_name, neg.get("size") or self._full_res,
                 stride_bytes=neg.get("stride"),
                 alignment=self.cfg.raw_alignment,
+                # The sensor's own depth where the driver states it. The
+                # format name is the container width and nothing more.
+                sample_bits=self._sample_bits,
+                sample_bits_source=self._sample_bits_source,
             )
         except RawFormatError as exc:
             hatch = bool(getattr(self.cfg, "allow_unvalidated_raw", False))
@@ -805,6 +982,104 @@ class Picamera2Source(CameraSource):
                 "; ".join(got.reservations))
         return got.array, dict(got.meta), got.validity
 
+    def _delivered_bits(self) -> int | None:
+        """The sample depth in force: the sensor mode's, else the format's."""
+        if self._sample_bits:
+            return int(self._sample_bits)
+        fmt = classify(str((self._raw_negotiated or {}).get("format") or ""))
+        return getattr(fmt, "bits", None)
+
+    def _lores_size(self) -> tuple[int, int]:
+        size = (self._lores_negotiated or {}).get("size")
+        if size:
+            return (int(size[0]), int(size[1]))
+        return (int(self.cfg.preview_resolution[0]),
+                int(self.cfg.preview_resolution[1]))
+
+    def geometry(self) -> dict[str, Any]:
+        """Every size this camera has, separately, with its provenance.
+
+        Five quantities, because they are five quantities. Collapsing them
+        into `full_resolution` and `preview_resolution` is what made a
+        driver-adjusted stream invisible, and it is also what makes a crop or a
+        binned mode indistinguishable from a resize for anything downstream
+        that needs to know which happened.
+        """
+        turns = self.quarter_turns
+        raw_size = tuple((self._raw_negotiated or {}).get("size") or (0, 0))
+        main_size = tuple(self._full_res)
+        lores_size = self._lores_size()
+        return {
+            "sensor": list(self._sensor_res),
+            "raw": {
+                "size": list(raw_size),
+                "format": str((self._raw_negotiated or {}).get("format") or ""),
+                "stride_bytes": (self._raw_negotiated or {}).get("stride"),
+                "source": "negotiated",
+            },
+            "main": dict(self._main_negotiated or {}),
+            "lores": dict(self._lores_negotiated or {}),
+            "oriented_main": list(self.oriented_size(main_size)),
+            "oriented_lores": list(self.oriented_size(lores_size)),
+            "quarter_turns": turns,
+            # True when the raw stream and the processed stream are the same
+            # size, which is the only case in which a coordinate in one is a
+            # coordinate in the other. On this rig they are equal; that is a
+            # property of this configuration, not a rule.
+            "raw_matches_main": list(raw_size) == list(main_size),
+            "sample_bits": self._sample_bits,
+            "sample_bits_source": self._sample_bits_source,
+            "notes": list(self._geometry_notes),
+        }
+
+    def pixel_pitch(self) -> tuple[float | None, str]:
+        """Physical pixel pitch in mm, and where the number came from.
+
+        Order of precedence, and each step is recorded rather than blended:
+
+          1. `pixel_pitch_mm` in the camera config -- an explicit operator
+             statement, which beats a driver whose tuning file may be wrong;
+          2. `UnitCellSize` from the camera properties, which the Picamera2
+             guide documents as an x/y size in NANOMETRES;
+          3. a documented per-model value, keyed on the reported model, for a
+             driver that does not publish the property;
+          4. **not established.**
+
+        Step 4 is the point of the whole function. The pitch was a module
+        constant -- the IMX296's 3.45 um -- used in the focal-length and
+        baseline arithmetic, so any other sensor silently inherited it and
+        produced plausible millimetres that were wrong by the ratio of the
+        pitches. A value that is not established must be reported as
+        unavailable, never substituted.
+
+        A non-square pixel is reported with a note and the x pitch, because
+        every downstream formula here assumes one pitch; that assumption is
+        now visible instead of implicit.
+        """
+        configured = getattr(self.cfg, "pixel_pitch_mm", None)
+        if configured:
+            return float(configured), "config:pixel_pitch_mm"
+
+        cell = self._info.get("UnitCellSize")
+        if cell:
+            try:
+                x_nm, y_nm = float(cell[0]), float(cell[1])
+            except (TypeError, ValueError, IndexError):
+                x_nm = y_nm = 0.0
+            if x_nm > 0:
+                if abs(x_nm - y_nm) > 1e-6:
+                    log.warning(
+                        "%s: UnitCellSize is %g x %g nm, which is not square; "
+                        "the derived optics assume one pitch and will use the "
+                        "x value", self.cam_id, x_nm, y_nm)
+                return x_nm * 1e-6, "driver:UnitCellSize"
+
+        model = str(self._info.get("Model", "")).lower()
+        known = KNOWN_PIXEL_PITCH_MM.get(model)
+        if known:
+            return known, f"table:{model}"
+        return None, "unknown"
+
     def describe(self) -> CameraInfo:
         return CameraInfo(
             cam_id=self.cam_id,
@@ -816,8 +1091,15 @@ class Picamera2Source(CameraSource):
             # makes them different, and the MLA reference frame, the readiness
             # checks and the session manifest all read from here.
             full_resolution=self.oriented_size(self._full_res),
-            preview_resolution=self.oriented_size(tuple(self.cfg.preview_resolution)),
+            # The NEGOTIATED lores size, not the configured one. It reported
+            # the request until 11 October, so a driver that adjusted the
+            # preview stream left every click-coordinate mapping scaled by the
+            # ratio between a size that was asked for and one that arrived.
+            preview_resolution=self.oriented_size(self._lores_size()),
             mono=self._mono,
+            geometry=self.geometry(),
+            pixel_pitch_mm=self.pixel_pitch()[0],
+            pixel_pitch_source=self.pixel_pitch()[1],
             detail={
                 **{k: str(v) for k, v in self._info.items()},
                 "dropped_controls": ", ".join(self._dropped_controls) or "none",

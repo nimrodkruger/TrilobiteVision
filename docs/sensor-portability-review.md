@@ -1,329 +1,403 @@
-# Sensor portability — review strategy
+# Sensor portability — whole-stack review process
 
-**Status:** proposal for review. **No code changes are proposed by this
-document.** It sets out what must be true before the sensors are swapped, how
-each claim can be checked, and what the supervisor is being asked to decide.
+**Status:** revised review plan; not a portability certification or an application
+patch. **Updated:** 11 October 2026. **Source check:** `c3aa989`.
 
-**Date:** 10 October 2026
-**Scope:** backend only. The user interface is explicitly out of scope: the
-dashboard takes its geometry from the cameras at run time and must continue to,
-so "the UI works with the new sensor" is a consequence to verify, not work to
-do. Candidate sensors are restricted to those supported by libcamera on
-Raspberry Pi OS.
+This revision corrects the 10 October proposal after targeted source inspection.
+It defines how to conduct the full sweep, what evidence to collect and what
+counts as support. The full code review, test matrix and hardware trials have
+not yet been performed. Keep this proportionate to a research rig: extend the
+existing tests and metadata, fix demonstrated gaps, and avoid a new framework
+unless a concrete limitation requires it.
 
----
+## 1. Purpose and scope
 
-## 1. What is being proposed, and why
+The user is considering replacement sensors because the current sensor format
+is unsuitable. Row noise is a separate unresolved investigation, not an assumed
+cause or a prerequisite for portability work. Record candidate optical-format,
+resolution and sampling requirements without making sensor selection dependent
+on resolving noise first.
 
-The current heads are two mono global-shutter **IMX296** (1456 × 1088,
-10-bit). The reason to change is **row noise** — the horizontal banding that
-has been visible since the earliest captures and that survived a cable swap, a
-different SD card and the Stage 2 format work. The proposal is to move to a
-sensor with better row-noise behaviour.
+**The scope is the entire stack:** installation and camera identification,
+configuration, acquisition, processing, calibration interfaces, preview/UI/API,
+stills, burst and continuous recording, storage, export, Python and MATLAB
+readers, saved-state restoration and diagnostics. The UI cannot be excluded:
+incorrect options, coordinate mapping or old settings can invalidate an
+otherwise correct backend. This calls for functional checks, not a UI redesign.
 
-Two things follow immediately, and they are the reason this document exists
-rather than a patch:
+The initial integration target is **Raspberry Pi 5 CSI cameras exposed through
+the supported Picamera2/libcamera stack on a recorded Raspberry Pi OS build**.
+A compatible connector or vendor claim does not establish application support.
+Include vendor drivers/overlays where a candidate needs them, but test and
+identify that software combination separately. USB/UVC cameras, bridges and
+vendor-only APIs are not automatically covered by this adapter; list such a
+candidate as requiring a separate backend review rather than quietly excluding
+it or calling it supported.
 
-- **A sensor swap is not a configuration change.** It changes the frame size,
-  very likely the sample depth, possibly the colour filter, certainly the
-  frame-rate limits, and possibly the shutter type. Every one of those is
-  carried through the software, the stored files and both readers.
-- **The row noise has not been attributed.** Changing sensors to fix an
-  artefact whose cause is unestablished is a plausible move and an expensive
-  one, and if the cause is in the CSI-2 link, the supply, or the PiSP
-  pipeline rather than the sensor, a new sensor will show it too. §8 treats
-  this as the first question, before any of the portability work.
+Do not narrow the review to mono sensors. Cover mono and Bayer acquisition and
+storage; assess colour-specific scientific processing separately. Likewise,
+rolling shutter does not make a camera software-incompatible. Record its
+measurement limitations without presenting global shutter as a universal rule.
 
----
+## 2. Replace the universal claim with a verifiable one
 
-## 2. The claim to be reviewed
+The goal is that a sensor or mode change within a supported capability set
+requires configuration and renewed calibration, not sensor-specific application
+code. The whole application need not know a model name, but it **must** know
+what its streams and samples mean. A new format or vendor backend can require
+an implementation extension; discovering that is a review result.
 
-The claim this document asks the supervisor to test is:
+A useful support record is one row per **camera module + driver/software build
++ sensor mode + output format + single/dual-head configuration**. Record preview,
+stills, burst, continuous recording, export, Python, MATLAB and relevant
+scientific operations separately. Use these evidence labels:
 
-> **Nothing in the software stack needs to know which sensor is attached.**
-> Geometry, sample depth, raw format, control set and frame-rate limits are all
-> discovered from the camera at open time and carried with the data; a
-> different Pi-compatible sensor requires a configuration file change and no
-> source change.
+- **Verified:** the claimed operation passed its automated and applicable real
+  Pi tests for this configuration.
+- **Desktop-tested / hardware pending:** simulated or fixture evidence only.
+- **Limited:** supported operations and restrictions are explicitly named.
+- **Unsupported:** the operation is unavailable with a clear reason.
 
-That claim is **mostly true today and not entirely true**, and the value of
-reviewing it before the hardware changes is that the exceptions are cheap to
-find now and expensive to find with a half-built rig on the bench.
+A safe refusal is a successful negative test, **not interoperability for that
+operation**. A camera that previews but cannot record is not fully supported.
+For a candidate to be called fully interoperable, every agreed required
+operation must be verified on its intended configuration. No finite review can
+certify every present or future Pi-compatible sensor from fake-camera tests.
 
-The claim decomposes into five propositions, each of which can be tested:
+## 3. Corrections to the original inventory
 
-| # | Proposition | How it is tested |
+These are source observations or review targets, not a completed defect list.
+Each must be confirmed with a focused test during the sweep.
+
+| ID | Observation in the current tree | Correction to the review process |
 |---|---|---|
-| P1 | Frame geometry comes from the camera, never from a constant | §4 inventory + the matrix in §6 |
-| P2 | Sample depth and raw format are established per sensor, not assumed | §5.2, existing Stage 2 admission tests |
-| P3 | Nothing in the processing or storage path breaks on a different frame shape | §6 matrix |
-| P4 | Both readers open files from the new sensor with no edit | §6 matrix, round-trip |
-| P5 | The dashboard renders and controls the new sensor with no edit | §6 matrix, browser scenarios |
+| S1 | `calibration/settings.py` defines `PIXEL_PITCH_MM = 3.45e-3`, used in focal-length/baseline calculations and inverse conversion. | Search physical constants and units as well as image dimensions. A new sensor must not inherit IMX296 physical pitch. Require a per-head value with a source, or report the derived metric as unavailable. |
+| S2 | `_full_resolution()` in that file returns `(1456, 1088)` after missing information or an exception. | Test unopened/failed cameras. A placeholder may support layout, but must never enable calibration or be persisted as measured geometry. |
+| S3 | The class is `Picamera2Source`. `_configure_and_start()` requests main/raw/lores; `_read_back_raw()` reads actual raw configuration. `describe()` reports `_full_res` and configured preview size. `CameraRuntime.start()` uses that description to register recording geometry. | There is not yet a demonstrated single actual-geometry source for all streams. Trace raw, main, lores, oriented display and stored recording sizes separately, including driver-adjusted requests. |
+| S4 | `KNOWN_FORMATS` includes mono `R16`, but Bayer entries are only 10/12-bit names and their packed forms. | The old inventory omitted R16. Test actual Pi 5 negotiation, including Bayer 16-bit containers. Adding an allowlist name alone is not proof of decoding, sample depth, alignment or reader support. |
+| S5 | `_admit_raw()` supplies a format, size, stride and configured alignment to `admit()`; nominal depth comes from the format table. | Verify the connection from selected sensor-mode bit depth to container interpretation and downstream reduction. A 16-bit container must not be mistaken for a 16-bit sensor sample. |
+| S6 | `recording/manager.py:common_geometry()` rejects unequal head sizes; a common plan and `_store_shift` are shared. | Test equal-size heads with different depths/alignment as well as unequal sizes. Mixed-head support is a real gap to assess, not already satisfied by a refusal. Trace bytes, reduction and metadata per head. |
+| S7 | `recording/ladder.py` defaults exact storage to uint16; its 8-bit option is explicitly a lossy reduction. `reduce_to_store()` performs that reduction in Python despite older module comments. | Audit native 8-bit exact recording separately from reducing deeper samples. Native 8-bit input is not inherently diagnostic. Verify actual output dtype and file size, not the option label or comments. |
+| S8 | `app.py` restores state by logical `cam_id`; capabilities are captured at open. | Check replacement under the same name, reordered camera indices and mode changes. Stale controls, geometry, capabilities and calibration must not silently transfer. |
+| S9 | `scripts/probe_cameras.py` includes IMX296-specific overlay advice. | Include diagnostics, deployment configuration and operator instructions in the sweep. Advice for one sensor must not configure a replacement as an IMX296. |
+| S10 | Recording round-trip fixtures already use 128 × 96, and other tests use small synthetic frames. | The suite does not prove only one geometry. Inventory actual coverage before adding tests; a small synthetic frame still does not exercise real raw-byte negotiation. |
 
----
+The original bandwidth example was low by a factor of two: two 4056 × 3040
+heads at 30 fps stored as uint16 require
+`4056 × 3040 × 2 bytes × 30 × 2 = 1,479,628,800 bytes/s`, about **1.48 GB/s**
+before overhead; about 740 MB/s is one head. This is an illustrative workload,
+not evidence that a particular module offers full resolution at 30 fps. Use
+actual mode/rate combinations and measured storage performance.
 
-## 3. Where geometry comes from today
+## 4. What the reviewer must trace
 
-There is a single source of truth, and it is worth stating because most of the
-portability argument rests on it.
+For every advertised operation, follow one identifiable frame from the driver
+to its final reader/display. At each boundary record the producer, consumer,
+geometry, representation, transformations, metadata and failure outcome. Review
+all callers, not only the preferred capture route.
 
-```
-picamera2 → PiCameraSource._configure_and_start()
-              full  = cfg.full_resolution or picam.sensor_resolution
-              raw   = picam.sensor_resolution, format from _choose_raw_format()
-              → read back from picam.camera_configuration()["raw"]
-          → CameraInfo (describe())  ← every consumer asks here
-```
+### 4.1 Discovery, modes and camera identity
 
-`CameraInfo.full_resolution` and `.preview_resolution` are what the pipeline,
-the MLA stage, the calibration settings, the recording plan and the web layer
-all use. `config.full_resolution` is an **override**, not a declaration: left
-unset, the sensor's own resolution is used. That is already the right design
-for portability.
+Inventory `config.py`, camera adapters/registry, `app.py`, `state.py`, deployed
+YAML/service/overlay configuration and camera diagnostic scripts. Collect:
 
-Three properties of the existing design that a swap depends on, all of which
-were built for other reasons and happen to carry the weight here:
+- Logical head name, enumerated camera ID/model and available stable device or
+  port identity. Indices can change; a model name alone cannot distinguish two
+  identical modules. Explain identity limits where serial numbers are absent.
+- OS/kernel, firmware, Picamera2, libcamera, rpicam-apps and vendor driver/tuning
+  versions. Record requested settings and post-configuration results separately.
+- Mode list, selected sensor mode, crop/readout region, bit depth, frame-duration
+  range and actual raw/main/lores formats, sizes, strides and buffer layout.
+- Optional features: autofocus, automatic exposure/white balance, HDR and
+  sensor-specific controls. These are capabilities, not obligations to implement
+  every feature. Unknown advanced modes must not silently alter raw meaning.
 
-- **The raw format is read back, not assumed** (Stage 2, review item R5). What
-  the driver negotiated is what admission checks against. A new sensor
-  advertising a format this code has not seen is refused with a message naming
-  the format, rather than silently misread — which is the behaviour that
-  matters most during a swap.
-- **Controls are intersected with what the sensor advertises.**
-  `_split_controls` drops unknown controls with a warning instead of aborting,
-  which is what lets one config file serve a mono and a colour rig.
-- **Mono is detected, not configured** — from the raw format string and then
-  firmed up from the negotiated format.
+Full physical sensor resolution, sensor-mode output, main-stream resolution
+and preview resolution are different concepts. Test negotiation where all
+three streams differ. Requesting native size is not proof of the actual mode;
+selecting the widest advertised bit depth must not pick an incompatible size
+or rate. Re-query mode-dependent capabilities after reconfiguration.
 
----
+Check camera loss/start failure and clean stop/restart with a different sensor.
+A failed candidate must not strand the other head or resurrect old capabilities.
+Reuse the owner model and existing failure tests; do not start concurrent SDK
+access merely to probe capabilities.
 
-## 4. Inventory of sensor-specific assumptions
+### 4.2 Raw interpretation and numerical meaning
 
-Graded by what happens if the new sensor differs. This is the part the
-supervisor should check hardest, because it is the list that decides whether
-the swap is a config edit or a sprint.
+Review `cameras/rawformat.py`, still and `read_raw()` paths, `Frame`/`RawRead`,
+recording conversion, stored metadata and both readers as one contract.
 
-### 4.1 Would silently produce wrong results
+Keep distinct: sensor sample depth, container bits, dtype, byte order, packing,
+compression, alignment, valid image width, byte stride and Bayer order. Preserve
+source evidence and any reservations across every save/read/export path.
 
-| Where | Assumption | Consequence |
+The Picamera2 guide documents Pi 5 unpacked output in left-shifted 16-bit words,
+including Bayer names such as `SBGGR16`; sensor depth is obtained separately
+from sensor configuration. It also documents configuration-dependent control
+limits. Check the deployed versions rather than inferring either from the
+requested format or old IMX296 fixtures. [Picamera2 guide, raw stream configuration and controls](https://datasheets.raspberrypi.com/camera/picamera2-manual.pdf)
+
+Require exact expected values for supported lossless paths. Test zero, saturation,
+low-bit patterns and byte-order markers, not just natural-looking pictures or
+matching shapes. For deliberate 8-bit reduction verify the defined shift,
+error bound, dtype and recorded loss. Missing depth/alignment must not become
+an unexplained cast. Distinguish unchanged native-8 data from reduced data.
+
+Audit display normalisation, clipping, histogram/statistics and calibration
+thresholds for fixed count ranges. Carry black/white-level information and its
+scale when established; missing levels are not a reason to invent IMX296
+defaults. Raw counts are not automatically comparable radiometry across sensors.
+Check ISP RGB/BGR/YUV channel ordering separately from raw, and record any
+tuning, HDR or other processing that changes output meaning. Keep native
+metadata types/units intact through JSON conversion, including optional fields
+and enum-valued controls.
+
+Known packing/compression is not automatically decodable: exercise advertised
+but unsupported modes and the diagnostic escape path. Require an explicit
+supported conversion or a visible restriction; diagnostic bytes must never be
+promoted to measurements. An attractive image is not proof that every row or
+sample has the right meaning.
+
+Do not call stride handling generic solely because it uses arithmetic. Test
+negotiated padding beyond the current 256-byte bound, missing stride, byte views,
+uint16 views, non-contiguous arrays and malformed rows. The core admission
+fallback currently uses a bounded padding allowance; it is not a universal
+64-byte rule. Audit separate legacy-reader heuristics too.
+
+### 4.3 Geometry, physical units and saved calibration
+
+Trace `orientation.py`, `optics/mla.py`, processing stages, calibration settings/
+sessions, state restoration and the readers. Use coordinates in explicitly
+named spaces: physical array, active mode/crop, raw pixels, oriented pixels,
+main/preview and display coordinates. Width-only scaling cannot establish an
+arbitrary crop, aspect-ratio change, binning or transform.
+
+A crop changes origin/field of view, not physical pixel pitch. Binning or
+subsampling changes sampling; main-stream resizing is a separate operation.
+Record the relevant mapping rather than calling all three a pitch change.
+
+Where available, the guide describes `UnitCellSize` as an x/y size in nanometres
+and `ScalerCrop` in full-sensor coordinates. Allow a documented module-specific
+physical value when the driver lacks it; preserve units and origin of evidence.
+Do not invent a value from image width. [Picamera2 guide, camera properties](https://datasheets.raspberrypi.com/camera/picamera2-manual.pdf)
+
+On a module, mode, crop or relevant orientation change, old MLA/calibration
+settings are candidates for reuse, not accepted calibration. Test a new sensor
+with **the same dimensions but different physical pitch**. Preserve old data,
+mark incompatible settings as needing alignment/calibration and avoid silently
+rescaling them into a claim of validity. A harmless image-only resize may have
+an established transform; verify that specific case rather than migrating all
+calibrations or discarding all settings indiscriminately.
+
+For Bayer, preserve native and stored mosaic order through crop parity, flips
+and 90-degree rotations. Test all four common Bayer patterns with recognisable
+colour samples. An ISP luma preview can work while raw Bayer is still mishandled.
+Keep exact raw acquisition distinct from colour rendering and MLA scientific
+processing; define which research operations are valid. Do not silently
+average, demosaic or treat a mosaic as mono sensor counts.
+
+### 4.4 Controls, timing and browser/API behaviour
+
+Review control discovery, validation, application and readback, including
+`raw_capabilities()`, `request_frame_rate()`, the recording rate choices and
+web endpoints. Test absent controls, unsupported enum values, numeric bounds,
+invalid requests, accepted-but-clamped settings and delayed effective values.
+Optional unsupported controls can be disabled with explanation; a required
+recording-rate request cannot be silently dropped.
+
+Use the current mode's capability ranges and exposure constraints for proposed
+rates, then verify observed timestamps/rate. For dual heads, test the common
+feasible rate and rollback if only one accepts a change. Lowering FPS does not
+by itself guarantee longer exposure, uniform delivery or less read noise.
+
+Preserve original timestamps, units, documented event/clock interpretation and
+host timing separately. Test absent or repeated metadata and distinguish
+application sequence counts from driver exposure sequence. Global versus
+rolling shutter belongs in the data record; readout timing may remain unknown.
+Do not infer synchronisation or correct rolling-shutter motion from two similar
+frame timestamps. Missing metadata limits a measurement, not necessarily viewing.
+
+Browser checks include aspect ratio, orientation, overlays/click coordinates,
+per-camera control ranges, actual recording options, byte/duration estimates,
+unsupported-operation messages and stale controls after a swap. No new dashboard
+architecture is required. Include API calls that bypass the visible controls.
+
+### 4.5 Recording, storage, export and readers
+
+Trace `recording/{manager,ladder,buffer,burst,continuous,chunks,preflight}.py`,
+application handoffs, storage and every currently offered export. The working
+chunk-based recording path is part of scope; do not assume everything is AVI
+because it was requested in an earlier plan. Review AVI/FFV1 only where offered,
+or label it unimplemented rather than silently adding a feature to this sweep.
+
+For each head use its actual delivered shape/dtype, sample interpretation,
+orientation convention, rate and source identity. Budget dual-camera RAM and
+throughput as the **sum of each head's costs**. Exercise different shapes,
+equal shapes with different depths, different orientations, different rate
+limits and mono/Bayer pairs. A common-plan restriction is a finding to remove
+for required mixed-head operation, or an explicit limitation preventing that
+claim. Verify any suggested single-head workaround is actually selectable.
+
+Test burst sizing and flush/retry, continuous queue/drop policy, chunk boundaries,
+partial final chunks, start/stop and reset of capabilities after a swap. Re-run
+slow/full/lost-storage protection with larger frames; external-only policy and
+its explicit internal-storage override remain unchanged. Neither an allocation
+that returns nor an empty preflight buffer proves the real workload fits.
+
+Verify `scripts/read_capture.py`, `tv_read_capture.m`, `tv_read_recording.m`,
+`tv_recording_frame.m` and any remaining public loaders/exports against the same
+small golden files. Check pixels, dtype, channel/mosaic layout, row/column order,
+orientation exactly once, numerical scale, per-head metadata, validity, timestamps
+and frame accounting. Missing/unknown schema or capability fields must produce
+an explicit inspection/unsupported result, not new sensor defaults. Opening a
+file without an exception is not a round-trip test.
+
+## 5. Test design — layers, not one large Cartesian product
+
+### Layer A: current coverage and contract tests
+
+First map existing tests to the contracts above. Search for model names,
+dimensions, physical constants, count ceilings, bit shifts, byte alignment,
+mono/channel assumptions, control names and fixed rate limits. Classify hits as
+runtime assumptions, intentional defaults, fixtures or accurate examples.
+
+**Replace the original 'grep must be empty' rule.** Legitimate IMX296 regression
+fixtures and labelled examples should remain. Test that changing capabilities
+changes behaviour correctly; use an allowlisted/static check only for a specific
+regression if it adds value. A keyword scan cannot establish portability.
+
+### Layer B: fake Picamera2/driver at the adapter boundary
+
+A richer synthetic source alone bypasses `_configure_and_start()` and decoding.
+Use a fake SDK exercising the **real adapter**, with separate requested and
+negotiated configurations, real-shaped byte buffers, per-mode controls and
+metadata. Independently construct the expected output; do not generate it using
+the same trimming/shift helper being tested. Simulate driver substitutions,
+missing properties and buffers invalidated/reused after release. Test startup
+cleanup and configuration changes without hardware.
+
+### Layer C: representative end-to-end matrix
+
+Use small equivalent images for most unit tests and selected realistic sizes
+for integration/resource tests. These are capability fixtures, not promises
+that physical cameras expose every combination:
+
+| Case | Deliberate difference | Required evidence |
 |---|---|---|
-| `calibration/settings.py:_full_resolution` | falls back to `(1456, 1088)` when `describe()` raises | detection geometry computed against the wrong frame; corner coordinates wrong by the ratio, and nothing says so. The fallback exists so the UI can render before a camera opens, which is reasonable — returning the wrong numbers silently is not. |
-| MLA geometry (`optics/mla.py`, `processing/stages/plenoptic.py`) | pitch and offset are stored in **sensor pixels** against a recorded `reference_width` | already rebased with a warning when the frame size changes, which covers a sensor swap — **but the rebase is a scale, and a different pixel pitch is not a scale.** See §7. |
-| `config.yaml` as deployed | `full_resolution` and `preview_resolution` set explicitly | a stale explicit size silently crops or upscales the new sensor. The override is the hazard, not the mechanism. |
+| A | Current IMX296 mode and real recorded layout | Baseline still + both recording paths + readers remain unchanged. |
+| B | Wide versus tall/non-default main/raw/preview sizes | Correct mappings, no hidden crop/upscale or wrong recording buffer. |
+| C | 10/12-bit samples in LSB/MSB uint16, plus true 16-bit fixtures | Exact values; sensor depth distinguished from container depth; correct reduction. |
+| D | Native uint8, e.g. 640 × 480 | Exact recording/readback; no mandatory lossy conversion or incorrect memory estimate. |
+| E | Odd image size, e.g. 1457 × 1089; boundary padding | Array/reader mapping exact; formats such as YUV420 may reject or negotiate an even size explicitly, never silently truncate. |
+| F | Bayer RGGB/BGGR/GRBG/GBRG including negotiated `S*16` | Adapter acceptance where supported, exact mosaic storage and correct crop/rotation/channel semantics. |
+| G | Same output size, changed crop/binning/pixel pitch | Saved calibration is not silently accepted; physical quantities and coordinate origin stay correct. |
+| H | Two unlike heads: size, depth/alignment, mono/Bayer and rates varied selectively | Per-head plan/accounting and interpretation, or a documented support gap; no cross-head leakage. |
+| I | Missing/unsupported controls and formats; negotiated substitutions | Useful refusal or explicitly limited operation; no false science or recording-rate claim. |
+| J | Swap/reorder/restart, old state present, one camera absent | Correct head identity, settings invalidation, refreshed UI and surviving-head behaviour. |
 
-### 4.2 Would fail loudly (acceptable, but must be anticipated)
+Add byte-order, padding sentinels, distinct corner markers, per-head tags and
+known low-bit patterns to catch errors a photograph hides. Do not force physically
+invalid odd YUV modes to pass merely to satisfy case E. A deliberate rejection
+there is correct; loss of a valid raw edge column is not.
 
-| Where | Assumption | Consequence |
-|---|---|---|
-| `cameras/rawformat.py` `KNOWN_FORMATS` | an allowlist of `R8/R10/R12`, their packed forms, and Bayer `S*10/12` | a sensor whose negotiated format is outside the list refuses to open, naming the format. Correct behaviour; a 14-bit or 16-bit sensor needs a one-line addition plus its admission tests. |
-| `recording/ladder.py` | 8-bit storage requires delivered samples deeper than 8 bits | a genuinely 8-bit sensor simply stops offering the 8-bit rung. Correct. |
-| `recording/manager.py:common_geometry` | both heads report the same frame | a mixed pair refuses to arm a recording, by design |
-| `picam.request_frame_rate` | the driver exposes `FrameDurationLimits` and accepts the requested duration | refuses with the sensor's own accepted range. Correct, and the rate ladder in the UI will offer rates the new sensor may reject — see §6, M6. |
+### Layer D: independent readers and targeted fault injection
 
-### 4.3 Documentation and comments that will become wrong
+Run Python and MATLAB against the same golden outputs, including stored sensor
+orientation versus already-oriented frames, legacy files and reduced-depth
+recordings. If MATLAB/browser/hardware execution is unavailable, record **not
+run**, not passed or equivalent to a Python test.
 
-Roughly thirty references to `1456`, `1088`, `1472`, `2944` and "IMX296" in
-docstrings and comments across `rawformat.py`, `read_capture.py`,
-`tv_read_capture.m`, `tv_selftest.m`, `mla.py`, `orientation.py` and
-`plenoptic.py`. **These are explanations, not logic** — the stride arithmetic
-they illustrate is computed, not hardcoded. They still have to be revised,
-because a worked example in the wrong numbers is how the next person
-misunderstands the stride rule, and that rule is the one that already produced
-a session of white-noise frames.
+Use a handful of targeted fault injections or mutations only where they add
+confidence: wrong dtype/shift, leaked row padding, x/y transposition, wrong head
+metadata, stale calibration and silent FPS substitution. Do not remove an MLA
+'rebase' and require a failure indiscriminately: the right new-sensor behaviour
+may be to invalidate that calibration rather than rescale it.
 
-### 4.4 Tests
+## 6. Hardware verification and support evidence
 
-Hard-coded `1456 × 1088` appears in several test modules. Those are fixtures
-rather than assumptions, but they mean **the suite currently proves the stack
-works for one geometry**. §6 proposes fixing that, and doing it *before* the
-hardware changes is the single highest-value piece of work in this document.
+Desktop tests demonstrate contracts, not driver support, optical correctness
+or sustainable dual-camera performance. Verify **each candidate and each mode
+claimed for use**, first alone and then in the intended pair. Sampling a family
+can guide implementation but does not certify an untested module.
 
----
+1. Record module/port identity, hardware and software versions, overlays/tuning
+   and the unmodified current-rig baseline. Use `rpicam-hello --list-cameras`
+   on current Raspberry Pi OS (record any legacy command used on an older image).
+   Enumeration confirms attached devices, not every driver compiled into an OS.
+   [Raspberry Pi camera software documentation](https://www.raspberrypi.com/documentation/computers/camera_software.html)
+2. Save requested and actual sensor/raw/main/lores configurations, capabilities
+   and one original raw buffer with metadata. Confirm interpretation using an
+   independent supported capture/read path at the same mode and controls. Keep
+   these small captures as future adapter fixtures where practical.
+3. Exercise preview, settings changes, raw/processed stills, burst/flush and
+   continuous recording. Run both the normal experimental workload and its
+   declared maximum resolution/rate/duration, with both heads and normal previews.
+   Record actual rate, losses, RAM, temperature/throttling and write throughput.
+4. Reopen in Python and MATLAB and compare values/geometry to the retained
+   source evidence. Check frame timing and accounting, not only playback.
+5. Swap head assignments, restart with old state and test one absent camera.
+   Test a controlled source failure and storage failure; power off before
+   changing CSI connections. No live-ribbon reconnection requirement is implied.
+6. Record results and limitations in the support matrix. An unsupported format,
+   missing physical property or unattainable rate must remain visible in both
+   UI and saved metadata. Retest affected rows after driver/mode/format changes.
 
-## 5. The classes of difference a new Pi sensor can present
+Use numeric acceptance criteria for the claimed workload: exact pixels on
+lossless routes; correct dimensions/orientation and metadata; no silent losses;
+observed rate within a stated tolerance; bounded memory; no internal recording
+fallback without explicit permission. If controlled frame dropping is an offered
+mode, its count/gaps must reconcile; it is not a zero-loss result. Define those
+thresholds before the run rather than choosing them to fit the result.
 
-What the supervisor should expect to be asked about, in rough order of how much
-it costs to absorb.
+## 7. Workflow and concrete deliverables
 
-### 5.1 Resolution and aspect ratio
-Absorbed by `CameraInfo`, subject to §4.1. Larger frames raise the recording
-bandwidth proportionally: Stage 5c's arithmetic is per-pixel, so a 4056 × 3040
-sensor at 30 fps in two heads is **≈ 740 MB/s at uint16** — far beyond the
-USB 3 SSD and beyond the Pi's USB controller. A larger sensor therefore
-changes the *recording* answer, not just the geometry. This has to be settled
-before a sensor is chosen, not after.
+1. **Freeze the review baseline and intended support table.** Record commit,
+   local changes, current working recording settings and candidate classes.
+   Identify required operations and whether mixed-head use is required; do not
+   silently turn a whole-stack request into mono-only or identical-head scope.
+2. **Trace and inventory.** Produce one ledger linking assumption → producer/
+   consumer paths → consequence → proposed test. Include configuration, state,
+   UI, tools and readers. Code comments and old reports are leads, not evidence.
+3. **Reproduce before fixing.** Build the adapter fixtures and representative
+   matrix. For each finding record expected versus observed values. Prioritise
+   silent misinterpretation, stale physical geometry and data loss, then explicit
+   restrictions, then wording. Keep successful current-IMX296 regressions.
+4. **Make small fixes in a subsequent implementation pass.** Attach a targeted
+   regression test to each fix. Refresh the support table and affected metadata/
+   documentation. This document itself does not authorise claiming those fixes
+   are done or mandate an abstract universal sensor/plugin layer.
+5. **Qualify on the Pi and close the report.** Deliver test results/fixtures,
+   hardware evidence, remaining limitations and a reproducible configuration for
+   each supported tuple. Missing equipment is a pending result, not a reason to
+   postpone useful desktop review or approve unsupported claims.
 
-### 5.2 Sample depth
-A 12-bit sensor already has a `KNOWN_FORMATS` entry. The things that follow
-depth are the admission value ceiling, the `raw_alignment` question (lsb vs
-msb in the 16-bit word — still unconfirmed on the current rig), and the 8-bit
-storage shift, which is derived per frame from the recorded depth and
-alignment and so needs no edit.
+Suggested finding ledger:
 
-### 5.3 Mono versus Bayer
-The format layer handles both and the pipeline accepts `rgb8`. But every
-calibration and MLA assumption in this project is written for a **mono**
-sensor: a Bayer sensor under a microlens array means the colour filter mosaic
-and the lenslet lattice interact, and demosaicing across a micro-image boundary
-is meaningless. A colour sensor is a research decision, not a port.
-**Recommendation: restrict candidates to mono.**
+| ID | Code path and assumption | Affected sensor/mode/operation | Reproduction and result | Minimal correction/test | State/evidence |
+|---|---|---|---|---|---|
+| S1… | File/function plus input/output contract | Named capability difference | Expected vs actual | Concrete, reviewable change | Open / fixed / desktop-tested / Pi-verified |
 
-### 5.4 Shutter type
-The current sensor is global shutter. Most Pi-compatible sensors are **rolling
-shutter**. For a static calibration target this may be acceptable; for anything
-moving, and for any claim about the two heads being comparable frame by frame,
-it is not. The recording path records per-frame `SensorTimestamp` and claims no
-synchronisation, so nothing in the software breaks — but the *meaning* of a
-frame changes, and a rolling-shutter frame is not one exposure. This is a
-decision for the supervisor and the single most consequential item here.
+Required handover: completed ledger; coverage matrix including skipped checks;
+small golden input/output files; recorded rig configurations and benchmark
+results; explicit supported/limited/unsupported operations. No blanket sign-off
+based on total passing test count or a plausible live image.
 
-### 5.5 Frame-rate limits and sensor modes
-Each sensor has its own duration range and its own mode list (full, binned,
-cropped). Two consequences: the rate ladder must be filtered against the
-driver's reported limits rather than a constant list, and a **binned or
-cropped mode changes the effective pixel pitch**, which invalidates the MLA
-geometry exactly as a different sensor does. The current code configures the
-raw stream at `sensor_resolution` and does not choose modes, which is the safe
-default and should be preserved.
+## 8. Research decisions kept separate
 
-### 5.6 Stride and padding
-Computed from the negotiated stride where the driver reports one, and inferred
-from a 64-byte alignment rule otherwise. Generic. The worked examples in the
-docstrings are not.
+Optical-format selection, acceptable pixel pitch, global versus rolling shutter,
+colour suitability and noise performance determine whether a supported camera
+is useful for the experiment. They do not replace the software checks above.
+Changing the sensor may require optical re-evaluation; it is not automatically
+an entire optical redesign, and the document should not assert an unverified
+MLA-to-sensor F-number match.
 
-### 5.7 Lens mount, sensor size and optical format
-Not software. Named here because it blocks everything: see §7.
+Continue the row-noise comparison with matched exposure, gain, illumination and
+independent capture when useful. Do not require attribution before reviewing
+portability, and do not claim a sensor replacement will cure it. Preserve old
+calibration/data for comparison while clearly identifying their original sensor.
 
----
-
-## 6. Proposed verification strategy
-
-The principle: **prove portability against a parameterised fake sensor before
-the hardware arrives**, so that what remains on the bench is confirming the one
-real device rather than discovering the design.
-
-### M1 — A parameterised sensor fixture
-Extend the synthetic backend (or add a `FakeSensor` test double) taking
-*width, height, bits, alignment, mono/Bayer, fps limits, stride rule* as
-parameters. The synthetic source already delivers 10-bit samples in a uint16
-word for this reason; this generalises it.
-
-### M2 — A geometry matrix across the whole stack
-Run the existing end-to-end paths — open, preview, pipeline, still capture and
-sidecar, burst, continuous recording, both readers — over a matrix of at least:
-
-| | width × height | bits | notes |
-|---|---|---|---|
-| A | 1456 × 1088 | 10 | today, the control |
-| B | 1920 × 1080 | 10 | wider, 16:9 |
-| C | 2028 × 1520 | 12 | larger and deeper |
-| D | 640 × 480 | 8 | small and shallow; exercises the no-8-bit-rung path |
-| E | 1457 × 1089 | 10 | **odd dimensions**, which is where stride, tiling and any `// 2` will break |
-
-Row E is the one that will find things. Nothing in the project has ever seen a
-frame whose width is not a multiple of 16.
-
-### M3 — The grep that must come back empty
-A test that fails if a sensor dimension appears as a literal in `src/`: no
-`1456`, `1088`, `1472`, `2944` outside comments and the allowlist. Mechanical,
-cheap, and it stops the next regression rather than finding this one.
-
-### M4 — Remove the silent fallback
-`calibration/settings.py:_full_resolution` must either refuse or report that it
-is using a placeholder, so a geometry it guessed cannot be mistaken for one it
-was told. This is the one change in §4.1 worth making before the swap
-regardless of which sensor is chosen.
-
-### M5 — Reader portability
-`scripts/read_capture.py`, `tv_read_capture.m`, `tv_read_recording.m` and
-`tv_recording_frame.m` opened against files generated at every geometry in M2,
-including odd widths and 8-bit chunks. The round-trip test added for Stage 5
-already does this for one geometry and parameterises cleanly.
-
-### M6 — Rate ladder from the driver
-`ladder.RATE_LADDER` is currently a fixed list filtered only by the configured
-sensor rate. It should be filtered by the driver's reported
-`FrameDurationLimits`, so the UI cannot offer a rate the new sensor will
-refuse. Small, and it is the one place the new sensor's limits reach the
-operator.
-
-### M7 — Browser scenarios at a second geometry
-The dashboard scenarios run against the synthetic backend; running them at one
-further geometry is close to free and is what substantiates P5.
-
-### M8 — Mutation checks on what M2 would hide
-A geometry matrix that passes because every path quietly reshapes is not
-evidence. The existing `tools/mutate_stage5.py` pattern applies: remove the
-chunk geometry check, the MLA rebase, the stride reconciliation, and confirm
-the matrix fails.
-
-**Order:** M3 and M4 first (they are findings, not work), then M1 and M2, then
-M5–M8. M1–M8 are all possible with no new hardware.
-
----
-
-## 7. Outside this document, and blocking
-
-Stated because a software portability review that ignored them would be
-misleading.
-
-- **Pixel pitch changes the optical design.** The MLA was matched to the
-  IMX296's pitch and its F-number. A different pitch changes the number of
-  pixels per micro-image, and therefore the angular sampling, the useful
-  depth range and whether the array is still focused-plenoptic at all. The
-  software rebase handles a change of *frame size*; it cannot handle a change
-  of *pixel size*, and nothing in the code will notice the difference.
-- **Sensor format and mount.** A different optical format changes the image
-  circle the MLA and the main lens have to cover.
-- **Existing calibration data does not transfer.** Every stored MLA alignment,
-  every pose set and every acceptance threshold is expressed against the
-  current sensor. They are not portable and should be archived rather than
-  migrated.
-
-A sensor swap is therefore an optical redesign with a software consequence,
-not the reverse. The software work in §6 is worth doing first because it is
-cheap, it is useful regardless of which sensor is chosen, and it stops the
-software from being the thing that is uncertain while the optics are being
-settled.
-
----
-
-## 8. What the supervisor is asked to check or decide
-
-1. **Has the row noise been attributed?** Before anything else. It is not yet
-   established whether it is the sensor, the CSI-2 link, the supply, or the
-   PiSP pipeline. `scripts/diagnose_lines.py` exists for this and its output
-   should be in the record before a sensor is chosen. *A sensor swap that does
-   not fix the artefact is the expensive outcome here.*
-2. **Global shutter: required, or preferred?** (§5.4) This is the constraint
-   that most narrows the candidates, and the answer depends on whether
-   anything in the intended measurements moves.
-3. **Mono only?** (§5.3) Recommended, and a supervisor should confirm it
-   rather than have it assumed.
-4. **What resolution is acceptable?** (§5.1) Larger is not better here: the
-   recording bandwidth is linear in pixels and the current path is already
-   within 2× of the USB controller's limit at 1456 × 1088.
-5. **Is the §6 work approved before hardware is ordered?** M1–M8 need no new
-   parts and would otherwise be done under time pressure on a bench.
-6. **Who owns the optical redesign in §7**, and is it sequenced before or
-   after the sensor choice?
-
----
-
-## 9. Honest unknowns
-
-- **Which sensors are actually supported** by the libcamera and kernel
-  versions on this rig is a fact to be established on the rig, with
-  `libcamera-hello --list-cameras` and the overlay list for the installed
-  kernel — not from a datasheet or a vendor page. Third-party modules
-  frequently need an out-of-tree overlay, which is a maintenance burden that
-  belongs in the decision.
-- **Whether a candidate's row noise is actually better** is a measurement on
-  the bench, not a specification. It is worth agreeing in advance what would
-  count as better: the existing diagnostic produces per-row statistics, and a
-  before/after on the same target under the same illumination is the
-  comparison that would settle it.
-- **`raw_alignment` on the current sensor is still unconfirmed** (lsb vs msb).
-  That is a loose end on the existing rig that should be closed before it is
-  re-opened on a new one, because the two differ by 64× per pixel and the
-  symptom is a plausible-looking image at the wrong scale.
+The remaining decisions are the candidate modules/modes, required mixed-head
+operation, required scientific analyses and practical recording limits. The
+review can begin without them; candidate-specific hardware qualification and
+any claim of full interoperability cannot be completed without that scope.

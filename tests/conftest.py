@@ -65,3 +65,23 @@ def pytest_configure(config):
         "markers",
         "allow_home_writes: this test is about the default storage location",
     )
+
+
+@pytest.fixture
+def fake_sdk():
+    """A fake `picamera2` in `sys.modules`, removed afterwards.
+
+    Lets the REAL `Picamera2Source` be opened on a desktop, which is the only
+    way the configuration negotiation, the raw read-back, the control
+    intersection and the sensor-mode depth get exercised at all. See
+    `tests/fakesdk.py`.
+    """
+    import fakesdk
+
+    def _install(*sensors):
+        return fakesdk.install(*sensors)
+
+    try:
+        yield _install
+    finally:
+        fakesdk.uninstall()

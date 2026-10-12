@@ -72,17 +72,17 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "a dropped frame is released but not counted",
         "src/trilobite/recording/continuous.py",
-        "        if index is None:\n            self.dropped += 1\n"
-        "            self._recent.append(False)",
-        "        if index is None:\n            self.dropped += 0\n"
-        "            self._recent.append(False)",
+        "            if index is None:\n                self.dropped += 1\n"
+        "                self._recent.append(False)",
+        "            if index is None:\n                self.dropped += 0\n"
+        "                self._recent.append(False)",
         (REC, ROUND),
     ),
     Mutation(
         "`exposed` counts stored frames rather than offered ones",
         "src/trilobite/recording/continuous.py",
-        "        self.exposed += 1\n        if self.first_seq is None:",
-        "        self.exposed += 0\n        if self.first_seq is None:",
+        "            self.exposed += 1\n            if self.first_seq is None:",
+        "            self.exposed += 0\n            if self.first_seq is None:",
         (REC, ROUND),
     ),
     # -- the start barrier ------------------------------------------------
@@ -204,8 +204,8 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "the storage shift may change part way through a recording",
         "src/trilobite/recording/manager.py",
-        "            if now != self._store_shift:",
-        "            if False and now != self._store_shift:",
+        "        elif want != known:",
+        "        elif False and want != known:",
         (REC,),
     ),
     # -- only wired-up rungs are offered ----------------------------------
@@ -214,6 +214,102 @@ MUTATIONS: list[Mutation] = [
         "src/trilobite/recording/ladder.py",
         "    candidates = [f for f in OFFERED if f.key in keys] or [RAW16]",
         "    candidates = [f for f in FORMATS if f.key in keys] or [RAW16]",
+        (REC,),
+    ),
+
+    # -- sensor portability: the depth, the geometry and the pitch --------
+    Mutation(
+        "the sample depth is taken from the format name instead of the mode",
+        "src/trilobite/cameras/picam.py",
+        "                sample_bits=self._sample_bits,",
+        "                sample_bits=None,",
+        ("tests/test_sensor_portability.py",),
+    ),
+    Mutation(
+        "a sample wider than its container is accepted",
+        "src/trilobite/cameras/rawformat.py",
+        "        if bits <= 0 or bits > fmt.container_bits:",
+        "        if False and (bits <= 0 or bits > fmt.container_bits):",
+        ("tests/test_sensor_portability.py",),
+    ),
+    Mutation(
+        "the value ceiling uses the container width rather than the depth",
+        "src/trilobite/cameras/rawformat.py",
+        "    bits = int(fmt.bits if bits is None else bits)",
+        "    bits = int(fmt.bits)",
+        ("tests/test_sensor_portability.py",),
+    ),
+    Mutation(
+        "describe() reports the requested stream sizes, not the negotiated ones",
+        "src/trilobite/cameras/picam.py",
+        "        self._full_res = tuple(self._main_negotiated[\"size\"])",
+        "        pass  # self._full_res left at the requested size",
+        ("tests/test_sensor_portability.py",),
+    ),
+    Mutation(
+        "the preview size reported is the configured one",
+        "src/trilobite/cameras/picam.py",
+        "            preview_resolution=self.oriented_size(self._lores_size()),",
+        "            preview_resolution=self.oriented_size(\n"
+        "                tuple(self.cfg.preview_resolution)),",
+        ("tests/test_sensor_portability.py",),
+    ),
+    Mutation(
+        "a missing pixel pitch falls back to the IMX296's",
+        "src/trilobite/calibration/settings.py",
+        "        if not pitch_mm or pitch_mm <= 0:",
+        "        pitch_mm = pitch_mm or DEFAULT_PITCH_MM\n"
+        "        if False:",
+        ("tests/test_sensor_portability.py",),
+    ),
+    Mutation(
+        "an unestablished frame size falls back to 1456x1088",
+        "src/trilobite/calibration/settings.py",
+        "    except Exception:\n        return None\n    return None",
+        "    except Exception:\n        return (1456, 1088)\n    return (1456, 1088)",
+        ("tests/test_sensor_portability.py",),
+    ),
+    Mutation(
+        "heads of different sample depth share one plan",
+        "src/trilobite/recording/manager.py",
+        "        if len(depths) > 1:",
+        "        if False and len(depths) > 1:",
+        ("tests/test_sensor_portability.py",),
+    ),
+    Mutation(
+        "heads of different alignment share one plan",
+        "src/trilobite/recording/manager.py",
+        "        if len(alignments) > 1:",
+        "        if False and len(alignments) > 1:",
+        ("tests/test_sensor_portability.py",),
+    ),
+    Mutation(
+        "an 8-bit store is called lossy even when the samples are 8 bits",
+        "src/trilobite/recording/ladder.py",
+        "        return int(self.delivered_bits) <= 8",
+        "        return False",
+        ("tests/test_sensor_portability.py",),
+    ),
+    Mutation(
+        "an 8-bit store is called exact when the depth is unknown",
+        "src/trilobite/recording/ladder.py",
+        "        if self.delivered_bits is None:\n            return False",
+        "        if self.delivered_bits is None:\n            return True",
+        ("tests/test_sensor_portability.py",),
+    ),
+    Mutation(
+        "saved state from a different sensor is applied in full",
+        "src/trilobite/app.py",
+        "            state = {k: v for k, v in state.items()\n"
+        "                     if k not in self.SENSOR_SPECIFIC_STATE}",
+        "            pass  # sensor-specific state applied anyway",
+        ("tests/test_sensor_portability.py",),
+    ),
+    Mutation(
+        "a frame offered after close is counted as exposed",
+        "src/trilobite/recording/continuous.py",
+        "            if self._closing:\n                return None",
+        "            if False:\n                return None",
         (REC,),
     ),
 

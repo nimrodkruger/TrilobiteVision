@@ -92,8 +92,9 @@ class RecordingManager:
         # The start barrier. See `_begin`.
         # Storage reduction, locked to the first frame of each recording.
         self._store_dtype: str | None = None
-        self._store_shift: int | None = None
-        self._store_shift_meta: dict[str, Any] = {}
+        # Per head: cam_id -> the shift locked from that head's first frame.
+        self._store_shift: dict[str, int] = {}
+        self._store_shift_meta: dict[str, dict[str, Any]] = {}
         # Set by the Application: (cam_id, fps|None) -> achieved fps or None.
         # None from the setter means "this backend cannot change its rate",
         # which is a refusal rather than something to work around.
@@ -110,7 +111,10 @@ class RecordingManager:
     def register(self, cam_id: str, caps: dict[str, Any],
                  width: int, height: int, fps: float,
                  orientation: dict[str, Any] | None = None,
-                 oriented: bool = False) -> None:
+                 oriented: bool = False,
+                 sample_bits: int | None = None,
+                 alignment: str = "lsb",
+                 mono: bool = True) -> None:
         """Called by a camera runtime as it opens. Off the hot path.
 
         The geometry recorded here must be **the frame this backend's
@@ -120,6 +124,15 @@ class RecordingManager:
         `capture_full`, which does). `oriented` says which, and the two have to
         be set together: a plan built for the sensor frame against a backend
         that delivers a turned one is a shape mismatch on every frame.
+
+        `sample_bits`, `alignment` and `mono` are recorded for the same reason
+        and were missing until 11 October. Two heads of the same SIZE can still
+        differ in what their samples mean -- one 10-bit lsb-aligned, the other
+        12-bit left-shifted -- and the recorder shared a single plan, a single
+        storage dtype and, worse, a single reduction shift locked from
+        whichever head delivered first. The frames would all be the right
+        shape, half of them scaled wrongly, and nothing would say so. See
+        `common_geometry` and `_reduce`.
         """
         with self._lock:
             self.camera_caps[cam_id] = caps
@@ -129,7 +142,12 @@ class RecordingManager:
                 # sensor orientation and the reader has to be told what to
                 # apply. See ladder.Plan.orientation.
                 "orientation": dict(orientation or {}),
-                "oriented": bool(oriented)}
+                "oriented": bool(oriented),
+                # What the samples MEAN, as against how many there are.
+                "sample_bits": (None if sample_bits is None
+                                else int(sample_bits)),
+                "alignment": str(alignment),
+                "mono": bool(mono)}
 
     def unregister(self, cam_id: str) -> None:
         with self._lock:
@@ -155,6 +173,31 @@ class RecordingManager:
             raise RuntimeError(
                 f"the heads report different sensor frames ({sizes}). A single "
                 f"recording plan cannot describe both; record them separately.")
+        # Sample interpretation, per head. Equal sizes are not equal frames:
+        # the depth sets the value scale and the alignment sets where the
+        # sample sits in its word, and a single plan carries one of each.
+        depths = {g.get("sample_bits") for g in self.geometry.values()}
+        if len(depths) > 1:
+            raise RuntimeError(
+                f"the heads deliver samples of different depths "
+                f"({sorted(str(d) for d in depths)}). One recording plan "
+                f"carries one depth and one reduction shift, so half the "
+                f"frames would be stored at the wrong scale while every frame "
+                f"had the right shape. Record them separately.")
+        alignments = {str(g.get("alignment")) for g in self.geometry.values()}
+        if len(alignments) > 1:
+            raise RuntimeError(
+                f"the heads report different sample alignments "
+                f"({sorted(alignments)}). The shift that takes a sample to its "
+                f"top eight bits differs between them by a factor of 64, and "
+                f"one plan carries one shift. Record them separately.")
+        monos = {bool(g.get("mono")) for g in self.geometry.values()}
+        if len(monos) > 1:
+            raise RuntimeError(
+                "one head is mono and the other is a colour mosaic. The "
+                "stored arrays would be indistinguishable and the mosaic "
+                "order is not recoverable afterwards. Record them separately.")
+
         oriented = {bool(g.get("oriented")) for g in self.geometry.values()}
         if len(oriented) > 1:
             # Mixing backends, one of which turns its frames and one of which
@@ -245,35 +288,45 @@ class RecordingManager:
         where delivered pixels become stored pixels, and one place where the
         shift that did it is established.
 
-        The shift is locked to the first frame of the recording and every later
-        frame is checked against it. A recording whose frames do not all mean
-        the same thing is the failure this stage is written to exclude, and a
-        per-frame shift would be exactly that -- so a frame whose alignment
-        disagrees fails the recording rather than being quietly re-scaled.
+        The shift is locked to each head's first frame and every later frame
+        from that head is checked against it. A recording whose frames do not
+        all mean the same thing is the failure this stage is written to
+        exclude, and a per-frame shift would be exactly that -- so a frame
+        whose alignment disagrees fails the recording rather than being
+        quietly re-scaled.
+
+        **Per head, not per recording.** It was one shift for both until
+        11 October, locked by whichever head delivered first, which meant two
+        heads of different depth or alignment would have had the second one's
+        frames shifted by the first one's amount: right shape, wrong scale, no
+        complaint. `common_geometry` now refuses that pair outright, so this
+        should never diverge in practice -- which is exactly why it is worth
+        keeping the check rather than relying on the refusal alone.
         """
         if self._store_dtype is None:
             return pixels
-        if self._store_shift is None:
-            self._store_shift = ladder.shift_to_eight(frame.meta)
-            self._store_shift_meta = {
+        cam_id = str(getattr(frame, "cam_id", "?"))
+        want = ladder.shift_to_eight(frame.meta)
+        known = self._store_shift.get(cam_id)
+        if known is None:
+            self._store_shift[cam_id] = want
+            self._store_shift_meta[cam_id] = {
                 "bits": (frame.meta or {}).get("raw_bits_nominal"),
+                "bits_source": (frame.meta or {}).get("raw_bits_source"),
                 "sample_shift": (frame.meta or {}).get("raw_sample_shift"),
                 "alignment": (frame.meta or {}).get("raw_alignment"),
             }
-        else:
-            now = ladder.shift_to_eight(frame.meta)
-            if now != self._store_shift:
-                raise RuntimeError(
-                    f"{getattr(frame, 'cam_id', '?')}: this frame's sample "
-                    f"alignment implies a "
-                    f"shift of {now} and the recording has been storing with "
-                    f"{self._store_shift}. The stored values would stop "
-                    f"meaning the same thing part way through the file.")
+        elif want != known:
+            raise RuntimeError(
+                f"{cam_id}: this frame's sample alignment implies a shift of "
+                f"{want} and this head has been storing with {known}. The "
+                f"stored values would stop meaning the same thing part way "
+                f"through the file.")
         return ladder.reduce_to_store(pixels, self._store_dtype,
-                                      self._store_shift)
+                                      self._store_shift[cam_id])
 
     def _arm_reduction(self, plan: Plan) -> None:
-        self._store_shift = None
+        self._store_shift = {}
         self._store_shift_meta = {}
         self._store_dtype = (plan.store_dtype
                              if plan.fmt.reduction == "shift-to-8" else None)
@@ -288,14 +341,22 @@ class RecordingManager:
         """
         if self._store_dtype is None:
             return {"stored_dtype": "uint16", "reduction": "as-delivered",
-                    "shift": 0, "scale_to_counts": 1}
-        shift = self._store_shift
+                    "shift": 0, "scale_to_counts": 1, "per_head": {}}
+        # Per head, and the top-level `shift` is only populated when the heads
+        # agree -- which `common_geometry` enforces, so in practice always.
+        # Reporting one number for two heads that could differ is the kind of
+        # claim this whole pass is about not making.
+        shifts = set(self._store_shift.values())
+        shift = shifts.pop() if len(shifts) == 1 else None
         return {
             "stored_dtype": self._store_dtype,
             "reduction": "shift-to-8",
             "shift": shift,
             "scale_to_counts": (None if shift is None else 2 ** shift),
-            "derived_from": dict(self._store_shift_meta),
+            "per_head": {c: {"shift": v, "scale_to_counts": 2 ** v}
+                         for c, v in self._store_shift.items()},
+            "derived_from": {c: dict(m)
+                             for c, m in self._store_shift_meta.items()},
             "note": ("the top 8 bits of each sample; multiply by "
                      "scale_to_counts for approximate sensor counts"),
         }
@@ -428,7 +489,8 @@ class RecordingManager:
                 else preflight_mod.available_format_keys(self.camera_caps))
         plans = enumerate_plans(
             heads=self.heads(), width=w, height=h, sensor_fps=fps,
-            available_formats=keys, sustained_mb_s=sustained)
+            available_formats=keys, sustained_mb_s=sustained,
+            delivered_bits=self.delivered_bits())
         state = self.writer.state()
         return {
             "available": True,
@@ -457,6 +519,18 @@ class RecordingManager:
             },
         }
 
+    def delivered_bits(self) -> int | None:
+        """The sample depth both heads agree on, or None if not established.
+
+        `common_geometry` has already refused a disagreement, so by the time
+        anything asks this there is one answer or none.
+        """
+        depths = {g.get("sample_bits") for g in self.geometry.values()}
+        depths.discard(None)
+        if len(depths) == 1:
+            return int(depths.pop())
+        return None
+
     def plan(self, key: str, fps: float,
              duration_s: float | None = None) -> Plan:
         w, h, sensor_fps = self.common_geometry()
@@ -469,7 +543,8 @@ class RecordingManager:
             key, fps, self.heads(), w, h, duration_s=duration_s,
             orientation={c: dict(g.get("orientation") or {})
                          for c, g in self.geometry.items()},
-            oriented=self.oriented)
+            oriented=self.oriented,
+            delivered_bits=self.delivered_bits())
 
     # -- the rate rung ---------------------------------------------------
 

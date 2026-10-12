@@ -357,6 +357,10 @@ class SyntheticSource(CameraSource):
             full_resolution=self.oriented_size(self._full),
             preview_resolution=self.oriented_size(self._prev),
             mono=True,
+            geometry=self.simple_geometry(self.oriented_size(self._full),
+                                          self.oriented_size(self._prev)),
+            pixel_pitch_mm=self.pixel_pitch()[0],
+            pixel_pitch_source=self.pixel_pitch()[1],
         )
 
     # Advertising a plausible control set is not decoration: it means the
@@ -577,5 +581,11 @@ class ReplaySource(CameraSource):
             preview_resolution=(self._measured
                                 or self.oriented_size(self.cfg.preview_resolution)),
             mono=True,
+            geometry=self.simple_geometry(
+                self._measured
+                or self.oriented_size(self.cfg.full_resolution or (0, 0)),
+                self._measured or self.oriented_size(self.cfg.preview_resolution)),
+            pixel_pitch_mm=self.pixel_pitch()[0],
+            pixel_pitch_source=self.pixel_pitch()[1],
             detail={"files": str(len(self._files)), "dir": str(self._dir)},
         )

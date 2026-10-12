@@ -13,8 +13,27 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-# IMX296 pixel pitch, mm. Fixed by the sensor, not a user setting.
-PIXEL_PITCH_MM = 3.45e-3
+# The IMX296's pixel pitch in mm, kept ONLY as the documented default for a
+# rig that cannot establish its own.
+#
+# It was `PIXEL_PITCH_MM`, a module constant read directly by the focal-length
+# and baseline arithmetic, which meant **any other sensor silently inherited
+# 3.45 um** and produced millimetres that looked entirely reasonable and were
+# wrong by the ratio of the two pitches. The portability review names this as
+# S1 and it is the clearest case of the class: a physical constant of one
+# sensor used as if it were a property of the software.
+#
+# Every function that needs a pitch now takes one, with its source, and reports
+# the metric quantities as UNAVAILABLE when there is none. `DEFAULT_PITCH_MM`
+# survives for one purpose: a caller that has no camera at all -- a unit test,
+# or the UI before anything opens -- and such a caller gets
+# `pitch_source="default:imx296"` so the figure is never mistaken for a
+# measurement.
+DEFAULT_PITCH_MM = 3.45e-3
+
+# Retained name for anything still importing it. Deliberately NOT used by any
+# computation in this module any more.
+PIXEL_PITCH_MM = DEFAULT_PITCH_MM
 
 # Where a checkerboard square should land, in sensor pixels. Below ~15 px
 # sub-pixel corner localisation degrades; above ~30 px a 100 px micro-image
@@ -220,25 +239,56 @@ class DerivedOptics(BaseModel):
     square_verdict: Literal["ok", "too_small", "too_big", "singular"]
     baseline_mm: float
     note: str
+    # The pitch these numbers were computed with, and where it came from.
+    # Carried on the result rather than assumed by the reader, because the
+    # same inputs with a different pitch give a different answer and nothing
+    # in the output would otherwise say which was used.
+    pitch_mm: float | None = None
+    pitch_source: str = "unknown"
+    # False when no pitch could be established, in which case every metric
+    # quantity below is zero and means "not available" rather than "zero".
+    available: bool = True
 
     @classmethod
-    def compute(cls, optics: NominalOptics, board: BoardSpec, pitch_px: float) -> DerivedOptics:
+    def compute(cls, optics: NominalOptics, board: BoardSpec, pitch_px: float,
+                pitch_mm: float | None = DEFAULT_PITCH_MM,
+                pitch_source: str = "default:imx296") -> DerivedOptics:
         F = optics.focal_length_mm
         dL = optics.lens_to_mla_mm
         b = optics.mla_to_sensor_mm
         Z = optics.working_distance_mm
         G = dL - F
 
+        if not pitch_mm or pitch_mm <= 0:
+            # No pitch, no answer. Every quantity here is a length in pixels
+            # derived from a length in millimetres, so without the pitch there
+            # is nothing to compute -- and the previous behaviour, computing
+            # with another sensor's pitch, produced a confident number that
+            # was wrong by a factor nobody would notice.
+            return cls(
+                f_px=0.0, D_mm=0.0, kappa_px=0.0, alpha=0.0,
+                magnification_px_per_mm=0.0, square_px=0.0,
+                square_verdict="singular", baseline_mm=0.0,
+                pitch_mm=None, pitch_source=pitch_source, available=False,
+                note="The sensor's pixel pitch is not established, so none of "
+                     "the derived optics can be computed. Set "
+                     "'pixel_pitch_mm' for this camera, or use a sensor whose "
+                     "driver reports UnitCellSize. These numbers are lengths "
+                     "in pixels derived from lengths in millimetres; another "
+                     "sensor's pitch would give a confident wrong answer.",
+            )
+
         if abs(G) < 1e-6:
             return cls(
                 f_px=0.0, D_mm=0.0, kappa_px=0.0, alpha=0.0,
                 magnification_px_per_mm=0.0, square_px=0.0,
                 square_verdict="singular", baseline_mm=0.0,
+                pitch_mm=pitch_mm, pitch_source=pitch_source,
                 note="d_L equals F: the MLA sits at the rear focal plane and the "
                      "object-side conjugate is at infinity. Check the drawing.",
             )
 
-        f_px = (b * F / G) / PIXEL_PITCH_MM
+        f_px = (b * F / G) / pitch_mm
         D_mm = F * dL / G
         alpha = (G + b) / G
         kappa_px = -F / (G + b)          # dimensionless: mm of centre per px of ĉ / s
@@ -252,7 +302,8 @@ class DerivedOptics(BaseModel):
                 f_px=round(f_px, 1), D_mm=round(D_mm, 1), kappa_px=round(kappa_px, 4),
                 alpha=round(alpha, 5), magnification_px_per_mm=0.0, square_px=0.0,
                 square_verdict="singular",
-                baseline_mm=round(abs(kappa_px) * pitch_px * PIXEL_PITCH_MM, 4),
+                baseline_mm=round(abs(kappa_px) * pitch_px * pitch_mm, 4),
+                pitch_mm=pitch_mm, pitch_source=pitch_source,
                 note=f"Working distance is at the virtual-centre plane D = {D_mm:.0f} mm, "
                      f"where the projection is singular. Move the board.",
             )
@@ -266,7 +317,7 @@ class DerivedOptics(BaseModel):
         )
 
         # Adjacent virtual projection centres, in object space.
-        baseline_mm = abs(kappa_px) * pitch_px * PIXEL_PITCH_MM
+        baseline_mm = abs(kappa_px) * pitch_px * pitch_mm
 
         if verdict == "ok":
             note = "Square size is in the good band."
@@ -288,11 +339,14 @@ class DerivedOptics(BaseModel):
             square_px=round(square_px, 1),
             square_verdict=verdict,
             baseline_mm=round(baseline_mm, 4),
+            pitch_mm=pitch_mm,
+            pitch_source=pitch_source,
             note=note,
         )
 
 
-def invert_derived(f_px: float, kappa_px: float, D_mm: float) -> dict[str, float]:
+def invert_derived(f_px: float, kappa_px: float, D_mm: float,
+                   pitch_mm: float | None = DEFAULT_PITCH_MM) -> dict[str, float]:
     """Recover F, d_L, b from the three fitted scalars -- spec eq. (4).
 
     Used after a fit to check the result against the drawing. Kept beside the
@@ -303,7 +357,11 @@ def invert_derived(f_px: float, kappa_px: float, D_mm: float) -> dict[str, float
     """
     if abs(1.0 - kappa_px) < 1e-9:
         return {}
-    f_mm = f_px * PIXEL_PITCH_MM
+    if not pitch_mm or pitch_mm <= 0:
+        # Same reason as the forward computation: f_px is a pixel count and F
+        # is a length, so the pitch is the only thing relating them.
+        return {}
+    f_mm = f_px * pitch_mm
     F = (D_mm + kappa_px * f_mm) / (1.0 - kappa_px)
     denom = kappa_px * (F + f_mm)
     if abs(denom) < 1e-12:
@@ -332,16 +390,54 @@ class Check(BaseModel):
     message: str
 
 
-def _full_resolution(cam: Any) -> tuple[int, int]:
-    """(width, height) of the frame detection will actually run on."""
+def _full_resolution(cam: Any) -> tuple[int, int] | None:
+    """(width, height) detection will run on, or **None if not established**.
+
+    It used to return `(1456, 1088)` after any failure. That is the geometry of
+    one particular sensor, and returning it as though it had been measured made
+    every check built on it -- the tile count, the board-fits arithmetic, the
+    pitch conversion -- compute against a frame that may not exist. On the
+    current rig the fallback is also the right answer, which is precisely why
+    it was invisible.
+
+    `None` now, and callers turn that into a blocking check that says the
+    geometry is unknown. A placeholder may lay out a page; it must never
+    authorise a calibration or be recorded as measured.
+    """
     try:
         info = cam.source.describe()
         w, h = info.full_resolution
         if w and h:
             return int(w), int(h)
     except Exception:
+        return None
+    return None
+
+
+def camera_pitch(cam: Any) -> tuple[float | None, str]:
+    """The camera's physical pixel pitch in mm and its source, or (None, ...).
+
+    Asked of the camera rather than assumed, because the pitch is a property of
+    the sensor and the application has no business holding one. See
+    `Picamera2Source.pixel_pitch`.
+    """
+    source = getattr(cam, "source", cam)
+    getter = getattr(source, "pixel_pitch", None)
+    if callable(getter):
+        try:
+            pitch, origin = getter()
+            return (float(pitch) if pitch else None), str(origin)
+        except Exception:                                 # noqa: BLE001
+            return None, "unknown"
+    try:
+        info = source.describe()
+        pitch = getattr(info, "pixel_pitch_mm", None)
+        if pitch:
+            return float(pitch), str(getattr(info, "pixel_pitch_source",
+                                             "unknown"))
+    except Exception:                                     # noqa: BLE001
         pass
-    return (1456, 1088)
+    return None, "unknown"
 
 
 # A sanity bound on the lattice, not a cost bound. Nothing scans tile-by-tile
@@ -519,7 +615,24 @@ def readiness_report(
         #
         # Blocking, because the number is knowable before anything starts and
         # the only thing that produces it is a wrong pitch.
-        full_w, full_h = _full_resolution(cam)
+        # Geometry, or a blocking refusal. `None` means the camera could not
+        # say what frame it produces, and every check below this point is
+        # arithmetic on that frame -- the tile count, the pitch conversion, the
+        # board-fits bound. Computing them against a placeholder was the S2
+        # defect: it produced a confident verdict about a frame that may not
+        # exist, and on this rig the placeholder happens to be right, which is
+        # why it never showed.
+        full = _full_resolution(cam)
+        if full is None:
+            checks.append(Check(
+                id=f"{cid}.geometry", ok=False, blocking=True,
+                message=(f"{cid}: the camera has not reported a frame size, so "
+                         f"nothing that depends on the sensor geometry can be "
+                         f"checked. Open the camera first; if it is open, its "
+                         f"describe() is failing and that is the fault to fix."),
+            ))
+            continue
+        full_w, full_h = full
         ref = (getattr(stage, "reference_shape", None)
                or _preview_resolution(cam) or (full_w, full_h))
         limit = MAX_SANE_TILES
@@ -662,15 +775,32 @@ def readiness_report(
         #
         # Everything here is in FULL-RESOLUTION pixels, because that is where
         # detection runs -- see MLAGridOverlay.geometry_for.
-        if settings is not None:
-            full_w, full_h = _full_resolution(cam)
+        if settings is not None and _full_resolution(cam) is not None:
+            full_w, full_h = _full_resolution(cam)   # type: ignore[misc]
             # Same reasoning as the preview check above: both axes, or nothing.
             # `det_geom` is this exact conversion and is usually already in
             # hand, so reuse it and only recompute if that attempt failed.
             tile_px = (det_geom.pitch if det_geom is not None
                        else _pitch_in(stage, (full_w, full_h),
                                       fallback=float(p.pitch_px))) * scale
-            derived = DerivedOptics.compute(settings.optics, settings.board, tile_px)
+            # The pitch comes from the camera, with its source, and a camera
+            # that cannot establish one yields a `DerivedOptics` marked
+            # unavailable rather than one computed with another sensor's pitch.
+            pitch_mm, pitch_source = camera_pitch(cam)
+            derived = DerivedOptics.compute(
+                settings.optics, settings.board, tile_px,
+                pitch_mm=pitch_mm, pitch_source=pitch_source)
+            if not derived.available:
+                checks.append(Check(
+                    id=f"{cid}.pixel_pitch", ok=False, blocking=False,
+                    message=(
+                        f"{cid}: the sensor's pixel pitch is not established "
+                        f"({pitch_source}), so the board-fits check and every "
+                        f"millimetre figure are unavailable. Set "
+                        f"'pixel_pitch_mm' for this camera from its datasheet. "
+                        f"Detection and alignment are unaffected: they work in "
+                        f"pixels."),
+                ))
             need_w = (settings.board.cols + 1) * derived.square_px
             need_h = (settings.board.rows + 1) * derived.square_px
             fits = derived.square_px > 0 and max(need_w, need_h) <= tile_px

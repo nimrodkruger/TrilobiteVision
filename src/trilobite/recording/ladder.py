@@ -191,6 +191,11 @@ class Plan:
     # built for the sensor frame against a backend that delivers a turned one
     # is a shape mismatch on every frame.
     oriented: bool = False
+    # The SENSOR's own sample depth, from the selected sensor mode. It decides
+    # whether an 8-bit store is a reduction or the samples themselves, which
+    # is a question about the sensor and not about the storage format. None
+    # means not established.
+    delivered_bits: int | None = None
 
     # -- per-frame arithmetic -------------------------------------------
 
@@ -201,6 +206,32 @@ class Plan:
     @property
     def store_dtype(self) -> str:
         return "uint8" if self.fmt.bytes_per_pixel <= 1.0 else "uint16"
+
+    @property
+    def exact(self) -> bool:
+        """Does this plan store every bit the sensor delivered?
+
+        **Not a property of the format alone**, which is what it was until
+        11 October. `raw8` on a sensor whose samples are 8 bits stores them
+        whole: there is nothing below the low eight bits to lose, so the store
+        is exact and the data can be science. Calling it lossy because the rung
+        is named "8-bit" mislabels a perfectly good recording, which is S7 in
+        the portability review.
+
+        The reverse error is the one that cannot be undone, so the unknown case
+        is conservative: with no established sample depth, an 8-bit store is
+        treated as a reduction.
+        """
+        if self.fmt.exact:
+            return True
+        if self.delivered_bits is None:
+            return False
+        return int(self.delivered_bits) <= 8
+
+    @property
+    def validity_ceiling(self) -> str:
+        """The best a frame in this plan can be. See `exact`."""
+        return SCIENCE if self.exact else DIAGNOSTIC
 
     @property
     def bytes_per_frame(self) -> int:
@@ -274,8 +305,12 @@ class Plan:
             "format": self.fmt.key,
             "format_label": self.fmt.label,
             "format_note": self.fmt.note,
-            "exact": self.fmt.exact,
-            "validity_ceiling": self.fmt.validity,
+            # From the PLAN, not from the format: an 8-bit store of 8-bit
+            # samples is exact. See `Plan.exact`.
+            "exact": self.exact,
+            "validity_ceiling": self.validity_ceiling,
+            "delivered_bits": self.delivered_bits,
+            "format_exact_by_itself": self.fmt.exact,
             "fps": round(self.fps, 3),
             "heads": list(self.heads),
             "width": self.width,
@@ -313,6 +348,7 @@ def enumerate_plans(
     available_formats: set[str] | None = None,
     sustained_mb_s: float | None = None,
     rates: tuple[float, ...] = (),
+    delivered_bits: int | None = None,
 ) -> list[dict[str, Any]]:
     """Every configuration this rig can actually offer, with its consequences.
 
@@ -338,9 +374,11 @@ def enumerate_plans(
     for fmt in candidates:
         for fps in rate_list:
             plan = Plan(fmt=fmt, fps=float(fps), heads=heads,
-                        width=width, height=height)
+                        width=width, height=height,
+                        delivered_bits=delivered_bits)
             row = plan.as_dict(sustained_mb_s=sustained_mb_s)
-            row["mechanisms"] = _mechanisms(fmt, fps, sensor_fps)
+            row["mechanisms"] = _mechanisms(fmt, fps, sensor_fps,
+                                            delivered_bits)
             row["feasible"] = (
                 sustained_mb_s is None or plan.mb_s <= sustained_mb_s)
             out.append(row)
@@ -350,7 +388,8 @@ def enumerate_plans(
     return out
 
 
-def _mechanisms(fmt: RecordingFormat, fps: float, sensor_fps: float) -> list[dict[str, str]]:
+def _mechanisms(fmt: RecordingFormat, fps: float, sensor_fps: float,
+                delivered_bits: int | None = None) -> list[dict[str, str]]:
     """Which ladder rungs a configuration uses, and when each one acts."""
     used: list[dict[str, str]] = []
     if fps < sensor_fps * 0.99:
@@ -370,7 +409,11 @@ def _mechanisms(fmt: RecordingFormat, fps: float, sensor_fps: float) -> list[dic
     if fmt.key == RAW8.key:
         used.append({
             "mechanism": EIGHT_BIT, "when": CONFIGURATION,
-            "effect": "half the bytes, LOSSY -- diagnostic, never science",
+            "effect": (
+                "half the bytes, LOSSY -- diagnostic, never science"
+                if delivered_bits is None or int(delivered_bits) > 8 else
+                "half the bytes, and EXACT: this sensor delivers 8-bit "
+                "samples, so there is nothing below them to lose"),
         })
     used.append({
         "mechanism": DROP, "when": RUNTIME,
@@ -427,6 +470,8 @@ def reduce_to_store(pixels: Any, dtype: Any, shift: int) -> Any:
     """
     want = np.dtype(dtype)
     if want.itemsize >= pixels.dtype.itemsize and want.kind == pixels.dtype.kind:
+        # Includes the case the review separates out: a uint8 frame asked to
+        # be stored as uint8. Nothing to do, and nothing lost.
         return pixels
     if shift > 0:
         return (pixels >> shift).astype(want, copy=False)

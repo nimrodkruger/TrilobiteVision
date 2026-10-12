@@ -89,13 +89,32 @@ from ..types import DIAGNOSTIC, SCIENCE, UNVALIDATED  # noqa: F401  (re-exported
 
 log = logging.getLogger(__name__)
 
-# Rows are padded to a hardware-friendly stride -- 64 bytes on this pipeline.
-# Used only when the driver's own stride is unavailable; when it is available
-# the row length must match it EXACTLY and this bound never comes into play.
-# The allowance is generous because the alignment is not ours to promise, and
-# bounded because an unbounded one would accept a buffer of the wrong format
-# whose row happens to be longer.
-MAX_STRIDE_PAD_BYTES = 256
+# How much row padding is consistent with a configuration, in bytes.
+#
+# 256 was a flat bound, chosen against a 2912-byte row on this sensor, and
+# the portability review is right that it is not a universal rule: the
+# alignment is the driver's to choose, some pipelines align to 1024 bytes,
+# and a wider sensor's row can legitimately carry more padding than a
+# narrower one's. A flat 256 would grade an ordinary wide-sensor frame
+# `unvalidated` for doing nothing wrong.
+#
+# What IS inconsistent is padding of a whole row or more: at that point the
+# "padding" is wide enough to be another row of image, which is the shape a
+# format or pixel-size disagreement takes -- a 10-bit buffer read as 8-bit
+# has a row exactly twice as long. So the bound is the larger of a fixed
+# floor and the row itself. On this rig (2912-byte rows) the floor never
+# binds and the behaviour is unchanged.
+MIN_STRIDE_PAD_ALLOWANCE = 256
+
+# Kept as the floor's old name so existing imports and tests still mean
+# what they meant. It is no longer the whole rule; see
+# `stride_pad_allowance`.
+MAX_STRIDE_PAD_BYTES = MIN_STRIDE_PAD_ALLOWANCE
+
+
+def stride_pad_allowance(row_bytes: int) -> int:
+    """The most padding a row of `row_bytes` may carry and still reconcile."""
+    return max(MIN_STRIDE_PAD_ALLOWANCE, int(row_bytes) - 1)
 
 # Where the sensor sample sits inside its container word.
 #
@@ -189,7 +208,15 @@ KNOWN_FORMATS: dict[str, RawFormat] = {f.name: f for f in [
     _mono("R12_CSI2P", 12, packed=True),
     # Bayer, for a colour sensor on the same rig. Linear sensor data, so
     # admissible; demosaicing is an offline concern.
-    *[_bayer(f"S{p}{b}", b) for b in (10, 12) for p in
+    #
+    # 16 is included alongside 10 and 12 as of 11 October. It was absent while
+    # mono `R16` was present, so a sensor whose driver negotiated `SBGGR16`
+    # could not open at all -- the refusal was safe, and it was also wrong,
+    # because those bytes are ordinary left-shifted samples in a 16-bit word
+    # and this code can read them. **A 16 in the name is the CONTAINER width
+    # and says nothing about the sample depth**, which is why `admit()` takes
+    # the depth from the sensor mode when it is known; see `sample_bits`.
+    *[_bayer(f"S{p}{b}", b) for b in (10, 12, 16) for p in
       ("RGGB", "BGGR", "GRBG", "GBRG")],
     *[_bayer(f"S{p}{b}_CSI2P", b, packed=True) for b in (10, 12) for p in
       ("RGGB", "BGGR", "GRBG", "GBRG")],
@@ -309,6 +336,7 @@ def _representation_reservations(data: np.ndarray, fmt: RawFormat) -> list[str]:
 
 def _value_evidence(
     trimmed: np.ndarray, fmt: RawFormat, alignment: str,
+    bits: int | None = None,
 ) -> tuple[dict[str, object], list[str]]:
     """Do the values fit the depth and alignment the format claims?
 
@@ -334,9 +362,15 @@ def _value_evidence(
     transport that looks like a slightly damaged photograph -- is invisible,
     and that is the one that still stops the capture.
     """
-    shift = fmt.shift_for(alignment)
+    # `bits` is the depth in force -- the sensor mode's where that is known,
+    # the format name's otherwise. Using the format's own `bits` here was the
+    # defect: on a 12-bit sensor negotiated as R16 the ceiling became 65535,
+    # and a ceiling nothing can exceed is not a check.
+    bits = int(fmt.bits if bits is None else bits)
+    shift = max(0, fmt.container_bits - bits) if alignment == MSB else 0
     peak = int(trimmed.max()) if trimmed.size else 0
-    ceiling = fmt.max_value << shift
+    sample_max = (1 << bits) - 1
+    ceiling = sample_max << shift
 
     meta: dict[str, object] = {
         "raw_values_checked": True,
@@ -346,18 +380,19 @@ def _value_evidence(
     out: list[str] = []
 
     if peak > ceiling:
-        other = fmt.max_value << (fmt.container_bits - fmt.bits)
+        other = sample_max << (fmt.container_bits - bits)
         hint = ""
         if alignment == LSB and peak <= other:
-            hint = (f"; the peak IS consistent with a {fmt.bits}-bit sample "
+            hint = (f"; the peak IS consistent with a {bits}-bit sample "
                     f"left-shifted into a {fmt.container_bits}-bit word, which "
                     f"is what the Picamera2 manual describes for the Pi 5 -- "
                     f"if that is this pipeline, set 'raw_alignment: msb'")
         out.append(
             f"peak value {peak} exceeds the {ceiling} maximum for a "
-            f"{fmt.bits}-bit {fmt.name} sample {alignment}-aligned in a "
+            f"{bits}-bit {fmt.name} sample {alignment}-aligned in a "
             f"{fmt.container_bits}-bit container{hint}")
 
+    meta["raw_sample_max"] = int(sample_max)
     if shift and trimmed.size:
         low = int(np.bitwise_and(trimmed, (1 << shift) - 1).max())
         meta["raw_low_bits_max"] = low
@@ -373,6 +408,8 @@ def admit(
     stride_bytes: int | None = None,
     alignment: str = LSB,
     check_values: bool = True,
+    sample_bits: int | None = None,
+    sample_bits_source: str = "format-name",
 ) -> Admitted:
     """Read a raw buffer as an image and grade what could be established.
 
@@ -382,6 +419,19 @@ def admit(
     review R5. It is also pre-orientation: this runs on the buffer exactly as
     the sensor delivered it, because row padding is on the right at that moment
     and on some other edge afterwards.
+
+    `sample_bits` is **the sensor's own sample depth**, from the selected
+    sensor mode, and it overrides the depth implied by the format name. The two
+    are different quantities and the review that prompted this is explicit
+    about it: `R16` and `SBGGR16` name a 16-bit CONTAINER, and a sensor
+    delivering 12-bit samples left-shifted into that container is the ordinary
+    case on a Pi 5 rather than an exotic one. Taking 16 as the depth makes the
+    value ceiling vacuous (nothing can exceed 65535), makes the msb shift zero
+    when it should be four, and makes any normalisation by full scale wrong by
+    16x -- while the picture still looks correct, which is why this needs an
+    authoritative source rather than a plausible one.
+
+    Left as None, the format name is used and `raw_bits_source` says so.
 
     **Two very different outcomes, and the split is the point.**
 
@@ -434,6 +484,33 @@ def admit(
 
     reservations = _representation_reservations(data, fmt)
 
+    # The sample depth in force, and where it came from. The sensor mode wins
+    # over the format name, because the name carries the container width.
+    bits = int(fmt.bits)
+    bits_source = "format-name"
+    if sample_bits is not None:
+        bits = int(sample_bits)
+        bits_source = sample_bits_source
+        if bits <= 0 or bits > fmt.container_bits:
+            raise RawFormatError(
+                f"a sample depth of {bits} bits was reported by "
+                f"{sample_bits_source} and {fmt.name} delivers a "
+                f"{fmt.container_bits}-bit container. A sample cannot be wider "
+                f"than the word it arrives in, so one of the two is wrong and "
+                f"guessing which would decide the scale of every value.")
+        if bits != fmt.bits:
+            # Not a reservation: this is the EXPECTED case for a left-shifted
+            # sample in a wider container, and the whole point of taking the
+            # depth from the mode. Recorded so a reader can see that the two
+            # disagreed and which one was used.
+            meta_note = (f"{fmt.name} names {fmt.bits} bits; "
+                         f"{sample_bits_source} reports {bits}")
+        else:
+            meta_note = None
+    else:
+        meta_note = None
+    sample_shift = max(0, fmt.container_bits - bits) if alignment == MSB else 0
+
     sensor_w, sensor_h = int(raw_size[0]), int(raw_size[1])
     if sensor_w <= 0 or sensor_h <= 0:
         raise RawFormatError(
@@ -458,21 +535,25 @@ def admit(
                 f"buffer rows are {row_bytes} bytes and the driver negotiated "
                 f"a stride of {stride_bytes}")
         pad = stride_bytes - want_bytes
-        if pad < 0 or pad > MAX_STRIDE_PAD_BYTES:
+        allowance = stride_pad_allowance(want_bytes)
+        if pad < 0 or pad > allowance:
             reservations.append(
                 f"the negotiated {stride_bytes}-byte stride is not "
-                f"{want_bytes} plus at most {MAX_STRIDE_PAD_BYTES} of padding, "
-                f"so the configuration is internally inconsistent")
+                f"{want_bytes} plus at most {allowance} of padding, so the "
+                f"configuration is internally inconsistent -- padding of a "
+                f"whole row or more is the shape a pixel-size disagreement "
+                f"takes, not alignment")
     else:
         stride_source = "inferred"
         pad = row_bytes - want_bytes
-        if pad < 0 or pad > MAX_STRIDE_PAD_BYTES:
+        allowance = stride_pad_allowance(want_bytes)
+        if pad < 0 or pad > allowance:
             reservations.append(
                 f"buffer rows are {row_bytes} bytes; {fmt.name} at {sensor_w} "
-                f"px wide needs {want_bytes} plus at most "
-                f"{MAX_STRIDE_PAD_BYTES} of stride padding, off by {pad}. If "
-                f"that is close to a factor of two, the negotiated format and "
-                f"the delivered buffer disagree about the pixel size")
+                f"px wide needs {want_bytes} plus at most {allowance} of "
+                f"stride padding, off by {pad}. If that is close to a factor "
+                f"of two, the negotiated format and the delivered buffer "
+                f"disagree about the pixel size")
 
     # Re-view to the format's own dtype. A C-contiguous uint8 row of 2N bytes
     # IS N little-endian uint16 pixels: no copy, no arithmetic, and the values
@@ -502,13 +583,17 @@ def admit(
 
     meta: dict[str, object] = {
         "raw_format": fmt.name,
-        # Nominal, and named so. Derived from the format name, which the
-        # Picamera2 manual warns is not evidence of the delivered sample depth.
-        "raw_bits_nominal": fmt.bits,
-        "raw_bits_source": "format-name",
+        # The depth IN FORCE, with its provenance beside it. `format-name` is
+        # nominal -- the Picamera2 manual warns against treating it as
+        # established -- and `sensor-mode` is the driver's own statement about
+        # the samples. A reader deciding whether values are comparable across
+        # sensors needs both the number and where it came from.
+        "raw_bits_nominal": bits,
+        "raw_bits_source": bits_source,
+        "raw_bits_from_format_name": fmt.bits,
         "raw_container_bits": fmt.container_bits,
         "raw_alignment": alignment,
-        "raw_sample_shift": fmt.shift_for(alignment),
+        "raw_sample_shift": sample_shift,
         "raw_bytes_per_pixel": fmt.bytes_per_pixel,
         "raw_dtype": str(out.dtype),
         "raw_stride_bytes": int(row_bytes),
@@ -519,8 +604,12 @@ def admit(
         "raw_height": sensor_h,
     }
 
+    if meta_note:
+        meta["raw_bits_note"] = meta_note
+
     if check_values and trimmed.dtype.kind == "u":
-        value_meta, value_reservations = _value_evidence(trimmed, fmt, alignment)
+        value_meta, value_reservations = _value_evidence(
+            trimmed, fmt, alignment, bits=bits)
         meta.update(value_meta)
         reservations.extend(value_reservations)
     else:

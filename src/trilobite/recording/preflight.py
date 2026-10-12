@@ -274,6 +274,7 @@ def plan_from(
     duration_s: float | None = None,
     orientation: dict[str, Any] | None = None,
     oriented: bool = False,
+    delivered_bits: int | None = None,
 ) -> Plan:
     """Build a Plan from a UI selection, refusing a format that is not a rung."""
     fmt = BY_KEY.get(key)
@@ -285,4 +286,5 @@ def plan_from(
         raise ValueError("a recording needs a positive frame rate")
     return Plan(fmt=fmt, fps=float(fps), heads=tuple(heads),
                 width=int(width), height=int(height), duration_s=duration_s,
-                orientation=orientation, oriented=oriented)
+                orientation=orientation, oriented=oriented,
+                delivered_bits=delivered_bits)

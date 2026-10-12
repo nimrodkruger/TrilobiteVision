@@ -1172,3 +1172,59 @@ def test_the_rate_ladder_only_offers_rates_at_or_below_the_sensor():
     # Nothing above the sensor rate, ever: a recording cannot run faster than
     # the frames arrive.
     assert all(r <= 12.0 for r in rates_for(12.0))
+
+
+def test_a_frame_offered_after_close_is_not_counted(cont):
+    """The race the portability matrix caught, as a deterministic assertion.
+
+    A capture thread can be inside `offer` when `stop` lands: it passes the
+    state check, increments `exposed`, and is pre-empted before the queue put.
+    `close` then signals the writer, which finds the queue momentarily empty
+    and stops -- and the frame is put behind it, counted as exposed, never
+    stored, never dropped. `unaccounted = 1`.
+
+    It fired in roughly one run in four of the geometry matrix, which is the
+    worst kind of defect to leave: rare enough to look like noise and exactly
+    the discrepancy the acceptance criterion exists to detect.
+
+    This asserts the invariant rather than the timing: after `close`, an offer
+    changes nothing.
+    """
+    cont.arm(plan(heads=("left",)), slots=4)
+    cont.start()
+    head = cont.heads["left"]
+    assert head.offer(pixels(1), meta(1)) is True
+    _drain(cont)
+    summary = head.close()
+    assert summary["unaccounted"] == 0
+
+    before = (head.exposed, head.stored, head.dropped)
+    assert head.offer(pixels(2), meta(2)) is None
+    assert (head.exposed, head.stored, head.dropped) == before
+    cont.stop()
+
+
+def test_the_accounting_holds_when_stop_races_the_capture_thread(cont):
+    """And under the race itself, repeatedly, which is how it was found.
+
+    Timing-dependent by nature, so it is a complement to the assertion above
+    rather than the evidence on its own: twenty stops landing at random points
+    in a stream of offers, each of which must balance.
+    """
+    import random
+
+    for _ in range(20):
+        cont.arm(plan(heads=("left",)), slots=4)
+        cont.start()
+        stopper = threading.Thread(
+            target=lambda: (time.sleep(random.uniform(0.0, 0.01)),
+                            cont._stop("test")))
+        stopper.start()
+        for n in range(1, 60):
+            if cont.offer("left", pixels(n % 50), meta(n)) is None:
+                break
+        stopper.join(5.0)
+        _drain(cont)
+        out = cont.stop()
+        head_summary = out["heads"]["left"]
+        assert head_summary["unaccounted"] == 0, head_summary

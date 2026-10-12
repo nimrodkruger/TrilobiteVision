@@ -17,7 +17,6 @@ import numpy as np
 import pytest
 
 from trilobite.cameras.rawformat import (
-    MAX_STRIDE_PAD_BYTES,
     Admitted,
     RawFormatError,
     admit,
@@ -233,13 +232,40 @@ def test_a_buffer_short_of_the_sensor_width_is_read_and_reserved():
     assert got.array.shape == (H, W - 8), "nothing to trim, so nothing trimmed"
 
 
-def test_padding_beyond_the_bound_is_reserved():
-    """The allowance is generous because the alignment is not ours to promise,
-    and bounded because an unbounded one would accept a buffer of an entirely
-    different format whose row happens to be longer."""
-    assert admit(r8(stride_bytes=W + MAX_STRIDE_PAD_BYTES), "R8", (W, H)).is_science
-    reserved(admit(r8(stride_bytes=W + MAX_STRIDE_PAD_BYTES + 1), "R8", (W, H)),
+def test_padding_up_to_a_whole_row_reconciles_and_a_whole_row_does_not():
+    """The bound, and why it is relative rather than a flat 256 bytes.
+
+    The alignment is the driver's to choose and a wider sensor's row can carry
+    more padding than a narrower one's, so a flat allowance would grade an
+    ordinary wide-sensor frame `unvalidated` for doing nothing wrong. What IS
+    inconsistent is padding of a whole row or more: that is the shape a
+    pixel-size disagreement takes, because a 10-bit buffer read as 8-bit has a
+    row exactly twice as long.
+    """
+    row = W                                    # R8: one byte per pixel
+    assert admit(r8(stride_bytes=row + row - 1), "R8", (W, H)).is_science
+    reserved(admit(r8(stride_bytes=row + row), "R8", (W, H)),
              "stride padding")
+    # And with the driver's own stride reported, which is a different branch
+    # and a different message for the same arithmetic.
+    reserved(admit(np.zeros((H, row + row), np.uint8), "R8", (W, H),
+                   stride_bytes=row + row),
+             "internally inconsistent")
+
+
+def test_the_floor_still_applies_to_a_narrow_row():
+    """A relative bound alone would be tighter than real alignment on a small
+    sensor: a 64-px row is 64 bytes and 64-byte alignment can add 63, while a
+    pipeline aligning to 256 would add more. The floor is what keeps a small
+    frame from being graded down for its driver's choice of alignment."""
+    from trilobite.cameras.rawformat import (
+        MIN_STRIDE_PAD_ALLOWANCE,
+        stride_pad_allowance,
+    )
+    assert stride_pad_allowance(64) == MIN_STRIDE_PAD_ALLOWANCE
+    assert stride_pad_allowance(4000) == 3999
+    narrow = np.zeros((48, 64 + 200), np.uint8)
+    assert admit(narrow, "R8", (64, 48)).is_science
 
 
 def test_the_two_readings_of_a_2944_byte_row_are_distinguished_by_the_format():
@@ -540,7 +566,10 @@ def test_a_graded_frame_is_still_a_frame():
 def test_every_reservation_reaches_the_metadata():
     """The sidecar has to carry them, or the grade is a number with no reason
     attached and the next person has to rediscover it."""
-    got = admit(r8(height=1080, stride_bytes=W + 999), "R8", (W, H))
+    # Two independent problems in one buffer: the wrong row count, and padding
+    # of more than a whole row. 1456 bytes of padding on a 1456-byte row is
+    # exactly the factor-of-two shape the bound exists to catch.
+    got = admit(r8(height=1080, stride_bytes=W + W), "R8", (W, H))
     assert len(got.reservations) == 2
     assert got.meta["raw_reservations"] == list(got.reservations)
     assert got.meta["raw_admitted"] is False

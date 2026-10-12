@@ -191,6 +191,45 @@ class CameraSource(ABC):
         frame = self.capture_full(raw=True)
         return RawRead(frame=frame, preview=None, oriented=True)
 
+    def pixel_pitch(self) -> tuple[float | None, str]:
+        """Physical pixel pitch in mm and its source, or (None, "unknown").
+
+        On the base class: the configured value if there is one, otherwise not
+        established. A backend that can ask its driver overrides this.
+
+        `None` is a real answer and the calibration code treats it as one --
+        the metric quantities become unavailable. That is the correction for
+        the defect this replaces: a module constant holding one sensor's pitch,
+        read by the focal-length arithmetic, which every other sensor would
+        have inherited silently.
+        """
+        configured = getattr(self.cfg, "pixel_pitch_mm", None)
+        if configured:
+            return float(configured), "config:pixel_pitch_mm"
+        return None, "unknown"
+
+    def simple_geometry(self, main: tuple[int, int],
+                        lores: tuple[int, int]) -> dict[str, Any]:
+        """The geometry block for a backend that negotiates nothing.
+
+        Takes its sizes as arguments rather than reading `describe()`, because
+        `describe()` is what calls this -- and the first version did read it,
+        which was an infinite recursion the suite caught immediately.
+
+        A generator or a directory of files has one geometry. Reporting five
+        copies of it would imply a negotiation that did not happen, so the
+        block says so in its notes and the distinct-stream fields are simply
+        absent. See `Picamera2Source.geometry` for the real thing.
+        """
+        return {
+            "sensor": list(main),
+            "oriented_main": list(main),
+            "oriented_lores": list(lores),
+            "quarter_turns": self.quarter_turns,
+            "notes": ["this backend negotiates no stream configuration, so "
+                      "there is one geometry and it is reported as given"],
+        }
+
     def raw_capabilities(self) -> dict[str, Any]:
         """Which raw formats this camera can actually deliver, measured.
 

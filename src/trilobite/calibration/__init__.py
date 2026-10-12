@@ -8,4 +8,9 @@ and the settings and readiness code must stay importable on a machine without
 it so that `readiness_report` can be the thing that *tells you* cv2 is missing.
 """
 
-from .settings import CalibrationSettings, DerivedOptics, readiness_report  # noqa: F401
+from .settings import (  # noqa: F401
+    CalibrationSettings,
+    DerivedOptics,
+    camera_pitch,
+    readiness_report,
+)

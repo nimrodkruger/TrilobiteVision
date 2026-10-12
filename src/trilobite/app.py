@@ -23,7 +23,12 @@ from .acquisition import (
     CameraOwner,
 )
 from .bus import LatestFrame
-from .calibration import CalibrationSettings, DerivedOptics, readiness_report
+from .calibration import (
+    CalibrationSettings,
+    DerivedOptics,
+    camera_pitch,
+    readiness_report,
+)
 from .cameras.base import CameraSource
 from .cameras.registry import build_camera
 from .config import AppConfig, CameraConfig
@@ -83,6 +88,37 @@ class RateMeter:
     def age(self) -> float | None:
         """Seconds since the most recent tick. None if there has never been one."""
         return None if not self._t else time.monotonic() - self._t[-1]
+
+
+def _identity_differences(saved: dict[str, Any],
+                          live: dict[str, Any]) -> list[str]:
+    """Which identity fields disagree, in words. Empty means "same sensor".
+
+    Absence is not a difference: a state file written before this field
+    existed has no identity at all, and refusing to restore it would break
+    every existing rig for nothing. Same for a field one side could not
+    establish -- `None` compares equal to anything, deliberately, because
+    "unknown" is not evidence of a change.
+
+    A field that both sides state and that differs IS a difference, and the
+    conservative direction is the right one here: the cost of a false positive
+    is re-aligning a grid, and the cost of a false negative is a calibration
+    that silently describes the wrong sensor.
+    """
+    if not saved or not live:
+        return []
+    out: list[str] = []
+    # `full_resolution` is NOT compared: it is post-orientation, so a saved
+    # rotation would read as a sensor change. `frame_shape` is the same
+    # information with the rotation taken out.
+    for key in ("model", "frame_shape", "mono", "raw_format",
+                "sample_bits", "pixel_pitch_mm"):
+        was, now = saved.get(key), live.get(key)
+        if was in (None, "", []) or now in (None, "", []):
+            continue
+        if was != now:
+            out.append(f"{key} was {was!r}, now {now!r}")
+    return out
 
 
 class CameraRuntime:
@@ -145,6 +181,10 @@ class CameraRuntime:
         # matters: a camera whose thread would not join is NOT stopped, and
         # closing it anyway races a thread that may be inside capture_request.
         self.lifecycle = "stopped"
+        # Non-empty when saved state was written for a different sensor; see
+        # apply_state. Surfaced in status() so it is visible rather than only
+        # logged once at startup.
+        self.sensor_changed: list[str] = []
         # start and stop are mutually exclusive. Two threads interleaving them
         # is how a second worker gets launched against a live source.
         self._lifecycle_lock = threading.RLock()
@@ -209,10 +249,17 @@ class CameraRuntime:
                 # size as it stands, and the journal then records the transform
                 # as already applied so the reader does not apply it twice.
                 w, h = h, w
+            caps = self.source.raw_capabilities()
             self.recorder.register(
-                self.cam_id, self.source.raw_capabilities(),
+                self.cam_id, caps,
                 width=int(w), height=int(h), fps=float(self.cfg.fps),
-                orientation=self.source.orientation, oriented=oriented)
+                orientation=self.source.orientation, oriented=oriented,
+                # What the samples MEAN, not just how many there are. Two
+                # heads of the same size can differ in depth and alignment,
+                # and one recording plan carries one of each.
+                sample_bits=caps.get("delivered_bits"),
+                alignment=str(getattr(self.cfg, "raw_alignment", "lsb")),
+                mono=bool(self.source.describe().mono))
         # The MLA parameters are in SENSOR pixels, so the sensor frame has to be
         # declared before any of them mean anything -- here, once, from the
         # camera itself, rather than inferred from whatever frame arrives first.
@@ -597,6 +644,12 @@ class CameraRuntime:
             # the pipeline catches them and passes the frame through.
             "stage_failures": self.pipeline.failures,
             "lifecycle": self.lifecycle,
+            # Non-empty when the saved state was written for a different
+            # sensor. In status rather than only in a start-up log line,
+            # because an operator who restarts after a module swap needs to
+            # know their alignment did not carry over at the moment they are
+            # wondering why the grid is wrong.
+            "sensor_changed": list(self.sensor_changed),
             # The command queue. `max_depth` and `max_age_s` are the two a
             # bench run reads: if neither ever approached its bound, the
             # capacity is not what is limiting anything.
@@ -650,13 +703,90 @@ class CameraRuntime:
             # portrait-referenced grid on a camera the config says is
             # landscape, rebase it back, and undo the turn silently.
             "orientation": self.source.orientation,
+            # Which sensor this state belongs to. Saved so that restoring it
+            # onto a DIFFERENT module can be noticed: the state file is keyed
+            # on the logical head name ("left"), so a replacement module in the
+            # same socket under the same name would otherwise inherit the old
+            # one's exposure, its MLA alignment and its reference geometry
+            # without a word. That is S8 in the portability review, and the
+            # pipeline block is the part that matters -- the alignment is in
+            # sensor pixels and is not transferable.
+            "sensor_identity": self.sensor_identity(),
         }
+
+    def sensor_identity(self) -> dict[str, Any]:
+        """What would have to match for saved sensor-specific state to apply.
+
+        Model, the negotiated raw format, the frame geometry and the sample
+        depth. **Not a serial number** -- CSI modules do not generally expose
+        one, which is a limit worth stating rather than papering over: two
+        identical modules swapped between sockets are indistinguishable here.
+        This catches a change of TYPE, not a change of unit.
+        """
+        try:
+            info = self.source.describe()
+        except Exception:                                 # noqa: BLE001
+            return {}
+        try:
+            caps = self.source.raw_capabilities() or {}
+        except Exception:                                 # noqa: BLE001
+            caps = {}
+        return {
+            "model": str(info.model),
+            "backend": str(info.backend),
+            # SORTED, so a quarter turn is not mistaken for a different
+            # sensor. `full_resolution` is post-orientation, and comparing it
+            # directly made restoring a saved 90-degree rotation look like a
+            # module swap -- which the suite caught immediately, and which is
+            # the right kind of false positive to find in a test rather than
+            # on a bench. A replacement whose two dimensions are the old
+            # ones transposed goes undetected here; that is the same pixel
+            # array and the alignment does transfer.
+            "frame_shape": sorted(int(v) for v in info.full_resolution),
+            "full_resolution": list(info.full_resolution),
+            "mono": bool(info.mono),
+            "raw_format": str(caps.get("negotiated") or ""),
+            "sample_bits": caps.get("delivered_bits"),
+            "pixel_pitch_mm": info.pixel_pitch_mm,
+        }
+
+    # Which parts of a saved snapshot are specific to the sensor that produced
+    # them. The MLA alignment is expressed in that sensor's pixels; the
+    # controls are in that sensor's own units and ranges. Orientation is NOT
+    # here: it describes how the camera is bolted down, which a module swap in
+    # the same mount does not change.
+    SENSOR_SPECIFIC_STATE = ("pipeline", "controls")
 
     def apply_state(self, state: dict[str, Any]) -> list[str]:
         """Restore a saved snapshot. Returns human-readable notes about
         anything that could not be applied, rather than raising -- a state file
         written before a config change must not stop the rig from starting."""
         notes: list[str] = []
+
+        # Does this state belong to the sensor that is actually here?
+        #
+        # Saved state is keyed on the logical head name, so a replaced module
+        # in the same socket is handed the old one's state. The orientation
+        # still applies -- the mount has not moved -- but the MLA alignment is
+        # in the old sensor's pixels and the controls are in its units, and
+        # applying either silently is how a calibration of one sensor comes to
+        # look like a calibration of another.
+        saved_identity = state.get("sensor_identity") or {}
+        differences = _identity_differences(saved_identity,
+                                            self.sensor_identity())
+        if differences:
+            self.sensor_changed = list(differences)
+            notes.append(
+                f"{self.cam_id}: the saved state was written for a different "
+                f"sensor ({'; '.join(differences)}). Orientation HAS been "
+                f"restored; the MLA alignment and the sensor controls have NOT, "
+                f"because they are expressed in the old sensor's pixels and "
+                f"units. Re-align the grid and re-run the calibration. Nothing "
+                f"has been deleted -- the saved values are still in the state "
+                f"file.")
+            state = {k: v for k, v in state.items()
+                     if k not in self.SENSOR_SPECIFIC_STATE}
+
         # Orientation before the pipeline, for reading rather than for
         # correctness: what actually matters is that both are in place before
         # bind_sensor runs, and Application._restore_state calls that
@@ -761,13 +891,27 @@ class Application:
         and the figure is an aid to choosing a target, not a measurement.
         """
         pitch = 100.0
+        pitch_mm: float | None = None
+        pitch_source = "unknown"
         for cam in self.cameras.values():
             stage = cam.mla_stage()
             if stage is not None:
                 pitch = float(stage.params.pitch_px)
+                pitch_mm, pitch_source = camera_pitch(cam)
                 break
+        if pitch_mm is None:
+            # No camera, or a camera that cannot say. Rather than silently
+            # using one sensor's pitch -- which is what the module constant
+            # did -- the result comes back marked unavailable and the UI shows
+            # that instead of plausible millimetres. See
+            # calibration/settings.DerivedOptics.compute.
+            return DerivedOptics.compute(
+                self.calibration.optics, self.calibration.board, pitch,
+                pitch_mm=None, pitch_source=pitch_source,
+            ).model_dump()
         return DerivedOptics.compute(
-            self.calibration.optics, self.calibration.board, pitch
+            self.calibration.optics, self.calibration.board, pitch,
+            pitch_mm=pitch_mm, pitch_source=pitch_source,
         ).model_dump()
 
     # -- the calibration session -------------------------------------------

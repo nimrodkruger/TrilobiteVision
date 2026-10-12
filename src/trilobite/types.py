@@ -184,6 +184,27 @@ class CameraInfo:
     preview_resolution: tuple[int, int]
     mono: bool
     detail: dict[str, Any] = field(default_factory=dict)
+    # The stream sizes as DISTINCT quantities, with their provenance. Added
+    # 11 October: `full_resolution` and `preview_resolution` are what a
+    # consumer holds after orientation, which is one of five different sizes a
+    # camera has, and reporting only those made the other four unavailable to
+    # anything that needed them -- while a driver that adjusted one of them
+    # left the two that are reported describing a frame that does not exist.
+    #
+    #   sensor      the physical pixel array
+    #   raw         the raw stream the sensor mode delivers
+    #   main        the processed full-size stream, pre-orientation
+    #   lores       the preview stream, pre-orientation
+    #   oriented_*  what a consumer actually holds
+    #
+    # Empty for a backend with no such distinction (synthetic, replay), which
+    # is itself the honest answer rather than five copies of one number.
+    geometry: dict[str, Any] = field(default_factory=dict)
+    # Pixel pitch in millimetres and where it came from. `None` means not
+    # established -- which is a usable answer, and inheriting another sensor's
+    # pitch is not. See calibration/settings.py.
+    pixel_pitch_mm: float | None = None
+    pixel_pitch_source: str = "unknown"
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -193,5 +214,8 @@ class CameraInfo:
             "full_resolution": list(self.full_resolution),
             "preview_resolution": list(self.preview_resolution),
             "mono": self.mono,
+            "geometry": self.geometry,
+            "pixel_pitch_mm": self.pixel_pitch_mm,
+            "pixel_pitch_source": self.pixel_pitch_source,
             "detail": self.detail,
         }
